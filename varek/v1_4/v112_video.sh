@@ -18,7 +18,7 @@
 #          sudo ./v112_video.sh --quick            (no pacing)
 #          sudo BEFORE_REF=<git-ref> ./v112_video.sh
 #
-# Requires: root, Linux >= 5.14, libseccomp-dev, libsodium-dev (v1.16+), a git checkout.
+# Requires: root, Linux >= 5.14, libseccomp-dev, libssl-dev (v1.41; through v1.40 also libsodium-dev), a git checkout.
 
 set -euo pipefail
 cd "$(dirname "$0")"

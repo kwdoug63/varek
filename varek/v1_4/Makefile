@@ -6,7 +6,34 @@ CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -Wpedantic -Wno-unused-parameter \
            -D_GNU_SOURCE -std=gnu11
 LDFLAGS ?=
-LDLIBS  ?= -lseccomp -lsodium
+LDLIBS  ?= -lseccomp
+
+# v1.41: VAREK's one crypto backend. Every hash, signature and random byte the
+# Warden, the checker and the tools use goes through varek_fips.c to the host's
+# OpenSSL 3 provider; VAREK carries no cryptography of its own and no longer
+# links libsodium (through v1.40 it did, for the audit chain and Ed25519).
+CRYPTO  := varek_fips.c varek_fips.h
+
+# v1.41: the Defense build, `make DEFENSE=1`. It differs from the open-source
+# core in two ways, both fixed at build time:
+#   VAREK_REQUIRE_FIPS     the Warden (and warden-secrets) refuse to start
+#                          unless the host's FIPS 140-3 validated OpenSSL
+#                          provider services their hashing and signing.
+#   VAREK_NO_TLS_INSPECT   the egress proxy's TLS-inspecting mode (v1.26.1) is
+#                          not compiled in: warden-proxy links no TLS or crypto
+#                          library at all, proxy_ca.c is not built, and the
+#                          Warden refuses a policy that says `proxy inspect`
+#                          (and so request rules, mcp rules, credentials and
+#                          passthrough hosts, which need it).
+# (The two -D switches are added at the end of this file: see there.)
+DEFENSE ?= 0
+ifeq ($(DEFENSE),1)
+PROXY_SRC  := warden_proxy_helper.c proxy_parse.c mcp_json.c
+PROXY_LIBS :=
+else
+PROXY_SRC  := warden_proxy_helper.c proxy_parse.c proxy_ca.c mcp_json.c varek_fips.c
+PROXY_LIBS := -lssl -lcrypto
+endif
 
 # v1.6 plan-graph integration. The Warden references these symbols
 # directly; -I../../v1_6 lets warden.c #include the v1.6 headers.
@@ -32,19 +59,19 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden warden-proxy warden-secrets target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-v1311 test-v1320 test-v1321 test-v1340 test-v1350 test-v1300 test-v1300-oflags test-varek-k8s test-varek-chart sweep-v1340 test-v1340-kind test-v1340-apiserver varek-nri varek-admission varek-svid test-node-json test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
+.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1410 fips-acceptance test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-v1311 test-v1320 test-v1321 test-v1340 test-v1350 test-v1300 test-v1300-oflags test-varek-k8s test-varek-chart sweep-v1340 test-v1340-kind test-v1340-apiserver varek-nri varek-admission varek-svid test-node-json test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
 
 all: $(BINS)
 
-# v1.16.1: the Warden needs the libseccomp and (from v1.16) libsodium headers;
+# v1.16.1: the Warden needs the libseccomp headers and (v1.41) OpenSSL 3's;
 # v1.26.1: warden-proxy needs OpenSSL's. Checked when (and only when) one of
 # them is about to be built, naming the command that installs them; `make
 # deps` runs that command.
 deps-check:
-	@printf '#include <seccomp.h>\n#include <sodium.h>\n#include <openssl/evp.h>\n' | $(CC) -E -x c - >/dev/null 2>&1 || { \
-	    echo "ERROR: the Warden needs the libseccomp, libsodium and OpenSSL (libcrypto) development headers."; \
-	    echo "  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev"; \
-	    echo "  Fedora/RHEL:   sudo dnf install -y gcc make libseccomp-devel libsodium-devel openssl-devel"; \
+	@printf '#include <seccomp.h>\n#include <openssl/evp.h>\n' | $(CC) -E -x c - >/dev/null 2>&1 || { \
+	    echo "ERROR: the Warden needs the libseccomp and OpenSSL 3 (libcrypto) development headers."; \
+	    echo "  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libssl-dev"; \
+	    echo "  Fedora/RHEL:   sudo dnf install -y gcc make libseccomp-devel openssl-devel"; \
 	    echo "  or run: make deps"; exit 1; }
 
 deps-check-ssl:
@@ -56,10 +83,10 @@ deps-check-ssl:
 
 deps:
 	@if command -v apt-get >/dev/null 2>&1; then \
-	    sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev; \
+	    sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libssl-dev; \
 	elif command -v dnf >/dev/null 2>&1; then \
-	    sudo dnf install -y gcc make libseccomp-devel libsodium-devel openssl-devel; \
-	else echo "install libseccomp, libsodium and OpenSSL (development packages) with your package manager"; exit 1; fi
+	    sudo dnf install -y gcc make libseccomp-devel openssl-devel; \
+	else echo "install libseccomp and OpenSSL 3 (development packages) with your package manager"; exit 1; fi
 
 # v1.16.1: check a deployment before running it (dependencies, build, policy,
 # the verdict stream / key / anchor locations the Warden refuses, and with
@@ -74,7 +101,7 @@ CHECKER := checker/vdp_checker.c checker/vdp_checker.h
 # uses the host's resolver library.
 RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c shared_domains.c shared_domains.h warden_proxy.c warden_proxy.h proxy_parse.h warden_secrets.c warden_secrets.h warden_revoke.inc.c
 
-warden: warden.c warden_node.inc.c node_json.c node_json.h warden_oci.c warden_oci.h warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c warden_exec.inc.c warden_noexec.inc.c warden_subagent.inc.c warden_revoke.inc.c warden_asagent.inc.c warden_change.inc.c warden_hold.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
+warden: warden.c warden_node.inc.c node_json.c node_json.h warden_oci.c warden_oci.h warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c warden_exec.inc.c warden_noexec.inc.c warden_subagent.inc.c warden_revoke.inc.c warden_asagent.inc.c warden_change.inc.c warden_hold.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(CRYPTO) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
 	@# v1.27: Landlock does not govern a memfd, so the agent must never make one
 	@# (docs/security/v1.27-program-launches.md): memfd_create stays hard-denied
@@ -87,39 +114,42 @@ warden: warden.c warden_node.inc.c node_json.c node_json.h warden_oci.c warden_o
 	    { echo "warden: prctl(PR_SET_MM) must stay refused (v1.32, the layout settling)"; exit 1; }
 	@[ "$$(grep -c 'SCMP_ACT_ALLOW, SCMP_SYS(prctl)' warden_baseline_filter.c)" = 2 ] || \
 	    { echo "warden: a prctl rule changed: check it admits no PR_SET_MM (v1.32), then this count"; exit 1; }
-	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c node_json.c warden_oci.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c warden_secrets.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lcrypto -lresolv
+	$(CC) $(CFLAGS) -pthread $(LDFLAGS) -o $@ warden.c node_json.c warden_oci.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c varek_fips.c warden_resolve.c shared_domains.c warden_proxy.c warden_secrets.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lcrypto -lresolv
 
 # v1.26.1: the egress proxy, its own program (the Warden starts it from a
-# sealed copy whose SHA-256 it records). It links neither libseccomp nor
-# libsodium, and never holds the signing key; v1.26.1 inspecting mode links
-# OpenSSL here, and only here.
-warden-proxy: warden_proxy_helper.c warden_proxy_mcp.inc.c warden_proxy.h proxy_parse.c proxy_parse.h proxy_ca.c proxy_ca.h mcp_json.c mcp_json.h
-	@$(MAKE) -s --no-print-directory deps-check-ssl
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_proxy_helper.c proxy_parse.c proxy_ca.c mcp_json.c -lssl -lcrypto
+# sealed copy whose SHA-256 it records). It links no libseccomp and never
+# holds the signing key; v1.26.1 inspecting mode links OpenSSL here (through
+# the v1.41 backend for its digests). v1.41 Defense build: inspecting mode is
+# not compiled in and the proxy links no TLS or crypto library (PROXY_SRC,
+# PROXY_LIBS above).
+warden-proxy: warden_proxy_helper.c warden_proxy_mcp.inc.c warden_proxy.h proxy_parse.c proxy_parse.h proxy_ca.c proxy_ca.h mcp_json.c mcp_json.h $(CRYPTO)
+	@[ "$(DEFENSE)" = 1 ] || $(MAKE) -s --no-print-directory deps-check-ssl
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(PROXY_SRC) $(PROXY_LIBS)
 
 # v1.28: warden-secrets, the helper that fetches the credentials a policy
 # names (file, HashiCorp Vault, AWS Secrets Manager). Its own program, as
 # the proxy is, so the Warden links no TLS code; it never sees a value.
-warden-secrets: warden_secrets_helper.c warden_secrets.h mcp_json.c mcp_json.h mcp_aud.h
+warden-secrets: warden_secrets_helper.c warden_secrets.h mcp_json.c mcp_json.h mcp_aud.h $(CRYPTO)
 	@$(MAKE) -s --no-print-directory deps-check-ssl
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_secrets_helper.c mcp_json.c -lssl -lcrypto
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_secrets_helper.c mcp_json.c varek_fips.c -lssl -lcrypto
 
 # v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
 # ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that
 # the certificate checker refuses the wrong verdict. Never deploy it.
-warden_faultinject: warden.c warden_node.inc.c node_json.c node_json.h warden_oci.c warden_oci.h warden_net.inc.c warden_exec.inc.c warden_noexec.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
+warden_faultinject: warden.c warden_node.inc.c node_json.c node_json.h warden_oci.c warden_oci.h warden_net.inc.c warden_exec.inc.c warden_noexec.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(CRYPTO) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
-	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT -pthread $(LDFLAGS) -o $@ warden.c node_json.c warden_oci.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c warden_resolve.c shared_domains.c warden_proxy.c warden_secrets.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lcrypto -lresolv
+	$(CC) $(CFLAGS) -DVDP_FAULT_INJECT -pthread $(LDFLAGS) -o $@ warden.c node_json.c warden_oci.c warden_baseline_filter.c smt_decide.c checker/vdp_checker.c varek_fips.c warden_resolve.c shared_domains.c warden_proxy.c warden_secrets.c $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC) $(LDLIBS) -lcrypto -lresolv
 
 # v1.15: command-line front end to the certificate checker (policy digest,
 # batch certificate checks). Links the checker only, never smt_decide.c.
-tools/vdp_cert_check: tools/vdp_cert_check.c $(CHECKER)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/vdp_cert_check.c checker/vdp_checker.c
+tools/vdp_cert_check: tools/vdp_cert_check.c $(CHECKER) $(CRYPTO)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/vdp_cert_check.c checker/vdp_checker.c varek_fips.c -lcrypto
 
-# v1.16: Ed25519 key pair for signing the verdict stream (--sign-key).
-tools/varek_keygen: tools/varek_keygen.c
-	@$(MAKE) -s --no-print-directory deps-check
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/varek_keygen.c -lsodium
+# v1.16: a key pair for signing the verdict stream (--sign-key); v1.41: ECDSA
+# P-384 (PKCS#8 PEM), made by the host provider through the backend.
+tools/varek_keygen: tools/varek_keygen.c $(CRYPTO)
+	@$(MAKE) -s --no-print-directory deps-check-ssl
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tools/varek_keygen.c varek_fips.c -lcrypto
 
 # v1.13: command-line front end to the SMT decision procedure (lint, analyze,
 # batch queries); the same smt_decide.c the Warden runs.
@@ -271,6 +301,22 @@ tests/v1160_probe: tests/v1160_probe.c
 
 test-v1160: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen tests/v1160_probe
 	@sudo ./tests/test_v1160.sh ./warden ./tools/vdp_check ./tools/vdp_cert_check ./tools/varek_keygen $(abspath tests/v1160_probe)
+
+# v1.41: no cryptography of VAREK's own. The crypto backend alone (known
+# answers, RFC 6979's P-384 vectors, the Defense switch's fail-closed init), no
+# libsodium in any binary or source and no hash of VAREK's own, the Defense
+# build (make DEFENSE=1, in a copy of the tree: its egress proxy links no TLS
+# or crypto library, its Warden refuses to run off FIPS mode) and a policy
+# with `proxy inspect` refused with inspecting mode left out. On a host in
+# FIPS mode it also audits a Defense run with --require-fips; the full RHEL 9
+# FIPS-mode acceptance is tests/fips_acceptance.sh (make fips-acceptance).
+test-v1410: all
+	@sudo ./tests/test_v1410.sh
+
+# v1.41: the Defense build's acceptance on RHEL 9 in FIPS mode (run there, as
+# root): it refuses to run off FIPS mode, and writes its evidence to OUT.
+fips-acceptance:
+	@sudo ./tests/fips_acceptance.sh $(OUT)
 
 # v1.16.1: deployment preflight. vdp_cert_check's openable check agrees with
 # the Warden's startup refusal; varek_preflight.sh passes a good deployment and
@@ -653,8 +699,17 @@ uninstall:
 	@echo "removed $(PREFIX); settings in /etc/varek and logs in /var/log/varek were kept"
 
 test-cli: warden warden-proxy tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
-	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_container.py tests/test_varek_license.py tests/test_add_free_trial.py tests/test_varek_vm.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py tests/test_varek_bench_mcp.py tests/test_varek_audit_stream.py tests/test_varek_node_keys.py tests/test_varek_otel.py tests/test_varek_splunk.py tests/test_varek_sentinel.py tests/test_varek_falcon.py tests/test_varek_export_resume.py
+	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_container.py tests/test_varek_license.py tests/test_add_free_trial.py tests/test_varek_vm.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py tests/test_varek_bench_mcp.py tests/test_varek_audit_stream.py tests/test_varek_node_keys.py tests/test_varek_v140_logs.py tests/test_varek_otel.py tests/test_varek_splunk.py tests/test_varek_sentinel.py tests/test_varek_falcon.py tests/test_varek_export_resume.py
 
 # v1.34 step 2: the node agent's JSON reader (node_json.c)
 test-node-json: tests/test_node_json.c node_json.c node_json.h
 	@$(CC) $(CFLAGS) -o tests/test_node_json tests/test_node_json.c node_json.c && ./tests/test_node_json
+
+# v1.41: the Defense build's compile-time switches (see DEFENSE near the top),
+# applied last. In GNU make an `override` assignment makes every later plain
+# `CFLAGS +=` in this file be ignored, so this must follow all of them.
+# `override` keeps the switches even when CFLAGS is given on the command line:
+# a Defense binary without its FIPS gate must not be buildable by accident.
+ifeq ($(DEFENSE),1)
+override CFLAGS += -DVAREK_REQUIRE_FIPS -DVAREK_NO_TLS_INSPECT
+endif

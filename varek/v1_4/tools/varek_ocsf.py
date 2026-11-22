@@ -720,6 +720,11 @@ def cmd_follow(args):
                 if rec.get("event") != "run_start":
                     continue
                 run = rec.get("run")
+                # v1.41: the chain's format (chain-2, or a v1.40 stream's chain-1)
+                fmt = cdx.log_format(rec.get("log"))
+                if fmt is None:
+                    fail(lineno, f"run_start's integrity format {rec.get('log')!r} is not one this exporter reads")
+                chained["head"], chained["fmt"] = fmt["iv"], fmt
                 ex = Exporter(args.policy, args.device)
             if "run" not in rec and rec.get("event") != "run_start":
                 continue                # step 9 (review): as batch mode does (a Warden before 1.35's

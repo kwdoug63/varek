@@ -733,8 +733,12 @@ def test_the_vareknodekey_crd():
     assert spec["x-kubernetes-validations"][0]["rule"] == "self == oldSelf"
     # the names and keys the webhook takes (k8s/internal/kube/nodekeys.go)
     go = open(os.path.join(ROOT, "varek", "v1_4", "k8s", "internal", "kube", "nodekeys.go")).read()
-    assert spec["properties"]["node"]["pattern"] == re.search(r"nodeName  = regexp\.MustCompile\(`([^`]*)`\)", go).group(1)
-    assert spec["properties"]["publicKey"]["pattern"] == re.search(r"publicKey = regexp\.MustCompile\(`([^`]*)`\)", go).group(1)
+    # (by name, whatever spaces gofmt aligns the block with: v1.41's comment in
+    # the block took nodeName's second space away)
+    for field, var in (("node", "nodeName"), ("publicKey", "publicKey")):
+        m = re.search(var + r"\s+=\s+regexp\.MustCompile\(`([^`]*)`\)", go)
+        assert m, f"nodekeys.go declares no {var} pattern"
+        assert spec["properties"][field]["pattern"] == m.group(1), field
 
 
 def test_the_varekcredential_crd():

@@ -113,7 +113,8 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <limits.h>
-#include <sodium.h>              /* v1.16: SHA-256 chain, Ed25519 signatures */
+#include "varek_fips.h"          /* v1.41: all hashing/signing via the host OpenSSL provider
+                                  * (SHA-384 chain, ECDSA P-384 signatures); was libsodium */
 
 /* VAREK v1.6 plan-graph integration headers.
  * The v1_6/ directory ships these as a self-contained module; this
@@ -703,6 +704,20 @@ static int policy_load(const char *path, struct policy *p) {
             !vdp_host_rule_ok(&p->v.rules[i], hw, sizeof hw))
             hostnever++;
     }
+#ifdef VAREK_NO_TLS_INSPECT
+    /* v1.41, Defense build: the egress proxy's TLS-inspecting mode is not
+     * compiled in. A policy that asks for it is refused here, on every path
+     * that loads a policy (lint, --check-startup, --oci-filter, a run), so it
+     * can never fall back to running uninspected. The parsers require
+     * `proxy inspect` for request rules, mcp rules, credentials and
+     * passthrough hosts, so this refuses those too. */
+    if (p->v.proxy_inspect) {
+        fprintf(stderr, "[warden] policy %s: refused: it says `proxy inspect`, and this VAREK Defense build "
+                "does not include the egress proxy's TLS-inspecting mode (request rules, mcp rules, "
+                "credentials and passthrough hosts need it); `proxy on` gates by host name and port\n", path);
+        return -1;
+    }
+#endif
     fprintf(stderr, "[warden] loaded policy %s v%s with %zu rules (%zu can never fire%s), "
             "sha256 %s\n", p->name, p->version, p->v.n, dead,
             hostnever ? "; some host rules can never match a connect, see the notes" : "",
@@ -1569,8 +1584,8 @@ static int plan_snapshot(const char *path) {
     }
     close(fd);
     unsigned char h[32];
-    crypto_hash_sha256(h, (const unsigned char *)b, n);
-    sodium_bin2hex(g_plan_snap_sha, sizeof g_plan_snap_sha, h, sizeof h);
+    if (vfips_sha256(b, n, h) != 0) { free(b); errno = EIO; return -1; }
+    vfips_bin2hex(g_plan_snap_sha, sizeof g_plan_snap_sha, h, sizeof h);
     free(g_plan_snap);
     g_plan_snap = b, g_plan_snap_len = n;
     snprintf(g_plan_snap_path, sizeof g_plan_snap_path, "%s", path);
@@ -2265,14 +2280,18 @@ static bool     g_relay_midline = false;
  *
  *   1. Hash chain (always on). Every record of this run (run_start, each
  *      decision record, checkpoint, anchor_error, run_end) ends with
- *        "chain":"<hex>"   chain_i = SHA-256(chain_{i-1} || body_i)
+ *        "chain":"<hex>"   chain_i = SHA-384(chain_{i-1} || body_i)
  *      where body_i is the record's exact bytes from its '{' up to (not
  *      including) the ',"chain":' that follows, and chain_{-1} =
- *      SHA-256("VAREK-LOG-CHAIN-1"). Editing, inserting, removing or
+ *      SHA-384("VAREK-LOG-CHAIN-2"). Editing, inserting, removing or
  *      reordering any record changes every chain value after it.
- *   2. Ed25519 signatures (--sign-key). run_start, every checkpoint and
- *      run_end also carry "sig": an Ed25519 signature over
- *      "VAREK-LOG-SIG-1" || chain_i (the raw 32 bytes). A checkpoint is written
+ *   2. ECDSA P-384 signatures (--sign-key). run_start, every checkpoint and
+ *      run_end also carry "sig": a DER ECDSA signature (SHA-384, curve P-384)
+ *      over "VAREK-LOG-SIG-2" || chain_i (the raw 48 bytes), computed by the
+ *      host OpenSSL provider. run_start says "log":"chain-2" and
+ *      "sigalg":"ecdsa-p384-sha384". (Through v1.40 the format was chain-1:
+ *      SHA-256 and Ed25519 over "VAREK-LOG-SIG-1"; the audit still verifies
+ *      those logs.) A checkpoint is written
  *      after every N decision records (--checkpoint-every, default 64) and once
  *      a second while records are pending. With the public key pinned, an
  *      auditor detects any change to the log up to the last signature; without
@@ -2288,12 +2307,16 @@ static bool     g_relay_midline = false;
  *
  * Human status lines ("[warden] ...") and the agent's relayed stderr
  * ("[agent] ...") are not records and are not chained. */
-#define LOG_CHAIN_IV   "VAREK-LOG-CHAIN-1"
-#define LOG_SIG_DOMAIN "VAREK-LOG-SIG-1"
-static unsigned char g_chain[32];
+/* v1.41: format chain-2 — SHA-384 chain, ECDSA P-384 (SHA-384) signatures over
+ * "VAREK-LOG-SIG-2" || chain. Streams written before v1.41 say "chain-1"
+ * (SHA-256, Ed25519, "VAREK-LOG-SIG-1"); tools/varek_audit.py verifies both. */
+#define LOG_CHAIN_IV   "VAREK-LOG-CHAIN-2"
+#define LOG_SIG_DOMAIN VFIPS_LOG_SIG_DOMAIN
+#define LOG_CHAIN_FMT  "chain-2"
+static unsigned char g_chain[VFIPS_CHAIN_LEN];
 static bool          g_signing = false;
-static unsigned char g_pk[crypto_sign_PUBLICKEYBYTES];
-static unsigned char *g_sk;                /* sodium_malloc: guarded, locked, not dumped */
+static char          g_pub_hex[VFIPS_PUB_HEX_MAX];   /* the signing key's public point */
+static vfips_key    *g_key;                /* held by OpenSSL (secure heap); never in the clear here */
 static int           g_anchor_fd = -1;
 static bool          g_anchor_fifo = false;  /* v1.16.2: held read-write; drained at exit */
 static char          g_anchor_lock[PATH_MAX + 8];  /* v1.16.2: the forwarder's liveness lock */
@@ -2377,20 +2400,27 @@ static void rec_end(const char *ckpt_event) {
         abort();
     }
     size_t bl = g_rl - 2;
-    crypto_hash_sha256_state st;
-    crypto_hash_sha256_init(&st);
-    crypto_hash_sha256_update(&st, g_chain, sizeof g_chain);
-    crypto_hash_sha256_update(&st, (const unsigned char *)g_rb, bl);
-    crypto_hash_sha256_final(&st, g_chain);
-    char chain_hex[65], sig_hex[2 * crypto_sign_BYTES + 1];
-    sodium_bin2hex(chain_hex, sizeof chain_hex, g_chain, sizeof g_chain);
+    /* A chain or signature the provider cannot compute stops supervision
+     * (fail closed), as a stream that cannot be written does. */
+    vfips_md *st = vfips_md_new(384);
+    if (!st || vfips_md_update(st, g_chain, sizeof g_chain) != 0 ||
+        vfips_md_update(st, (const unsigned char *)g_rb, bl) != 0 ||
+        vfips_md_final(st, g_chain) != 0) {
+        fprintf(stderr, "[warden] audit chain: SHA-384 via the host crypto provider failed; stopping\n");
+        abort();
+    }
+    vfips_md_free(st);
+    char chain_hex[2 * VFIPS_CHAIN_LEN + 1], sig_hex[VFIPS_SIG_HEX_MAX];
+    vfips_bin2hex(chain_hex, sizeof chain_hex, g_chain, sizeof g_chain);
     bool sign = ckpt_event && g_signing;
     if (sign) {
-        unsigned char msg[sizeof LOG_SIG_DOMAIN - 1 + 32], sig[crypto_sign_BYTES];
+        unsigned char msg[sizeof LOG_SIG_DOMAIN - 1 + VFIPS_CHAIN_LEN];
         memcpy(msg, LOG_SIG_DOMAIN, sizeof LOG_SIG_DOMAIN - 1);
-        memcpy(msg + sizeof LOG_SIG_DOMAIN - 1, g_chain, 32);
-        crypto_sign_detached(sig, NULL, msg, sizeof msg, g_sk);
-        sodium_bin2hex(sig_hex, sizeof sig_hex, sig, sizeof sig);
+        memcpy(msg + sizeof LOG_SIG_DOMAIN - 1, g_chain, VFIPS_CHAIN_LEN);
+        if (vfips_sign(g_key, msg, sizeof msg, sig_hex, sizeof sig_hex) < 0) {
+            fprintf(stderr, "[warden] verdict stream: ECDSA P-384 signing failed; stopping\n");
+            abort();
+        }
     }
     log_line_start();
     fwrite(g_rb, 1, bl, g_log);
@@ -2419,7 +2449,7 @@ static void emit_anchor_error(const char *event, int err) {
  * file cannot be made, it goes on in this one (it is whole either way), and
  * is tried again after as much again. */
 static void seg_rotate(void) {
-    char name[256], prev[65];
+    char name[256], prev[2 * VFIPS_CHAIN_LEN + 1];
     int n = snprintf(name, sizeof name, "%s.jsonl.%u", g_seg_base, g_seg + 1);
     /* this segment whole on disk before the next is there (a follower moves
      * on when it sees the next) */
@@ -2442,7 +2472,7 @@ static void seg_rotate(void) {
     close(fd);
     g_seg++;
     g_seg_bytes = 0;
-    sodium_bin2hex(prev, sizeof prev, g_chain, sizeof g_chain);
+    vfips_bin2hex(prev, sizeof prev, g_chain, sizeof g_chain);
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     g_rotating = true;
@@ -2499,7 +2529,7 @@ static int log_init(void) {
     /* v1.16: records are built here, then chained and written in one piece. */
     g_rf = open_memstream(&g_rb, &g_rl);
     if (!g_rf) return -1;
-    crypto_hash_sha256(g_chain, (const unsigned char *)LOG_CHAIN_IV, sizeof LOG_CHAIN_IV - 1);
+    if (vfips_sha384(LOG_CHAIN_IV, sizeof LOG_CHAIN_IV - 1, g_chain) != 0) return -1;
     clock_gettime(CLOCK_MONOTONIC, &g_last_ckpt);
     unsigned char rnd[16];
     size_t got = 0;
@@ -2645,13 +2675,15 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
 #endif
             );
     /* v1.16: how this stream is protected (see the log integrity notes). */
-    fputs("\"log\":\"chain-1\",", f);
+    fputs("\"log\":\"" LOG_CHAIN_FMT "\",", f);
+    /* v1.41: the provider that computes the stream's chain and signatures
+     * ("fips": the host's FIPS 140-3 validated module), recorded in run_start,
+     * which is signed, so a log's holder cannot change it undetected */
+    fprintf(f, "\"crypto_provider\":\"%s\",", vfips_provider_label());
     /* v1.35 step 4: the run is held to this plan (if it passes the gate) */
     if (g_hold_req) fprintf(f, "\"hold\":{\"plan\":\"%s\",\"plan_sha256\":\"%s\"},", g_hold_plan_json, g_hold_plan_sha);
     if (g_signing) {
-        char pk_hex[2 * crypto_sign_PUBLICKEYBYTES + 1];
-        sodium_bin2hex(pk_hex, sizeof pk_hex, g_pk, sizeof g_pk);
-        fprintf(f, "\"log_pubkey\":\"%s\",", pk_hex);
+        fprintf(f, "\"log_pubkey\":\"%s\",\"sigalg\":\"%s\",", g_pub_hex, VFIPS_SIGALG_P384);
     }
     if (checkpoints_on())
         fprintf(f, "\"checkpoint_every\":%" PRIu64 ",", g_ckpt_every);
@@ -2852,17 +2884,19 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
 static int sha256_file_hex(const char *path, char out[65]) {
     FILE *f = fopen(path, "re");
     if (!f) return -1;
-    crypto_hash_sha256_state st;
-    crypto_hash_sha256_init(&st);
+    vfips_md *st = vfips_md_new(256);
+    if (!st) { fclose(f); return -1; }
     unsigned char buf[65536];
     size_t n;
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0) crypto_hash_sha256_update(&st, buf, n);
+    int upd = 0;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) upd |= vfips_md_update(st, buf, n);
     int bad = ferror(f);
     fclose(f);
-    if (bad) return -1;
     unsigned char h[32];
-    crypto_hash_sha256_final(&st, h);
-    sodium_bin2hex(out, 65, h, sizeof h);
+    int fin = vfips_md_final(st, h);
+    vfips_md_free(st);
+    if (bad || upd || fin) return -1;
+    vfips_bin2hex(out, 65, h, sizeof h);
     return 0;
 }
 
@@ -5008,30 +5042,40 @@ static int load_sign_key(const char *path, const struct policy *p) {
     }
     if (refuse_if_agent_can_open(p, fd, path, "signing key") < 0) { close(fd); return -1; }
     protect_fd(fd, "signing key");          /* v1.17.0: refused by identity at runtime too */
-    char buf[80];
+    /* v1.41: a PKCS#8 PEM EC private key on curve P-384 (tools/varek_keygen).
+     * A pre-v1.41 key (64 hex characters, an Ed25519 seed) is refused with a
+     * pointer to make a new one: the Warden no longer signs with Ed25519. */
+    char buf[4096];
+    size_t total = 0;
     ssize_t n;
-    do { n = read(fd, buf, sizeof buf); } while (n < 0 && errno == EINTR);
+    for (;;) {
+        n = read(fd, buf + total, sizeof buf - 1 - total);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        total += (size_t)n;
+        if (total == sizeof buf - 1) break;
+    }
     close(fd);
-    unsigned char seed[crypto_sign_SEEDBYTES];
-    size_t bl = 0;
-    bool ok = (n == 64 || (n == 65 && buf[64] == '\n')) &&
-              sodium_hex2bin(seed, sizeof seed, buf, 64, NULL, &bl, NULL) == 0 &&
-              bl == sizeof seed;
-    sodium_memzero(buf, sizeof buf);
-    if (!ok) {
-        sodium_memzero(seed, sizeof seed);
-        fprintf(stderr, "[warden] signing key %s: not a VAREK signing key (64 hex characters; "
-                "make one with tools/varek_keygen)\n", path);
+    if (n < 0) {
+        vfips_memzero(buf, sizeof buf);
+        fprintf(stderr, "[warden] signing key %s: %s\n", path, strerror(errno));
         return -1;
     }
-    g_sk = sodium_malloc(crypto_sign_SECRETKEYBYTES);
-    if (!g_sk) {
-        sodium_memzero(seed, sizeof seed);
-        fprintf(stderr, "[warden] cannot allocate protected memory for the signing key\n");
+    buf[total] = '\0';
+    char why[160] = {0};
+    g_key = vfips_key_load_pem(buf, total, why, sizeof why);
+    vfips_memzero(buf, sizeof buf);
+    if (!g_key) {
+        fprintf(stderr, "[warden] signing key %s: not a VAREK signing key: %s (v1.41 signs with ECDSA "
+                "P-384; make a key with tools/varek_keygen; a v1.40 Ed25519 key is no longer used)\n", path, why);
         return -1;
     }
-    crypto_sign_seed_keypair(g_pk, g_sk, seed);
-    sodium_memzero(seed, sizeof seed);
+    if (vfips_pubkey_hex(g_key, g_pub_hex, sizeof g_pub_hex) < 0) {
+        vfips_key_free(g_key);
+        g_key = NULL;
+        fprintf(stderr, "[warden] signing key %s: cannot derive its public key\n", path);
+        return -1;
+    }
     g_signing = true;
     return 0;
 }
@@ -6206,6 +6250,23 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* v1.41: the crypto backend, before anything is hashed or signed (the
+     * policy digest in policy_load, the plan snapshot, the node's key). It is
+     * libcrypto's first initialisation and reads no OpenSSL configuration
+     * file, so no module or provider one names is loaded (v1.29). Every hash
+     * and signature after this goes through the host's provider; on a host in
+     * FIPS mode that is the FIPS provider. In the Defense build
+     * (VAREK_REQUIRE_FIPS) the Warden refuses to do anything — lint, check or
+     * supervise — unless the FIPS 140-3 validated provider services its
+     * hashing and signing (fail closed). */
+    {
+        char why[256] = {0};
+        if (vfips_init(VFIPS_INIT_NO_CONFIG | VFIPS_INIT_SECURE_HEAP, why, sizeof why) != 0) {
+            fprintf(stderr, "[warden] refusing to start: %s\n", why);
+            return 1;
+        }
+    }
+
     /* v1.34 step 3: the filter in OCI's form, for the NRI plugin */
     if (oci_only) {
         if (sep_idx >= 0 || g_check_only || node_sock || g_hold_req || session_arg || state_arg || gstatus_arg ||
@@ -6443,17 +6504,7 @@ int main(int argc, char **argv) {
         g_writable_exec = true;          /* no noexec mounts: launches are not held */
     }
 
-    /* v1.16: log integrity. */
-    /* v1.29 (step 9): libcrypto only hashes the launch set; it reads no
-     * configuration file, so no module or provider one names is loaded */
-    if (OPENSSL_init_crypto(OPENSSL_INIT_NO_LOAD_CONFIG, NULL) != 1) {
-        fprintf(stderr, "[warden] libcrypto failed to initialize\n");
-        return 1;
-    }
-    if (sodium_init() < 0) {
-        fprintf(stderr, "[warden] libsodium failed to initialize\n");
-        return 1;
-    }
+    /* v1.16: log integrity (crypto initialised after the argument parse). */
     load_raw_char_majors();                 /* v1.17.0 */
     load_ancestors(&p);                     /* v1.17.0 */
     if (refuse_exposed_stream(&p) < 0) return 1;
@@ -6519,7 +6570,7 @@ int main(int argc, char **argv) {
     if (p.v.proxy && geteuid() != 0 && !g_check_only) {
         fprintf(stderr, "[warden] `proxy on` needs the Warden to run as root (the proxy runs as its "
                 "own user); refusing to start\n");
-        if (g_sk) sodium_free(g_sk);
+        if (g_key) vfips_key_free(g_key);
         return 2;
     }
     /* v1.26.1: the proxy is warden-proxy, beside this binary unless
@@ -6540,7 +6591,7 @@ int main(int argc, char **argv) {
         if (proxy_fd < 0) {
             fprintf(stderr, "[warden] the egress proxy: %s; build it (make warden-proxy) or name it with "
                     "--proxy-bin; refusing to start\n", why);
-            if (g_sk) sodium_free(g_sk);
+            if (g_key) vfips_key_free(g_key);
             return 1;
         }
         fprintf(stderr, "[warden] egress proxy binary %s, SHA-256 %s\n", pb, g_proxy_sha);
@@ -6549,7 +6600,7 @@ int main(int argc, char **argv) {
         if (wp_start(&g_proxy, proxy_fd, pxa.uid, pxa.gid) < 0) {
             fprintf(stderr, "[warden] cannot start the egress proxy (%s); refusing to start\n",
                     g_proxy.why[0] ? g_proxy.why : strerror(errno));
-            if (g_sk) sodium_free(g_sk);
+            if (g_key) vfips_key_free(g_key);
             return 1;
         }
         fprintf(stderr, "[warden] egress proxy (%s) on 127.0.0.1:%u as %u:%u\n",
@@ -6814,15 +6865,29 @@ int main(int argc, char **argv) {
                     if (g_nr.on) {
                         /* v1.36 step 4: the NRI plugin's, in the container's
                          * environment already (node_creds_check) */
-                        crypto_hash_sha256(dg, (const unsigned char *)g_cred_ph[k], strlen(g_cred_ph[k]));
-                        sodium_bin2hex(g_cred_ph_sha[k], sizeof g_cred_ph_sha[k], dg, sizeof dg);
+                        if (vfips_sha256(g_cred_ph[k], strlen(g_cred_ph[k]), dg) != 0) {
+                            fprintf(stderr, "[warden] credentials: SHA-256 failed; refusing to start\n");
+                            ws_stop(&g_secrets);
+                            return 1;
+                        }
+                        vfips_bin2hex(g_cred_ph_sha[k], sizeof g_cred_ph_sha[k], dg, sizeof dg);
                         continue;
                     }
-                    randombytes_buf(rnd, sizeof rnd);
-                    sodium_bin2base64(b64, sizeof b64, rnd, sizeof rnd, sodium_base64_VARIANT_URLSAFE_NO_PADDING);
+                    if (vfips_rand(rnd, sizeof rnd) != 0 ||
+                        vfips_b64url(b64, sizeof b64, rnd, sizeof rnd) != 0) {
+                        vfips_memzero(rnd, sizeof rnd);
+                        fprintf(stderr, "[warden] credentials: no random placeholder; refusing to start\n");
+                        ws_stop(&g_secrets);
+                        return 1;
+                    }
                     snprintf(g_cred_ph[k], sizeof g_cred_ph[k], "varek_ph_%s_%s", p.v.creds[k].name, b64);
-                    crypto_hash_sha256(dg, (const unsigned char *)g_cred_ph[k], strlen(g_cred_ph[k]));
-                    sodium_bin2hex(g_cred_ph_sha[k], sizeof g_cred_ph_sha[k], dg, sizeof dg);
+                    if (vfips_sha256(g_cred_ph[k], strlen(g_cred_ph[k]), dg) != 0) {
+                        vfips_memzero(rnd, sizeof rnd);
+                        fprintf(stderr, "[warden] credentials: SHA-256 failed; refusing to start\n");
+                        ws_stop(&g_secrets);
+                        return 1;
+                    }
+                    vfips_bin2hex(g_cred_ph_sha[k], sizeof g_cred_ph_sha[k], dg, sizeof dg);
                     int el = snprintf(env, sizeof env, "VAREK_CRED_%s", p.v.creds[k].name);
                     for (int q = 11; q < el; q++) env[q] = (char)toupper((unsigned char)env[q]);
                     if (setenv(env, g_cred_ph[k], 1) < 0) {
@@ -6830,7 +6895,7 @@ int main(int argc, char **argv) {
                         ws_stop(&g_secrets);
                         return 1;
                     }
-                    sodium_memzero(rnd, sizeof rnd);
+                    vfips_memzero(rnd, sizeof rnd);
                 }
                 int vs[2];
                 if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, vs) < 0 || ws_hand_to(&g_secrets, vs[0]) < 0 ||
@@ -6853,7 +6918,7 @@ int main(int argc, char **argv) {
     if (p.v.launches && !g_nr.on) {
         if (exec_ruleset_build(&p, target_argv ? boot_path : NULL) < 0 ||
             exec_confined_checks(&p) < 0) {              /* v1.31 */
-            if (g_sk) sodium_free(g_sk);
+            if (g_key) vfips_key_free(g_key);
             return 1;
         }
         fprintf(stderr, "[warden] launch set: %zu files, %s\n", g_exec_n,
@@ -6874,11 +6939,11 @@ int main(int argc, char **argv) {
                     "mapped executable\n");
         } else {
             if (noexec_build(&p, target_argv ? boot_path : NULL) < 0) {
-                if (g_sk) sodium_free(g_sk);
+                if (g_key) vfips_key_free(g_key);
                 return 1;
             }
             if (!g_check_only && noexec_mount() < 0) {      /* step 2: before the agent is forked */
-                if (g_sk) sodium_free(g_sk);
+                if (g_key) vfips_key_free(g_key);
                 return 1;
             }
             size_t gone = 0;
@@ -6924,7 +6989,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[warden] the plan's steps are decided (the node check); a check does not "
                         "step the flow policy or the breaker\n");
             if (warden_verify_plan(plan_path, &p, false) != 0) {
-                if (g_sk) sodium_free(g_sk);
+                if (g_key) vfips_key_free(g_key);
                 return 1;
             }
         }
@@ -6935,7 +7000,7 @@ int main(int argc, char **argv) {
                 gstatus_arg ? ", --gate-status" : "",
                 pidns && !have_cap_sys_admin() ? " (but this user lacks CAP_SYS_ADMIN, which "
                 "a run needs)" : "");
-        if (g_sk) sodium_free(g_sk);
+        if (g_key) vfips_key_free(g_key);
         return 0;
     }
     if (!target_argv && !g_nr.on) { usage(argv[0]); return 2; }
@@ -6969,7 +7034,7 @@ int main(int argc, char **argv) {
     /* v1.26.1: inspecting mode: the run's CA, made by the proxy, and the
      * trust views, before run_start records them */
     if (g_inspect_on && trust_setup(&p) < 0) {
-        if (g_sk) sodium_free(g_sk);
+        if (g_key) vfips_key_free(g_key);
         return 1;
     }
     if (!g_nr.on) emit_run_start(policy_path, &p);     /* v1.34 step 3: node_supervise's, after the launch set */
@@ -6985,7 +7050,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[warden] cannot start the resolver helper (%s); refusing to start\n",
                     strerror(errno));
             emit_run_end(1);
-            if (g_sk) sodium_free(g_sk);
+            if (g_key) vfips_key_free(g_key);
             return 1;
         }
         /* v1.34 step 4: under the node agent, after run_start (node_supervise);
@@ -7004,12 +7069,12 @@ int main(int argc, char **argv) {
         int gate = warden_gate_plan_flow(plan_path, &p);
         if (gate != GATE_PASS) {
             emit_run_end(gate);
-            if (g_sk) sodium_free(g_sk);
+            if (g_key) vfips_key_free(g_key);
             return gate;
         }
     } else if (plan_path && warden_verify_plan(plan_path, &p, true) != 0) {
         emit_run_end(1);                    /* v1.16: a closed (and signed) stream */
-        if (g_sk) sodium_free(g_sk);
+        if (g_key) vfips_key_free(g_key);
         return 1;
     }
     if (g_hold_req && !g_nr.on) {                                          /* v1.35 step 4 */
@@ -7293,7 +7358,7 @@ int main(int argc, char **argv) {
     if (g_names_on) wr_async_stop(&g_names);    /* v1.24 */
     emit_run_end(rc);
     anchor_drain();
-    if (g_sk) sodium_free(g_sk);             /* zeroes it */
+    if (g_key) vfips_key_free(g_key);        /* OpenSSL clears the key */
     close(target_pidfd);
     close(notify_fd);
     if (g_px_failed && rc == 0) rc = 1;      /* v1.26.1 review: the run did not end cleanly */

@@ -1312,11 +1312,12 @@ else
     check "a node agent with no key yet: it makes one" agent nk "$B/p.txt" --node-key "$B/nkey/node.key" \
         --node-name node-1 --anchor "$B/nanchor" --checkpoint-every 16
     NKPUB="$(cat "$B/nkey/node.key.pub" 2>/dev/null)"
-    check "... the key root's and 0400, 64 hex characters; its public key beside it, 0444" sh -c \
-        "[ \"\$(stat -c '%u %a %s' '$B/nkey/node.key')\" = '0 400 65' ] && [ \"\$(stat -c '%u %a' '$B/nkey/node.key.pub')\" = '0 444' ] &&
-         grep -Eqx '[0-9a-f]{64}' '$B/nkey/node.key.pub' && grep -q 'made the node.s key $B/nkey/node.key (node node-1' '$B/nk.log'"
+    check "... the key root's and 0400, a P-384 PEM key (v1.41); its public key beside it, 0444" sh -c \
+        "[ \"\$(stat -c '%u %a' '$B/nkey/node.key')\" = '0 400' ] && [ \"\$(head -n 1 '$B/nkey/node.key')\" = '-----BEGIN PRIVATE KEY-----' ] &&
+         [ \"\$(stat -c '%u %a' '$B/nkey/node.key.pub')\" = '0 444' ] &&
+         grep -Eqx '04[0-9a-f]{192}' '$B/nkey/node.key.pub' && grep -q 'made the node.s key $B/nkey/node.key (node node-1' '$B/nk.log'"
     check "... announced to the anchor: the node's name and its key" \
-        grep -qx "{\"event\":\"node_key\",\"node\":\"node-1\",\"key\":\"$NKPUB\",\"timestamp_ns\":[0-9]*}" "$B/nanchor"
+        grep -qx "{\"event\":\"node_key\",\"node\":\"node-1\",\"key\":\"$NKPUB\",\"sigalg\":\"ecdsa-p384-sha384\",\"timestamp_ns\":[0-9]*}" "$B/nanchor"
     bundle nk1 "$B/s/nk.sock" "/probe reads 40 /data/allowed" 1; run nk1
     check "a container's stream: signed with the node's key, its run_start naming the node" \
         rec nk nk1 "S and S[0]['log_pubkey'] == '$NKPUB' and S[0]['node']['node_name'] == 'node-1' and E"
