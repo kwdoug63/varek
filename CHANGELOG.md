@@ -54,6 +54,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- **warden-secrets accepts JWTs signed RS384, PS384 and ES384 (P-384)**
+  (v1.41), beside RS256, PS256, ES256 and EdDSA, so an identity provider
+  signing CNSA-aligned can be used. With no `kid`, an EC key of the other
+  curve is not counted as a key for the token's algorithm (an issuer may
+  publish a P-256 and a P-384 key side by side).
+- **The run id comes from the crypto provider's DRBG** (v1.41; the FIPS
+  provider's in FIPS mode), not `getrandom(2)`: every random byte VAREK uses
+  now comes from the module.
 - **VAREK implements no cryptography of its own** (v1.41,
   `docs/security/v1.41-cryptography.md`). Every hash, signature, key and
   random byte of the Warden and its tools is the host's OpenSSL 3, through

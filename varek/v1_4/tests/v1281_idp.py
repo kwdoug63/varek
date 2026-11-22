@@ -97,6 +97,7 @@ def serve(d):
         "rsa1": rsa.generate_private_key(public_exponent=65537, key_size=2048),
         "rsa2": rsa.generate_private_key(public_exponent=65537, key_size=2048),
         "ec1": ec.generate_private_key(ec.SECP256R1()),
+        "ec384": ec.generate_private_key(ec.SECP384R1()),    # v1.41: ES384
         "ed1": ed25519.Ed25519PrivateKey.generate(),
         "other": ec.generate_private_key(ec.SECP256R1()),   # not in any JWKS
     }
@@ -110,12 +111,13 @@ def serve(d):
             return {"kty": "RSA", "kid": name, "use": "sig", "n": uint(n.n), "e": uint(n.e)}
         if isinstance(k, ec.EllipticCurvePublicKey):
             n = k.public_numbers()
-            return {"kty": "EC", "kid": name, "crv": "P-256", "x": b64(n.x.to_bytes(32, "big")),
-                    "y": b64(n.y.to_bytes(32, "big"))}
+            cl, crv = (48, "P-384") if isinstance(k.curve, ec.SECP384R1) else (32, "P-256")
+            return {"kty": "EC", "kid": name, "crv": crv, "x": b64(n.x.to_bytes(cl, "big")),
+                    "y": b64(n.y.to_bytes(cl, "big"))}
         raw = k.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         return {"kty": "OKP", "kid": name, "crv": "Ed25519", "x": b64(raw)}
 
-    jwks = {"keys": [jwk("rsa1"), jwk("ec1"), jwk("ed1")]}
+    jwks = {"keys": [jwk("rsa1"), jwk("ec1"), jwk("ed1"), jwk("ec384")]}
     jwks_two = {"keys": [jwk("rsa1"), jwk("rsa2")]}
     # review cases: keys whose use or alg cannot be read (passed over), and one
     # kid on keys of two types (the one of the token's type is used)
@@ -199,14 +201,18 @@ def sign(d, alg, kid, header, claims, key=None):
     if alg == "HS256":                       # the RSA public key as the HMAC secret
         pub = load(d, "rsa1").public_key().public_bytes(PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
         return si.decode() + "." + b64(hmac.new(pub, si, hashlib.sha256).digest())
-    k = key or load(d, {"RS256": "rsa1", "PS256": "rsa1", "ES256": "ec1", "EdDSA": "ed1"}[alg])
-    if alg == "RS256":
-        sig = k.sign(si, padding.PKCS1v15(), hashes.SHA256())
-    elif alg == "PS256":
-        sig = k.sign(si, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32), hashes.SHA256())
-    elif alg == "ES256":
-        r, s = decode_dss_signature(k.sign(si, ec.ECDSA(hashes.SHA256())))
-        sig = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+    k = key or load(d, {"RS256": "rsa1", "PS256": "rsa1", "ES256": "ec1", "EdDSA": "ed1",
+                        "RS384": "rsa1", "PS384": "rsa1", "ES384": "ec384"}[alg])
+    if alg in ("RS256", "RS384"):
+        h_ = hashes.SHA384() if alg == "RS384" else hashes.SHA256()
+        sig = k.sign(si, padding.PKCS1v15(), h_)
+    elif alg in ("PS256", "PS384"):
+        h_ = hashes.SHA384() if alg == "PS384" else hashes.SHA256()
+        sig = k.sign(si, padding.PSS(mgf=padding.MGF1(h_), salt_length=h_.digest_size), h_)
+    elif alg in ("ES256", "ES384"):
+        cl, h_ = (48, hashes.SHA384()) if alg == "ES384" else (32, hashes.SHA256())
+        r, s = decode_dss_signature(k.sign(si, ec.ECDSA(h_)))
+        sig = r.to_bytes(cl, "big") + s.to_bytes(cl, "big")
     else:
         sig = k.sign(si)
     return si.decode() + "." + b64(sig)
@@ -217,8 +223,11 @@ def mint(d, case, iss):
     c = {"iss": iss, "sub": "alice@example.test", "aud": AUD, "exp": t + 3600, "iat": t - 10, "nbf": t - 10,
          "jti": "jti-" + case}
     alg, kid, hdr, key = "ES256", "ec1", {}, None
-    if case in ("rs256", "ps256", "eddsa"):
-        alg, kid = {"rs256": ("RS256", "rsa1"), "ps256": ("PS256", "rsa1"), "eddsa": ("EdDSA", "ed1")}[case]
+    if case in ("rs256", "ps256", "eddsa", "rs384", "ps384", "es384"):
+        alg, kid = {"rs256": ("RS256", "rsa1"), "ps256": ("PS256", "rsa1"), "eddsa": ("EdDSA", "ed1"),
+                    "rs384": ("RS384", "rsa1"), "ps384": ("PS384", "rsa1"), "es384": ("ES384", "ec384")}[case]
+    elif case == "es384-nokid":             # beside a P-256 key: the curve picks the key
+        alg, kid = "ES384", None
     elif case == "es256-nokid":
         kid = None
     elif case == "rs256-nokid":             # with /jwks-two: two RSA keys

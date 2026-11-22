@@ -199,13 +199,17 @@ for l in open(sys.argv[1]):
     (cd "$T" && timeout 60 "$WARDEN" "$T/p.txt" --secrets-conf "$T/conf" --on-behalf-of "$T/tok" -- /usr/bin/env > "$OUT/env.out" 2> "$OUT/env.err")
     check "nor in the agent's environment" sh -c "grep -q '^PATH=' '$OUT/env.out' && ! grep -qF -- '$TOKSIG' '$OUT/env.out' && ! grep -qF -- '$TOKPAY' '$OUT/env.out'"
     check "the helper is gone once the identities are verified" sh -c "! pgrep -fx 'warden-secrets [0-9]+:[0-9]+'"
-    for c in rs256:RS256:rsa1 ps256:PS256:rsa1 eddsa:EdDSA:ed1; do
+    # v1.41: the SHA-384 forms (RS384, PS384, ES384 on P-384), CNSA-aligned issuers'
+    for c in rs256:RS256:rsa1 ps256:PS256:rsa1 eddsa:EdDSA:ed1 rs384:RS384:rsa1 ps384:PS384:rsa1 es384:ES384:ec384; do
         n="${c%%:*}"; a="$(echo "$c" | cut -d: -f2)"; k="${c##*:}"
         mint "$n"; go "$n" "$T/p.txt" --on-behalf-of "$T/tok"
         check "a $a token: verified with the issuer's key $k" sh -c "grep -qx 0 '$OUT/$n.rc' && grep -q 'token verified ($a, key $k)' '$OUT/$n.out'"
     done
     mint es256-nokid; go nokid "$T/p.txt" --on-behalf-of "$T/tok"
     check "a token naming no key, with one key for its algorithm: verified" sh -c "grep -qx 0 '$OUT/nokid.rc' && grep -q 'token verified (ES256)' '$OUT/nokid.out'"
+    mint es384-nokid; go nokid384 "$T/p.txt" --on-behalf-of "$T/tok"
+    check "an ES384 token naming no key, the issuer's P-256 key beside its P-384 one: verified (the curve picks the key)" \
+        sh -c "grep -qx 0 '$OUT/nokid384.rc' && grep -q 'token verified (ES384)' '$OUT/nokid384.out'"
     check "the keys from the issuer's discovery document" sh -c "grep -q 'GET /.well-known/openid-configuration' '$T/requests.log' && grep -q 'GET /jwks$' '$T/requests.log'"
     mint aud-array; go audarr "$T/p.txt" --on-behalf-of "$T/tok"
     check "an audience array holding the policy's audience: verified" ok audarr
@@ -791,7 +795,7 @@ sys.exit(0 if P.get("varek:on_behalf_of.user.subject") == "alice@example.test" a
     VL() { python3 -c 'import importlib.machinery,sys
 m = importlib.machinery.SourceFileLoader("varekcli", sys.argv[1]).load_module()
 print(*m.issuer_keys(sys.argv[2], None, sys.argv[3]))' "$HERE/tools/varek" "$@"; }
-    check "varek doctor's issuer check: the stand-in's keys" sh -c "$(declare -f VL); HERE='$HERE' VL '$ISS' '$T/conf' | grep -q '^True 3 key(s) (EC, OKP, RSA) at $ISS/jwks'"
+    check "varek doctor's issuer check: the stand-in's keys" sh -c "$(declare -f VL); HERE='$HERE' VL '$ISS' '$T/conf' | grep -q '^True 4 key(s) (EC, OKP, RSA) at $ISS/jwks'"
     check "... and an issuer whose discovery names another" sh -c "$(declare -f VL); HERE='$HERE' VL '$ISS/liar' '$T/conf' | grep -q 'names another issuer'"
 fi
 

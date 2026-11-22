@@ -570,7 +570,7 @@ Model-B techniques below, with the residual limits stated honestly.
   `subagent=` in the policy:
   - *The user is verified, not asserted.* The token given with
     `--on-behalf-of` (a root-owned file) is checked by `warden-secrets`:
-    a signature by the trusted issuer's key (RS256, PS256, ES256 or EdDSA;
+    a signature by the trusted issuer's key (RS256, PS256, ES256, RS384, PS384, ES384 or EdDSA;
     `none`, every HMAC algorithm, `crit`, and keys the token carries or
     points to refused), the issuer, the audience, at least 60 s before
     its expiry, `nbf` and `iat`, a canonical encoding, an `act` chain at

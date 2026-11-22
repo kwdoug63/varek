@@ -2531,13 +2531,10 @@ static int log_init(void) {
     if (!g_rf) return -1;
     if (vfips_sha384(LOG_CHAIN_IV, sizeof LOG_CHAIN_IV - 1, g_chain) != 0) return -1;
     clock_gettime(CLOCK_MONOTONIC, &g_last_ckpt);
+    /* v1.41: the run id's 128 bits from the crypto provider's DRBG (the FIPS
+     * provider's, in FIPS mode), as every other random byte VAREK uses */
     unsigned char rnd[16];
-    size_t got = 0;
-    while (got < sizeof rnd) {
-        ssize_t n = getrandom(rnd + got, sizeof rnd - got, 0);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
-        got += (size_t)n;
-    }
+    if (vfips_rand(rnd, sizeof rnd) != 0) return -1;
     for (size_t i = 0; i < sizeof rnd; i++)
         snprintf(g_run_id + 2 * i, 3, "%02x", rnd[i]);
     return 0;
