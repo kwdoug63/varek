@@ -101,7 +101,11 @@ int vfips_init(int flags, char *why, size_t wn) {
     // never loaded into a FIPS run. activate_fips() then checks that the
     // validated module is what VAREK's default fetches resolve to.
 #ifdef VAREK_REQUIRE_FIPS
-    if (activate_fips() != 0) {
+    // The host in FIPS mode first: RHEL's FIPS provider loads, and services
+    // every fetch, whether or not the host is in FIPS mode, but it is the
+    // validated module only on a host in FIPS mode (its security policy).
+    // Off FIPS mode nothing is loaded and init refuses.
+    if (!kernel_fips_mode() || activate_fips() != 0) {
         snprintf(g_init_why, sizeof g_init_why,
                  "the FIPS provider is not active%s; this Defense build runs only "
                  "with the host's FIPS 140-3 validated OpenSSL module",

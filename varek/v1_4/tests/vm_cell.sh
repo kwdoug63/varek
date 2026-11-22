@@ -123,6 +123,7 @@ if [ "$CMD" = inside ]; then
             'go \(not installed\)'          # nor Go, on a dnf host; Ubuntu's sweep (warden-build.yml) runs both
             '^musl \('                      # no musl-gcc in Amazon Linux 2023's repositories (arm64_sweep.sh notes it)
             'no git or no v1\.13\.0 tag'     # the checkout is shallow, without tags
+            'needs a host in FIPS mode'     # v1.41: these VMs are not; tests/fips_acceptance.sh runs on one
         )
         allowed="$(IFS='|'; echo "${EXPECTED_SKIPS[*]}")"
         for f in "$OUT"/sweep/test-*.log "$OUT"/sweep/crosscheck.log; do
