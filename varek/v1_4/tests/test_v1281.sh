@@ -200,8 +200,11 @@ for l in open(sys.argv[1]):
     check "nor in the agent's environment" sh -c "grep -q '^PATH=' '$OUT/env.out' && ! grep -qF -- '$TOKSIG' '$OUT/env.out' && ! grep -qF -- '$TOKPAY' '$OUT/env.out'"
     check "the helper is gone once the identities are verified" sh -c "! pgrep -fx 'warden-secrets [0-9]+:[0-9]+'"
     # v1.41: and the SHA-384 forms (CNSA's), ES384 on the issuer's P-384 key
+    # (EdDSA only where the host's provider offers Ed25519: not in FIPS mode)
+    ED=0; [ -s "$T/key-ed1.pem" ] && ED=1
     for c in rs256:RS256:rsa1 ps256:PS256:rsa1 eddsa:EdDSA:ed1 rs384:RS384:rsa1 ps384:PS384:rsa1 es384:ES384:ec384; do
         n="${c%%:*}"; a="$(echo "$c" | cut -d: -f2)"; k="${c##*:}"
+        if [ "$n" = eddsa ] && [ "$ED" = 0 ]; then skip "an EdDSA token (this host's provider offers no Ed25519: FIPS mode)"; continue; fi
         mint "$n"; go "$n" "$T/p.txt" --on-behalf-of "$T/tok"
         check "a $a token: verified with the issuer's key $k" sh -c "grep -qx 0 '$OUT/$n.rc' && grep -q 'token verified ($a, key $k)' '$OUT/$n.out'"
     done
@@ -795,7 +798,8 @@ sys.exit(0 if P.get("varek:on_behalf_of.user.subject") == "alice@example.test" a
     VL() { python3 -c 'import importlib.machinery,sys
 m = importlib.machinery.SourceFileLoader("varekcli", sys.argv[1]).load_module()
 print(*m.issuer_keys(sys.argv[2], None, sys.argv[3]))' "$HERE/tools/varek" "$@"; }
-    check "varek doctor's issuer check: the stand-in's keys" sh -c "$(declare -f VL); HERE='$HERE' VL '$ISS' '$T/conf' | grep -q '^True 4 key(s) (EC, OKP, RSA) at $ISS/jwks'"
+    if [ "$ED" = 1 ]; then KEYS='4 key(s) (EC, OKP, RSA)'; else KEYS='3 key(s) (EC, RSA)'; fi
+    check "varek doctor's issuer check: the stand-in's keys" sh -c "$(declare -f VL); HERE='$HERE' VL '$ISS' '$T/conf' | grep -q '^True $KEYS at $ISS/jwks'"
     check "... and an issuer whose discovery names another" sh -c "$(declare -f VL); HERE='$HERE' VL '$ISS/liar' '$T/conf' | grep -q 'names another issuer'"
 fi
 

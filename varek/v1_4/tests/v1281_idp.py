@@ -84,6 +84,16 @@ def ku(sign=True, cert_sign=False):
 
 # ---- serve ----
 
+def ed25519_key():
+    """v1.41: an Ed25519 key, or None on a host whose provider does not offer
+    it (the FIPS provider in FIPS mode): the issuer then has no EdDSA key, and
+    the suite skips the EdDSA token."""
+    try:
+        return ed25519.Ed25519PrivateKey.generate()
+    except Exception:
+        return None
+
+
 def serve(d):
     ck = ec.generate_private_key(ec.SECP256R1())
     cn = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "v1281 test CA")])
@@ -98,9 +108,10 @@ def serve(d):
         "rsa2": rsa.generate_private_key(public_exponent=65537, key_size=2048),
         "ec1": ec.generate_private_key(ec.SECP256R1()),
         "ec384": ec.generate_private_key(ec.SECP384R1()),      # v1.41: ES384
-        "ed1": ed25519.Ed25519PrivateKey.generate(),
+        "ed1": ed25519_key(),                                 # None where not offered (FIPS mode)
         "other": ec.generate_private_key(ec.SECP256R1()),   # not in any JWKS
     }
+    keys = {k: v for k, v in keys.items() if v is not None}
     for name, k in keys.items():
         open(os.path.join(d, "key-%s.pem" % name), "wb").write(key_pem(k))
 
@@ -118,7 +129,7 @@ def serve(d):
 
     # v1.41: the P-384 key without alg: an ES256 token naming no key still has
     # one key for it (the curve's), and an ES384 one too
-    jwks = {"keys": [jwk("rsa1"), jwk("ec1"), jwk("ed1"), jwk("ec384")]}
+    jwks = {"keys": [jwk(k) for k in ("rsa1", "ec1", "ed1", "ec384") if k in keys]}
     jwks_two = {"keys": [jwk("rsa1"), jwk("rsa2")]}
     # review cases: keys whose use or alg cannot be read (passed over), and one
     # kid on keys of two types (the one of the token's type is used)

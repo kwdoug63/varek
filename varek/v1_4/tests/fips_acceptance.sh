@@ -22,11 +22,16 @@
 #      anchored, every forgery caught), its hashing and signing the FIPS
 #      provider's.
 #   5. tests/test_v1161.sh with the Defense binaries: the preflight.
-#   6. The audit's own crypto in FIPS mode (Python): hashlib refuses MD5 for
+#   6. tests/test_v1281.sh with this checkout's binaries, which in FIPS mode
+#      activate the FIPS provider too: the user's token verified by
+#      warden-secrets through it, RS384, PS384 and ES384 among them (EdDSA
+#      skipped where Ed25519 is not offered). The core binaries, as the
+#      Defense build refuses the credential rules the suite also uses.
+#   7. The audit's own crypto in FIPS mode (Python): hashlib refuses MD5 for
 #      security; cryptography's ECDSA P-384 verifies RFC 6979's vectors; whether
 #      Ed25519 is offered (if not, logs of v1.40 or earlier are checked on a
 #      host not in FIPS mode; the audit says so, not that they are forged).
-#   7. For information: EdDSA (JWT tokens checked by warden-secrets) in the FIPS
+#   8. For information: EdDSA (JWT tokens checked by warden-secrets) in the FIPS
 #      provider.
 # Everything goes to OUT/varek-fips-acceptance-HOST-DATE/, with SUMMARY.txt
 # (one PASS/FAIL/INFO line each, then the result), and to a .tar.gz of it.
@@ -102,7 +107,7 @@ rpm -q openssl openssl-libs openssl-fips-provider openssl-fips-provider-so pytho
 note "module packages: $(grep -v 'not installed' "$E/packages.txt" | tr '\n' ' ')(the CMVP certificate is named by the openssl-libs / fips provider version)"
 
 echo "== 2. the Defense build ==" | tee -a "$S"
-make -s -C "$HERE" all > "$E/build-core.txt" 2>&1 && ok "make all (this checkout)" || bad "make all: $(tail -2 "$E/build-core.txt")"
+make -s -C "$HERE" all tests/v1281_sub > "$E/build-core.txt" 2>&1 && ok "make all (this checkout)" || bad "make all: $(tail -2 "$E/build-core.txt")"
 mkdir -p "$T/tree/varek"; cp -a "$ROOT/v1_6" "$ROOT/v1_7" "$T/tree/"; cp -a "$HERE" "$T/tree/varek/v1_4"
 DEF="$T/tree/varek/v1_4"
 make -s -C "$DEF" clean > /dev/null 2>&1
@@ -139,7 +144,16 @@ echo "== 5. test_v1161, the preflight, with the Defense binaries ==" | tee -a "$
 "$DEF/tests/test_v1161.sh" "$DEF/warden" "$DEF/tools/vdp_cert_check" > "$E/test_v1161-defense.txt" 2>&1 \
   && ok "test_v1161 (Defense): PASS" || bad "test_v1161 (Defense): FAIL ($(grep '  FAIL' "$E/test_v1161-defense.txt" | head -3 | tr '\n' ';'))"
 
-echo "== 6. the audit's own crypto (Python) in FIPS mode ==" | tee -a "$S"
+echo "== 6. test_v1281, the user's token through the FIPS provider (this checkout's binaries) ==" | tee -a "$S"
+"$HERE/tests/test_v1281.sh" "$HERE/tools/vdp_check" "$HERE/tools/vdp_cert_check" "$HERE/warden" > "$E/test_v1281.txt" 2>&1 \
+  && ok "test_v1281 (FIPS mode): PASS ($(grep -c '  PASS' "$E/test_v1281.txt") checks, $(grep -c '  SKIP' "$E/test_v1281.txt") skipped)" \
+  || bad "test_v1281 (FIPS mode): FAIL ($(grep '  FAIL' "$E/test_v1281.txt" | head -3 | tr '\n' ';'))"
+for a in RS384:rsa1 PS384:rsa1 ES384:ec384; do
+    grep -q "PASS   a ${a%%:*} token: verified with the issuer's key ${a##*:}" "$E/test_v1281.txt" \
+      && ok "... a ${a%%:*} token verified in FIPS mode" || bad "... a ${a%%:*} token in FIPS mode (test_v1281.txt)"
+done
+
+echo "== 7. the audit's own crypto (Python) in FIPS mode ==" | tee -a "$S"
 python3 - "$HERE/tools" > "$E/python-fips.txt" 2>&1 <<'EOF'
 import hashlib, sys
 sys.path.insert(0, sys.argv[1])
@@ -175,7 +189,7 @@ else
     note "Ed25519 is offered here even in FIPS mode: v1.40 logs can be checked on this host"
 fi
 
-echo "== 7. for information ==" | tee -a "$S"
+echo "== 8. for information ==" | tee -a "$S"
 openssl list -signature-algorithms -provider fips > "$E/fips-signature-algorithms.txt" 2>&1
 grep -qi ed25519 "$E/fips-signature-algorithms.txt" \
   && note "the fips provider lists ED25519 (approved or not: see fips-signature-algorithms.txt); EdDSA JWTs for warden-secrets may verify" \
