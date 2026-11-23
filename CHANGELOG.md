@@ -51,8 +51,18 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `docs/security/openssf-best-practices.md`: the answer given for each
   OpenSSF Best Practices criterion (project 16965), and how the CodeQL
   findings open at submission were fixed or dismissed, with each reason.
+- **The user's token may be signed with RS384, PS384 or ES384** (v1.41), the
+  SHA-384 forms a CNSA-aligned identity provider uses, besides RS256, PS256,
+  ES256 and EdDSA. An ES384 token is checked with a P-384 key only, ES256 with
+  a P-256 one: a key of the other curve is passed over, as one of another type
+  is, so a token naming the issuer's P-256 key with ES384 is refused. `run_start` records the algorithm, and
+  the audit accepts the three.
 
 ### Changed
+
+- **The run id comes from the crypto provider's DRBG** (v1.41), the FIPS
+  provider's in FIPS mode, as every other random byte the Warden uses (it came
+  from `getrandom(2)`). Nothing else changes: 16 bytes, as 32 hex digits.
 
 - **VAREK implements no cryptography of its own** (v1.41,
   `docs/security/v1.41-cryptography.md`). Every hash, signature, key and

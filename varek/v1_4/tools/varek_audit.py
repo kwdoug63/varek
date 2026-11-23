@@ -1870,7 +1870,7 @@ class TokenScan:
         echo = "decision_final" in rec or rec.get("event") == "dns_question"
         for k, x in rec.items():
             walk(x, k, echo, f"line {i}")
-JWT_ALGS = ("RS256", "PS256", "ES256", "EdDSA")
+JWT_ALGS = ("RS256", "PS256", "ES256", "EdDSA", "RS384", "PS384", "ES384")      # v1.41: the SHA-384 forms
 
 
 class ChainCheck:
