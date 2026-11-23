@@ -252,6 +252,23 @@ run() {
     sleep 0.5
 }
 stream() { ls "$B/streams-$1"/v1340-$2.*.jsonl 2>/dev/null | head -1; }
+# diag RUN AGENT: why a run's check failed. Its first two lines follow the
+# FAIL line, which the node-agent sweep copies into the job's log with the two
+# lines after it (the artifact is not where every reader can fetch it); the
+# rest goes to this log: the container's output, the node agent's log, its
+# streams. The run's directory is gone after the suite, so this is all there is.
+diag() {
+    local n="$1" a="$2" s
+    printf '     why: rc=%s; the container said: %s\n' "$(cat "$B/$n.rc" 2>/dev/null || echo '?')" \
+        "$(grep -v '^$' "$B/$n.out" 2>/dev/null | tail -3 | tr '\n' '|' | cut -c1-200)"
+    printf '     agent: %s\n' "$(grep -v '^$' "$B/$a.log" 2>/dev/null | tail -3 | tr '\n' '|' | cut -c1-220)"
+    echo "     -- $n's output"; sed 's/^/        /' "$B/$n.out" 2>/dev/null
+    echo "     -- the node agent's log ($a), its last 40 lines"; tail -40 "$B/$a.log" 2>/dev/null | sed 's/^/        /'
+    echo "     -- its streams"; ls -l "$B/streams-$a" 2>/dev/null | sed 's/^/        /'
+    s="$(stream "$a" "$n")"
+    [ -n "$s" ] && { echo "     -- $n's stream, its first 3000 bytes"; head -c 3000 "$s" | sed 's/^/        /'; echo; }
+    return 0
+}
 said() { grep -qx "$2" "$B/$1.out"; }
 rec() { python3 - "$(stream "$1" "$2")" "$3" <<'PY'
 import json, sys
@@ -1205,6 +1222,8 @@ PY
         WANT="$(cd "$TB/..2026_10_28_10_00_00.1" && pwd -P)/corp.pem"
         check "a pod's trust bundle: the command ran, run_start's roots the bundle's (the node's ConfigMap, read in the node's view)" \
             sh -c "grep -qx 'read_allowed: ok allowed content' '$B/tb1.out'"
+        # (it failed once in CI, November 23, 2026, with nothing kept to say why)
+        grep -qx 'read_allowed: ok allowed content' "$B/tb1.out" || diag tb1 tb
         check "... run_start: that file, its SHA-256" rec tb tb1 \
             'S and S[0]["trust"]["host_bundle"] == "'"$WANT"'" and S[0]["trust"]["host_bundle_sha256"] == "'"$(sha256sum "$TBS" | cut -d' ' -f1)"'"'
         lbundle tb2 "$B/s/tb.sock" "$B/f/tb.json" tb "/varek/init -- /probe" trust=nosuch.pem; in_pod tb2; run tb2
