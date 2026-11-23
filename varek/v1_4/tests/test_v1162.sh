@@ -233,7 +233,7 @@ echo "== 4. extra anchor lines neither fool nor block the audit"
 line="$(grep "\"run\":\"$R1\"" "$RF" | grep '"event":"run_end"' | head -1)"
 { printf '%s\n' "${line/\"records\":/\"records\":9}"         # conflicting, placed FIRST, still validly signed
   cat "$RF"
-  printf '%s\n' "$(sed -E 's/"sig":"[0-9a-f]{128}"/"sig":"'"$(printf '0%.0s' $(seq 1 128))"'"/' <<<"$line")"
+  printf '%s\n' "$(sed -E 's/"sig":"[0-9a-f]+"/"sig":"'"$(printf '0%.0s' $(seq 1 128))"'"/' <<<"$line")"
   echo 'this is not JSON'
   printf '{"run":"%s","records":%s}\n' "$R1" "$(head -c 5000 /dev/zero | tr '\0' 7)"   # a 5000-digit number
 } > "$OUT/extra.log"
@@ -247,11 +247,12 @@ if python3 -c "import cryptography" 2>/dev/null; then
     # does not hold, after the run ended: noted, not a failure.
     python3 - "$OUT/log.key" "$R1" > "$OUT/bogus.line" <<'EOF'
 import os, sys, time
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-k = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(open(sys.argv[1]).read().strip()))
-ch = os.urandom(32)
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+k = serialization.load_pem_private_key(open(sys.argv[1], "rb").read(), password=None)   # v1.41: P-384
+ch = os.urandom(48)
 print('{"run":"%s","event":"checkpoint","records":3,"chain":"%s","sig":"%s","timestamp_ns":%d}'
-      % (sys.argv[2], ch.hex(), k.sign(b"VAREK-LOG-SIG-1" + ch).hex(), time.time_ns()))
+      % (sys.argv[2], ch.hex(), k.sign(b"VAREK-LOG-SIG-2" + ch, ec.ECDSA(hashes.SHA384())).hex(), time.time_ns()))
 EOF
     "${SSH[@]}" -i "$OUT/fwkey" "$U@127.0.0.1" < "$OUT/bogus.line" >/dev/null 2>&1
     o="$("${A[@]}" --pubkey "$OUT/log.key.pub" --anchor "$RF" "$LOGD/v1.log" 2>&1)"

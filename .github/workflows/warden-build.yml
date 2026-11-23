@@ -1,7 +1,7 @@
 name: Warden build
 
-# v1.16.1: the Warden (varek/v1_4) needs the libseccomp and libsodium
-# development headers. This builds it and its tools with exactly those
+# v1.16.1: the Warden (varek/v1_4) needs the libseccomp and (v1.41) OpenSSL 3
+# development headers; libsodium is no longer used. This builds it and its tools with exactly those
 # packages, lints the shipped policies, and runs the preflight check on each
 # (no root: the dependency, build, policy and verdict-stream checks).
 # v1.16.3: it also builds and tests v1_6/plan_verify, the Verdict Service's
@@ -27,7 +27,7 @@ jobs:
   build:
     # v1.30: every step on x86_64 and on arm64 (GitHub's arm64 Linux runners),
     # from the same source (docs/security/v1.30-macos.md, D2 and D5)
-    name: Build the Warden with libseccomp + libsodium (${{ matrix.arch }})
+    name: Build the Warden with libseccomp + OpenSSL (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
@@ -47,7 +47,7 @@ jobs:
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
             | sudo tee /etc/apt/apt.conf.d/80varek-ci-retries > /dev/null
           sudo apt-get update
-          sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
+          sudo apt-get install -y build-essential libseccomp-dev libssl-dev
           # v1.24: test_v1240.sh runs a Java client as the agent, with the
           # distribution's OpenJDK (the runner's preinstalled JDKs differ)
           sudo apt-get install -y openjdk-21-jdk-headless musl-tools
