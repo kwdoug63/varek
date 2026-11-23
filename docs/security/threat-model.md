@@ -1,6 +1,6 @@
 # VAREK — Threat Model
 
-Version: current as of v1.40.0 (released November 20, 2026) · MIT · github.com/kwdoug63/varek
+Version: current as of v1.41.0 (released November 2026) · MIT · github.com/kwdoug63/varek
 
 This document states what VAREK defends, against whom, and what it explicitly
 does not defend. It is deliberately conservative: where a guarantee is
@@ -305,7 +305,8 @@ Model-B techniques below, with the residual limits stated honestly.
   - *Authorization-record integrity.* Every agent-controlled string is escaped, so
     no input can begin, end, or forge a record in the verdict stream. Records
     carry the resolved object the decision was made on. From v1.16 records are
-    hash-chained, checkpoints are Ed25519-signed (`--sign-key`) and optionally
+    hash-chained, checkpoints are signed (`--sign-key`; Ed25519 through v1.40,
+    ECDSA P-384 over a SHA-384 chain from v1.41) and optionally
     appended to an external anchor (`--anchor`), so the log's holder cannot
     alter, insert, remove, reorder or truncate records undetected before the
     last signature (without the key) or before the last anchored checkpoint
@@ -1087,9 +1088,19 @@ are claimed as solved.
   - *A lookup through a file* (`dir/file/x`) is EACCES, not ENOTDIR; the
     working directory's ancestors and the shell's start-up files are not
     readable.
-  - *libcrypto in the Warden.* From v1.29.0 the Warden links OpenSSL's
-    libcrypto for the launch set's SHA-256 only, initialised so that it
-    reads no configuration file (no provider or module is loaded).
+  - *libcrypto in the Warden.* From v1.29.0 the Warden linked OpenSSL's
+    libcrypto for the launch set's SHA-256 only. From v1.41 every hash,
+    signature and random byte of the Warden and its tools is OpenSSL's,
+    through one backend (`varek_fips.c`), initialised without reading a
+    configuration file; on a host in FIPS mode it loads the FIPS provider.
+    VAREK implements no cryptographic algorithm of its own, so the log's
+    integrity rests on the host's OpenSSL (`docs/security/v1.41-cryptography.md`).
+  - *The audit verifies with the signer's library (v1.41).* Through v1.40
+    the audit checked libsodium's Ed25519 signatures with its own Python
+    code; from v1.41 the Warden signs and the audit verifies with OpenSSL,
+    as FIPS requires of both. A flaw in OpenSSL's ECDSA would not be caught
+    by the audit's signature check; the hash chain and the external anchor
+    still are.
   - *Review.* v1.29.0 had a correctness review (the code read, GCC's
     static analyzer, the suite under ASan and UBSan) and dry runs of four
     real agents. The adversarial review by AI review agents the ship gates

@@ -9,14 +9,27 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [1.41.0] - 2026-11-24 — VAREK implements no cryptography of its own
+
+Every hash, signature, key and random byte of the Warden and its tools is
+the host's OpenSSL 3, through one backend; libsodium and VAREK's own SHA-256
+and Ed25519 code are gone. The verdict stream moves to format chain-2
+(SHA-384, ECDSA P-384), and v1.40 logs still verify. The Defense build
+(`make DEFENSE=1`) runs only on a host in FIPS mode with its FIPS 140-3
+validated module servicing it, and leaves TLS-inspecting mode out. The
+sector packs move to `require warden 1.29`; the Falcon Next-Gen SIEM
+export is in, tested against a stand-in. CrowdStrike Falcon Foundry and
+Wiz move to v1.42.0.
+
 ### Added
 
 - **The Defense build, `make DEFENSE=1`** (v1.41,
   `docs/security/v1.41-cryptography.md`). Two switches, fixed at build time:
   the Warden, warden-secrets and varek_keygen refuse to start unless the
-  host's FIPS 140-3 validated OpenSSL provider services their hashing and
-  signing (fail closed: off FIPS mode the Warden will not even lint a
-  policy); and the egress proxy's TLS-inspecting mode is not compiled in,
+  host is in FIPS mode and its FIPS 140-3 validated OpenSSL provider
+  services their hashing and signing (fail closed: off FIPS mode the Warden
+  will not even lint a policy, even where Red Hat's FIPS provider is
+  installed, which loads off FIPS mode too); and the egress proxy's TLS-inspecting mode is not compiled in,
   so `warden-proxy` links no TLS or crypto library at all, and a policy that
   says `proxy inspect` (and so request rules, mcp rules, credentials and
   passthrough hosts) is refused on every path that loads one. `make DEFENSE=1`
@@ -29,7 +42,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   P-384 vectors, the Defense switch's refusal), no libsodium in any binary or
   source and no hash of VAREK's own, the Defense build's binaries and
   refusals, and `proxy inspect` refused. `make fips-acceptance` runs the
-  Defense build's acceptance on RHEL 9 in FIPS mode and keeps its evidence.
+  Defense build's acceptance on RHEL 9 in FIPS mode and keeps its evidence;
+  it names what is not installed before it builds, and checks the user's
+  token (RS384, PS384, ES384) through the FIPS provider (`test_v1281` with
+  the core binaries, the EdDSA token skipped where Ed25519 is not offered).
 - `tests/v140_fixture`: a verdict stream, anchor and CycloneDX evidence the
   v1.40.0 Warden wrote, which the audit and exporter must go on verifying.
 - **CrowdStrike Falcon Next-Gen SIEM export, against a stand-in** (v1.41,

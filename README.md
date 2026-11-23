@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Language](https://img.shields.io/badge/language-v1.0%20stable-blue.svg)](https://github.com/kwdoug63/varek/releases)
-[![Runtime](https://img.shields.io/badge/runtime-v1.40.0-green.svg)](https://github.com/kwdoug63/varek/releases)
+[![Runtime](https://img.shields.io/badge/runtime-v1.41.0-green.svg)](https://github.com/kwdoug63/varek/releases)
 [![Verdict](https://img.shields.io/badge/verdict-SATISFIED%20%7C%20UNSATISFIED%20%7C%20UNKNOWN-7a5cff.svg)](#the-verdict-model)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/16965/badge)](https://www.bestpractices.dev/projects/16965)
@@ -71,7 +71,7 @@ VAREK has two layers, developed in sequence:
 
 1. **The Warden runtime** — the verification and enforcement layer. It is where
    active development lives and where the verification thesis above is realized.
-   **Current release: v1.40.0.**
+   **Current release: v1.41.0.**
 2. **VAREK the language** — a statically-typed, LLVM-compiled language for AI/ML
    pipelines, where unsafe operations are not expressible in the first place.
    **Stable at v1.0.**
@@ -138,6 +138,7 @@ The runtime line has progressed well beyond simple syscall containment:
   "Never requires a human" becomes certified rather than hoped. Since v1.18.0 the
   Warden runs it on the `--flow-policy` at startup and refuses to start if it
   fails.
+- **v1.41.0 — VAREK implements no cryptography of its own.** Every hash, signature, key and random byte of the Warden and its tools is now the host's OpenSSL 3, through one backend (`varek_fips.c`); libsodium and VAREK's own SHA-256 and Ed25519 code are gone. The verdict stream moves to format chain-2: a SHA-384 chain, signed with ECDSA P-384 (CNSA-aligned), and CycloneDX evidence signs with ES384. Logs and evidence written by v1.40 and earlier still verify; `sudo varek init` replaces a v1.40 host's Ed25519 key and keeps its public half for the old runs. The Defense build (`make DEFENSE=1`) runs only on a host in FIPS mode with its FIPS 140-3 validated module servicing every hash and signature (fail closed, otherwise), records `crypto_provider: fips` in each run's signed start, and leaves TLS-inspecting mode out, so its egress proxy links no crypto library; `varek_audit.py --require-fips` checks it. Accepted on RHEL 9.8 in FIPS mode. The user's token may also be signed RS384, PS384 or ES384, and the run id comes from the provider's random generator. The sector packs move to `require warden 1.29` (files opened as the agent's own user), and `varek export --format falcon` sends a run's events to CrowdStrike Falcon Next-Gen SIEM (tested against a stand-in). Falcon Foundry and Wiz move to v1.42.0. See [`RELEASE-v1.41.0.md`](./RELEASE-v1.41.0.md) and [`docs/security/v1.41-cryptography.md`](./docs/security/v1.41-cryptography.md).
 - **v1.40.0 — security operations: Microsoft Sentinel.** `varek export --format sentinel` sends a run's OCSF events, audited first, to Microsoft Sentinel's workspace as rows of `VarekOCSF_CL`, through the Azure Monitor Logs Ingestion API (a client secret from the environment, or an Azure VM's managed identity); `--follow` sends a live run's. `integrations/sentinel` deploys the table and data collection rule, three analytics rules and a workbook: a refusal raises an incident naming its policy line, a tampered verdict stream a High one, each judged when its row arrives, up to a day after the run. An export that fails partway names where its unsent events begin, and `--from-position N` sends the rest. The sector packs now say `require warden 1.27`: their `allow exec` lines decide which programs an agent may launch (any other refused), their writable directories are mounted `noexec`, and an agent starts under them with no refusals. Tested live in a Sentinel workspace, and with a 24-hour soak on GKE. CrowdStrike Falcon and Wiz move to v1.41.0. Includes v1.39.1's license check for AWS Marketplace's hourly listing. The Warden's code is unchanged. See [`RELEASE-v1.40.0.md`](./RELEASE-v1.40.0.md).
 - **v1.39.0 — security operations: OpenTelemetry and Splunk.** A run's OCSF events, audited first as `varek export --format ocsf` writes them, go where security teams look. `varek export --format otlp` sends them to an OpenTelemetry collector (and through it to Grafana, Datadog, Honeycomb, Elastic) as OTLP log records, a refusal a WARN naming its policy line; `--format splunk` sends them to a Splunk HTTP Event Collector, and a Splunk app names their fields and gives a dashboard of refusals by policy line, agent and run, dry runs and failed audits. With `--follow` a live run's events go as they are decided. Keys come from the environment, never the command line; a refusal or lost batch ends the export with exit 1. Tested against Grafana Cloud and Splunk Enterprise 10.4.5: a live run's refusals there within about two seconds. Microsoft Sentinel, CrowdStrike Falcon and Wiz are v1.40.0. The Warden decides nothing differently. See [`RELEASE-v1.39.0.md`](./RELEASE-v1.39.0.md).
 - **v1.38.0 — hardening: git's settings, the VM's agent user and network.** Three of v1.37.0's known limits closed. The baseline policy never writes the working directory's git settings and hooks (`.git/config`, `.git/hooks/`, a worktree's and a submodule's), which git runs, on a Mac outside the Warden too; reads and git's other files are as before. On a Mac, the agent runs in the VM as a user of its own without sudo, and a packet filter on the Mac (pf, its own anchor) keeps the VM from the Mac, link-local addresses (the instance metadata service) and the private networks while it runs. `mac_check.sh --sweep` passed on an EC2 Mac on this code, November 12, 2026. The baseline's change costs the agent `git init` at the root of the working directory, `git config` and `git push -u` there (a run that needs them takes `--policy`). See [`RELEASE-v1.38.0.md`](./RELEASE-v1.38.0.md).
@@ -195,7 +196,7 @@ The runtime line has progressed well beyond simple syscall containment:
   (connects: shipped in v1.21.0; launches, opt-in, in v1.27.0). See
   [`RELEASE-v1.9.1.md`](./RELEASE-v1.9.1.md).
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.40.0 history.
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full v1.0–v1.41.0 history.
 
 ### Network
 
@@ -598,7 +599,7 @@ different risks at different points in the stack.
 - [x] **v1.38.0** — Hardening: the baseline never writes the working directory's git settings and hooks; on a Mac, the agent's own user in the VM without sudo, and a packet filter keeping the VM from the Mac and its networks ([release notes](./RELEASE-v1.38.0.md))
 - [x] **v1.39.0** — Security operations, first part: the OCSF events sent to OpenTelemetry and to Splunk (with a Splunk app), live with `--follow` ([release notes](./RELEASE-v1.39.0.md))
 - [x] **v1.40.0** — Security operations, second part: Microsoft Sentinel (analytics rules and a workbook), a failed export resumed, the sector packs deciding launches ([release notes](./RELEASE-v1.40.0.md))
-- [ ] **v1.41.0** (planned) — VAREK implements no cryptography of its own: every hash and signature through the host's OpenSSL 3 (SHA-384, ECDSA P-384), and a Defense build (`make DEFENSE=1`) that runs only with RHEL 9's FIPS 140-3 validated module, in FIPS mode ([report](./docs/security/v1.41-cryptography.md))
+- [x] **v1.41.0** — VAREK implements no cryptography of its own: every hash and signature through the host's OpenSSL 3 (SHA-384, ECDSA P-384), and a Defense build (`make DEFENSE=1`) that runs only with RHEL 9's FIPS 140-3 validated module, in FIPS mode ([release notes](./RELEASE-v1.41.0.md), [report](./docs/security/v1.41-cryptography.md))
 - [ ] **v1.42.0** (planned; was v1.40.0, then v1.41.0) — Security operations, third part: CrowdStrike Falcon Foundry and Wiz, each waiting on its partner program's tenant ([plan](./docs/security/v1.39-security-operations.md))
 - [~] **v1.10 program** — The UNKNOWN-shrinking program (below); shipped as v1.13.0, v1.14.0 and v1.15.0. Remaining: customer-derived corpus and measured baseline, a formally verified checker
 - [ ] **v1.11 (candidate)** — Bounded sequence fragment for cross-action data-flow; revisited after v1.35, once generated plans show how many steps it would clear ([plan](./docs/roadmap/v1.36-v1.37.md))
