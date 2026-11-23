@@ -17,6 +17,8 @@ venv
 **/*.a
 **/*.so
 **/*.log
+# v1.41: but the v1.40 verdict stream test-cli verifies (tests/test_varek_v140_logs.py)
+!varek/v1_4/tests/v140_fixture/verdicts.log
 **/*.ipynb
 **/*-intercept.py
 **/*_intercept.py

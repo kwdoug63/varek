@@ -4,9 +4,10 @@
 # test_v1160.sh — regression test for VAREK v1.16: a verdict stream its holder
 # cannot rewrite undetected, and a bound on the work of one decision.
 #
-#   1. A live run with --sign-key and --anchor: every record is hash-chained,
-#      run_start / checkpoints / run_end are Ed25519-signed and anchored, and
-#      the audit reports "signed, anchored".
+#   1. A live run with --sign-key and --anchor: every record is hash-chained
+#      (v1.41: chain-2, SHA-384), run_start / checkpoints / run_end are signed
+#      (ECDSA P-384, by the host's OpenSSL) and anchored, and the audit reports
+#      "signed, anchored".
 #   2. Someone holding the log but not the key: an edited record breaks the
 #      chain; with the chain recomputed, the signatures fail; a log cut short
 #      has no signed run_end; a log re-signed with another key fails against
@@ -21,8 +22,10 @@
 #      or when the key is not private, has a second name, or is malformed.
 #   6. Glob tokens are capped at 4,096 per policy, by the Warden's decision
 #      procedure, the certificate checker and vdp_check alike.
-#   7. The audit's Ed25519 verifier (tools/varek_ed25519.py) passes the RFC 8032
-#      test vectors and agrees with OpenSSL (Python "cryptography") when present.
+#   7. The audit's verifiers (tools/varek_ed25519.py, on Python "cryptography"):
+#      ECDSA P-384 passes the RFC 6979 vectors and refuses malformed input;
+#      Ed25519 (for v1.40 logs) passes the RFC 8032 vectors, refuses every
+#      small-order key, and agrees with OpenSSL on honest keys.
 #
 # Usage: ./test_v1160.sh <warden> <vdp_check> <vdp_cert_check> <varek_keygen> <probe>
 set -u
@@ -60,13 +63,13 @@ HAVE_CRYPTO=0; python3 -c "import cryptography" 2>/dev/null && HAVE_CRYPTO=1
 echo "== 1. a signed, anchored run =="
 timeout 30 "$WARDEN" "$POL" --sign-key "$D/keys/k1" --anchor "$D/anchor" --checkpoint-every 4 \
     -- /bin/cat "${FILES[@]}" > "$OUT/stdout" 2> "$OUT/v"
-grep -q '"event":"run_start".*"log":"chain-1".*"log_pubkey":"'"$(cat "$D/keys/k1.pub")"'"' "$OUT/v" \
+grep -q '"event":"run_start".*"log":"chain-2".*"log_pubkey":"'"$(cat "$D/keys/k1.pub")"'","sigalg":"ecdsa-p384-sha384"' "$OUT/v" \
   && pass "run_start names the chain format and the signing key" || flunk "run_start log fields"
 nck=$(grep -c '"event":"checkpoint"' "$OUT/v")
 [ "$nck" -ge 3 ] && pass "checkpoints written ($nck, every 4 records)" || flunk "checkpoints written ($nck)"
-nrec=$(grep -c '^{.*"run":' "$OUT/v"); nch=$(grep -c '"chain":"[0-9a-f]\{64\}"}$\|"chain":"[0-9a-f]\{64\}","sig"' "$OUT/v")
+nrec=$(grep -c '^{.*"run":' "$OUT/v"); nch=$(grep -c '"chain":"[0-9a-f]\{96\}"}$\|"chain":"[0-9a-f]\{96\}","sig"' "$OUT/v")
 [ "$nrec" -eq "$nch" ] && pass "every record of the run carries a chain value ($nch)" || flunk "chained records ($nch of $nrec)"
-nsig=$(grep -c '"sig":"[0-9a-f]\{128\}"}$' "$OUT/v"); nanc=$(wc -l < "$D/anchor")
+nsig=$(grep -c '"sig":"\([0-9a-f][0-9a-f]\)\{8,104\}"}$' "$OUT/v"); nanc=$(wc -l < "$D/anchor")
 [ "$nsig" -eq $((nck + 2)) ] && [ "$nanc" -eq "$nsig" ] \
   && pass "run_start, checkpoints and run_end signed and anchored ($nsig)" || flunk "signed $nsig, anchored $nanc"
 grep -q "file 12" "$OUT/stdout" && grep -q '"target":"/tmp/varek_v1160/data/secret".*"decision_final":"DENY"' "$OUT/v" \
@@ -77,6 +80,23 @@ grep -q "integrity: signed, anchored" <<<"$o" && grep -q "varek_audit: PASS" <<<
 o="$("${A[@]}" "$OUT/v" 2>&1)"
 grep -q "key not pinned" <<<"$o" && grep -q PASS <<<"$o" \
   && pass "without --pubkey the audit says the key is not pinned" || flunk "unpinned report"
+# v1.41: run_start (signed) names the provider that made the chain and the
+# signatures: on a host in FIPS mode (or a Defense build) the FIPS provider
+want=default; [ "$(cat /proc/sys/crypto/fips_enabled 2>/dev/null)" = 1 ] && want=fips
+grep -q '"event":"run_start".*"crypto_provider":"'"$want"'"' "$OUT/v" \
+  && pass "run_start names the crypto provider ($want)" || flunk "run_start's crypto_provider (want $want)"
+o="$("${A[@]}" --pubkey "$D/keys/k1.pub" --require-fips "$OUT/v" 2>&1)"
+if [ "$want" = fips ]; then
+    grep -q "varek_audit: PASS" <<<"$o" && grep -q "crypto provider: fips" <<<"$o" \
+      && pass "--require-fips passes: the chain and signatures were the FIPS provider's" \
+      || { flunk "--require-fips on a host in FIPS mode"; echo "$o" | grep PROBLEM | head -3; }
+else
+    grep -q "not the host's FIPS provider's" <<<"$o" && grep -q "varek_audit: FAIL" <<<"$o" \
+      && pass "--require-fips fails on this host (not in FIPS mode: the default provider)" || flunk "--require-fips off FIPS mode"
+fi
+o="$("${A[@]}" --require-fips "$OUT/v" 2>&1)"
+grep -q "vouched for only by its signature under a pinned key" <<<"$o" \
+  && pass "--require-fips needs the key pinned (the claim is as good as run_start's signature)" || flunk "--require-fips unpinned"
 
 echo "== 2. holder without the key =="
 # An authorized read rewritten as a read of the secret.
@@ -142,22 +162,31 @@ grep -q "checkpoints were removed" <<<"$o" && grep -q FAIL <<<"$o" \
   && pass "an incomplete stream with its checkpoints removed fails (checkpoint_every)" \
   || { flunk "checkpoints removed from an incomplete stream"; echo "$o" | head -4; }
 # ... with an unsigned run_end forged in its place.
-{ cat "$OUT/cut"; grep '"event":"run_end"' "$OUT/v" | sed -E 's/,"sig":"[0-9a-f]{128}"//'; } > "$OUT/fakeend.raw"
+{ cat "$OUT/cut"; grep '"event":"run_end"' "$OUT/v" | sed -E 's/,"sig":"[0-9a-f]+"//'; } > "$OUT/fakeend.raw"
 # (run_end's record count still matches: no decision record was cut.)
 python3 "$RECHAIN" "$OUT/fakeend.raw" > "$OUT/fakeend"
 o="$("${A[@]}" --pubkey "$D/keys/k1.pub" "$OUT/fakeend" 2>&1)"
 grep -q "run_end record is not signed" <<<"$o" && pass "a forged unsigned run_end fails" || flunk "forged run_end"
 # The key dropped from run_start: the stream then claims no signing at all.
-sed -E 's/"log_pubkey":"[0-9a-f]{64}","checkpoint_every":[0-9]+,//; s/,"sig":"[0-9a-f]{128}"//' "$OUT/edit" > "$OUT/nokey.raw"
+sed -E 's/"log_pubkey":"[0-9a-f]+","sigalg":"[a-z0-9-]+","checkpoint_every":[0-9]+,//; s/,"sig":"[0-9a-f]+"//' "$OUT/edit" > "$OUT/nokey.raw"
 python3 "$RECHAIN" "$OUT/nokey.raw" > "$OUT/nokey"
 o="$("${A[@]}" --pubkey "$D/keys/k1.pub" "$OUT/nokey" 2>&1)"
 grep -q "the stream is not signed" <<<"$o" && grep -q FAIL <<<"$o" \
   && pass "signatures stripped: fails against the pinned key" || flunk "stripped signatures"
 # Downgrade: every chain field and the log format stripped.
-sed -E 's/,"chain":"[0-9a-f]{64}"//; s/,"sig":"[0-9a-f]{128}"//; s/"log":"chain-1",//' "$OUT/edit" > "$OUT/down"
+sed -E 's/,"chain":"[0-9a-f]+"//; s/,"sig":"[0-9a-f]+"//; s/"log":"chain-2",//' "$OUT/edit" > "$OUT/down"
 o="$("${A[@]}" "$OUT/down" 2>&1)"
 grep -q "the chain was stripped" <<<"$o" && pass "a 1.16 stream with its chain stripped is refused (no downgrade)" \
   || { flunk "downgrade"; echo "$o" | head -3; }
+# v1.41: the format downgraded: rewritten as an unsigned chain-1 stream
+# (SHA-256), every chain value recomputed; run_start still names a 1.41 Warden.
+sed -E 's/"log":"chain-2"/"log":"chain-1"/; s/"log_pubkey":"[0-9a-f]+","sigalg":"[a-z0-9-]+","checkpoint_every":[0-9]+,//; s/,"sig":"[0-9a-f]+"//' \
+    "$OUT/v" > "$OUT/down1.raw"
+python3 "$RECHAIN" "$OUT/down1.raw" > "$OUT/down1"
+o="$("${A[@]}" "$OUT/down1" 2>&1)"
+grep -q "writes chain-2 (1.41 or later) but the stream is in an older format" <<<"$o" \
+  && pass "a 1.41 stream rewritten into chain-1 (SHA-256), chain recomputed, is refused" \
+  || { flunk "format downgrade"; echo "$o" | head -3; }
 o="$("${A[@]}" --run 0123456789abcdef0123456789abcdef "$OUT/v" 2>&1)"
 grep -q "not the run asked for" <<<"$o" && pass "--run binds the audit to one run" || flunk "--run"
 if [ "$HAVE_CRYPTO" = 1 ]; then
@@ -270,6 +299,9 @@ cp "$D/keys/k1" "$D/keys/open"; chmod 644 "$D/keys/open"
 refuse "a key readable by others is refused" "readable or writable by group or others" "$POL" --sign-key "$D/keys/open"
 printf 'not a key\n' > "$D/keys/bad"; chmod 600 "$D/keys/bad"
 refuse "a malformed key is refused" "not a VAREK signing key" "$POL" --sign-key "$D/keys/bad"
+# v1.41: a v1.40 key (an Ed25519 seed, 64 hex characters) is refused, saying why
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$D/keys/old"; echo >> "$D/keys/old"; chmod 600 "$D/keys/old"
+refuse "a v1.40 Ed25519 key is refused, naming the change" "a v1.40 Ed25519 key is no longer used" "$POL" --sign-key "$D/keys/old"
 ln -sf "$D/keys/k1" "$D/keys/link"
 refuse "a key reached through a symlink is refused" "signing key" "$POL" --sign-key "$D/keys/link"
 { cat "$POL"; echo "allow path /tmp/varek_v1160/keys/"; } > "$OUT/leaky.txt"
@@ -333,8 +365,36 @@ o="$("$WARDEN" "$OUT/g4097.txt" -- /bin/true 2>&1)"
 grep -q "more than 4096 tokens" <<<"$o" && ! grep -q "supervising pid=" <<<"$o" \
   && pass "Warden: 4,097 refused" || flunk "Warden cap"
 
-echo "== 7. the audit's Ed25519 verifier =="
-python3 - "$HERE/tools" "$HAVE_CRYPTO" <<'EOF' && pass "RFC 8032 vectors, and agreement with OpenSSL on 400 cases (when installed)" || flunk "Ed25519 verifier"
+echo "== 7. the audit's verifiers =="
+python3 - "$HERE/tools" <<'EOF' && pass "P-384: RFC 6979 vectors; malformed keys, signatures and DER refused" || flunk "P-384 verifier"
+import sys
+sys.path.insert(0, sys.argv[1])
+from varek_ed25519 import verify_p384
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+# RFC 6979 A.2.6: the P-384 key; SHA-384 signatures over "sample" and "test"
+pub = bytes.fromhex("04" "EC3A4E415B4E19A4568618029F427FA5DA9A8BC4AE92E02E06AAE5286B300C64DEF8F0EA9055866064A254515480BC13"
+                    "8015D9B72D7D57244EA8EF9AC0C621896708A59367F9DFB9F54CA84B3F1C9DB1288B231C3AE0D4FE7344FD2533264720")
+KAT = [(b"sample", 0x94EDBB92A5ECB8AAD4736E56C691916B3F88140666CE9FA73D64C4EA95AD133C81A648152E44ACF96E36DD1E80FABE46,
+                   0x99EF4AEB15F178CEA1FE40DB2603138F130E740A19624526203B6351D0A3A94FA329C145786E679E7B82C71A38628AC8),
+       (b"test",   0x8203B63D3C853E8D77227FB377BCF7B7B772E97892A80F36AB775D509D7A5FEB0542A7F0812998DA8F1DD3CA3CF023DB,
+                   0xDDD0760448D42D8A43AF45AF836FCE4DE8BE06B485E9B61B827C2F13173923E06A739F040649A667BF3B828246BAA5A5)]
+n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFC7634D81F4372DDF581A0DB248B0A77AECEC196ACCC52973
+for m, r, s in KAT:
+    der = encode_dss_signature(r, s)
+    assert verify_p384(pub, m, der)
+    assert not verify_p384(pub, m + b"x", der)
+    assert not verify_p384(pub, m, encode_dss_signature(r, s + n))           # s out of range
+    assert not verify_p384(pub, m, encode_dss_signature(0, s))
+    assert not verify_p384(pub, m, der + b"\x00")                            # bytes after the DER
+off = bytearray(pub); off[-1] ^= 1
+assert not verify_p384(bytes(off), b"sample", encode_dss_signature(*KAT[0][1:]))   # not on the curve
+assert not verify_p384(b"\x04" + bytes(96), b"sample", encode_dss_signature(*KAT[0][1:]))
+assert not verify_p384(pub[1:], b"sample", encode_dss_signature(*KAT[0][1:]))      # not a point
+EOF
+if ! python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import varek_ed25519; sys.exit(0 if varek_ed25519.ed25519_available() else 1)" "$HERE/tools"; then
+    skip "Ed25519 (v1.40 logs): this host's provider does not offer it (FIPS mode); tests/test_varek_v140_logs.py covers the message"
+else
+python3 - "$HERE/tools" "$HAVE_CRYPTO" <<'EOF' && pass "Ed25519 (v1.40 logs): RFC 8032 vectors, no small-order key, agreement with OpenSSL" || flunk "Ed25519 verifier"
 import os, random, sys
 sys.path.insert(0, sys.argv[1])
 from varek_ed25519 import verify
@@ -346,38 +406,44 @@ for pk, m, s in V:
     assert verify(bytes.fromhex(pk), bytes.fromhex(m), bytes.fromhex(s))
     bad = bytearray.fromhex(s); bad[0] ^= 1
     assert not verify(bytes.fromhex(pk), bytes.fromhex(m), bytes(bad))
-# S >= L (a malleated signature) and a small-order public key are refused.
+# S >= L (a malleated signature) is refused.
 pk, m, s = V[0]
 L = 2 ** 252 + 27742317777372353535851937790883648493
 S = int.from_bytes(bytes.fromhex(s)[32:], "little") + L
 assert not verify(bytes.fromhex(pk), b"", bytes.fromhex(s)[:32] + S.to_bytes(32, "little"))
-assert not verify(bytes(32), b"", bytes(64))
-assert not verify((1).to_bytes(32, "little"), b"", bytes(64))
 # Non-canonical encodings: y >= p for R, and x = 0 with the sign bit set.
 P = 2 ** 255 - 19
 sig = bytes.fromhex(s)
 assert not verify(bytes.fromhex(pk), b"", P.to_bytes(32, "little") + sig[32:])
 assert not verify(bytes.fromhex(pk), b"", ((1 << 255) | 1).to_bytes(32, "little") + sig[32:])
 assert not verify(((1 << 255) | 1).to_bytes(32, "little"), b"", sig)
-if sys.argv[2] == "1":
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-    from cryptography.hazmat.primitives import serialization
-    rng = random.Random(1160)
-    for i in range(100):
-        k = Ed25519PrivateKey.generate()
-        pk = k.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-        m = os.urandom(rng.randrange(0, 64)); s = k.sign(m)
-        cases = [(pk, m, s)]
-        b = bytearray(s); b[rng.randrange(64)] ^= 1 << rng.randrange(8); cases.append((pk, m, bytes(b)))
-        b = bytearray(m + b"x"); b[rng.randrange(len(b))] ^= 1; cases.append((pk, bytes(b), s))
-        b = bytearray(pk); b[rng.randrange(32)] ^= 1 << rng.randrange(8); cases.append((bytes(b), m, s))
-        for a, mm, ss in cases:
-            try:
-                Ed25519PublicKey.from_public_bytes(a).verify(ss, mm); ref = True
-            except Exception:
-                ref = False
-            assert verify(a, mm, ss) == ref, (a.hex(), mm.hex(), ss.hex())
+# v1.41: no small-order public key, for any message (OpenSSL alone accepts
+# "signatures" under one: R a small-order point, S = 0, about one in eight).
+SMALL = [bytes.fromhex(h) for h in (
+    "0100000000000000000000000000000000000000000000000000000000000000", "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "0000000000000000000000000000000000000000000000000000000000000000", "0000000000000000000000000000000000000000000000000000000000000080",
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05", "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a", "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa")]
+assert not any(verify(a, b"m%d" % i, r + bytes(32)) for a in SMALL for r in SMALL for i in range(32))
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives import serialization
+rng = random.Random(1160)
+for i in range(100):
+    k = Ed25519PrivateKey.generate()
+    pk = k.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    m = os.urandom(rng.randrange(0, 64)); s = k.sign(m)
+    cases = [(pk, m, s)]
+    b = bytearray(s); b[rng.randrange(64)] ^= 1 << rng.randrange(8); cases.append((pk, m, bytes(b)))
+    b = bytearray(m + b"x"); b[rng.randrange(len(b))] ^= 1; cases.append((pk, bytes(b), s))
+    b = bytearray(pk); b[rng.randrange(32)] ^= 1 << rng.randrange(8); cases.append((bytes(b), m, s))
+    for a, mm, ss in cases:
+        try:
+            Ed25519PublicKey.from_public_bytes(a).verify(ss, mm); ref = True
+        except Exception:
+            ref = False
+        assert verify(a, mm, ss) == ref, (a.hex(), mm.hex(), ss.hex())
 EOF
+fi
 
 echo
 if [ "$fail" -eq 0 ]; then echo "test_v1160: PASS"; else echo "test_v1160: FAIL"; fi

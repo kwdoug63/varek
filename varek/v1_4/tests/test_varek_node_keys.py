@@ -18,6 +18,7 @@ import varek_anchor_forward as fwd   # noqa: E402
 import varek_audit as va             # noqa: E402
 
 K1, K2, K3 = "11" * 32, "22" * 32, "33" * 32
+P1 = "04" + "aa" * 96                     # v1.41: a node's P-384 key (the uncompressed point)
 T0 = 1_800_000_000                   # seconds
 
 
@@ -45,7 +46,9 @@ def test_the_list_by_node_in_the_order_admitted(tmp_path):
 
 @pytest.mark.parametrize("item, why", [
     (nk("node-1", K1, T0, kind="VarekPolicy"), "not a VarekNodeKey"),
-    ({**nk("node-1", K1, T0), "spec": {"node": "node-1", "publicKey": "AB" * 32}}, "no 64-hex publicKey"),
+    ({**nk("node-1", K1, T0), "spec": {"node": "node-1", "publicKey": "AB" * 32}}, "no publicKey (194 hex"),
+    ({**nk("node-1", K1, T0), "spec": {"node": "node-1", "publicKey": "05" + "aa" * 96}}, "no publicKey (194 hex"),
+    ({**nk("node-1", K1, T0), "spec": {"node": "node-1", "publicKey": P1[:-2]}}, "no publicKey (194 hex"),
     ({**nk("node-1", K1, T0), "metadata": {"name": "x"}}, "no creationTimestamp"),
     ({**nk("node-1", K1, T0), "spec": {"publicKey": K1}}, "has no node"),
 ])
@@ -68,6 +71,12 @@ def integrity(path, node="node-1", key=K1, began=T0 + 120, rx=None, last=None, l
 def check(it):
     head = va.Section()
     return it.node_key(head), list(head.items)
+
+
+def test_a_p384_key_and_a_v140_key_in_one_list(tmp_path):
+    """v1.41: a node's P-384 key, and the Ed25519 key it had before, both read"""
+    keys, why = va._node_keys(listing(tmp_path, nk("node-1", K1, T0), nk("node-1", P1, T0 + 60)))
+    assert why is None and [k for _, k, _ in keys["node-1"]] == [bytes.fromhex(K1), bytes.fromhex(P1)]
 
 
 def test_the_nodes_key_trusted(tmp_path):
@@ -152,6 +161,8 @@ def test_node_keys_and_pubkey_together():
 
 
 LINE = f'{{"event":"node_key","node":"node-1.example","key":"{K1}","timestamp_ns":1700000000000000000}}'
+PLINE = (f'{{"event":"node_key","node":"node-1.example","key":"{P1}","sigalg":"ecdsa-p384-sha384",'
+         f'"timestamp_ns":1700000000000000000}}')                       # v1.41
 
 
 @pytest.mark.parametrize("line, ok", [
@@ -160,6 +171,10 @@ LINE = f'{{"event":"node_key","node":"node-1.example","key":"{K1}","timestamp_ns
     (LINE.replace("node-1.example", "-node"), False),
     (LINE.replace(K1, K1[:-1]), False),
     (LINE[:-1] + ',"x":1}', False),
+    (PLINE, True),                                                    # v1.41: a P-384 key, with its sigalg
+    (PLINE.replace(',"sigalg":"ecdsa-p384-sha384"', ""), False),     # ... without it
+    (PLINE.replace(P1, "05" + P1[2:]), False),                        # not a point
+    (LINE.replace(',"timestamp_ns"', ',"sigalg":"ecdsa-p384-sha384","timestamp_ns"'), False),  # Ed25519 named P-384
 ])
 def test_the_forwarder_and_the_receiver_carry_node_key_lines(line, ok):
     assert bool(fwd.NODE_KEY_LINE.match(line.encode())) is ok
@@ -171,6 +186,11 @@ def test_the_forwarder_and_the_receiver_carry_node_key_lines(line, ok):
     assert (r.returncode == 0) is ok
     old = f'{{"run":"{"a" * 32}","event":"checkpoint","records":3,"chain":"{"b" * 64}","timestamp_ns":5}}'
     assert fwd.LINE.match(old.encode()) and not fwd.NODE_KEY_LINE.match(old.encode())
+    # v1.41: a chain-2 checkpoint line (SHA-384 chain, DER P-384 signature);
+    # a chain value of neither width is not one
+    new = (f'{{"run":"{"a" * 32}","event":"checkpoint","records":3,"chain":"{"b" * 96}",'
+           f'"sig":"{"30" + "c" * 202}","timestamp_ns":5}}')
+    assert fwd.LINE.match(new.encode()) and not fwd.LINE.match(new.replace("b" * 96, "b" * 80).encode())
 
 
 def test_an_id_set_of_scattered_ids():

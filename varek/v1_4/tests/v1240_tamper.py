@@ -20,9 +20,10 @@ varek_audit.py must refuse each.
   unstart <key>           delete <key> from run_start
   badaddrs                the first resolution record: "addresses": 5
 """
-import hashlib
 import json
 import sys
+
+import varek_logfmt
 
 src, dst, mode, args = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
 lines = open(src, encoding="utf-8", errors="surrogateescape").read().splitlines(keepends=True)
@@ -68,7 +69,8 @@ def edit(d):
     return True
 
 
-head = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
+fmt = varek_logfmt.of_lines(lines)       # v1.41: chain-2 (SHA-384) or chain-1
+head = fmt["iv"]
 out = []
 for line in lines:
     if line.startswith("{") and ',"chain":"' in line:
@@ -84,8 +86,8 @@ for line in lines:
             after = json.dumps(d, separators=(",", ":"), ensure_ascii=False)
             if after != before:
                 body = after[:-1]
-        head = hashlib.sha256(head + body.encode("utf-8", "surrogateescape")).digest()
-        line = body + ',"chain":"' + head.hex() + line[cut + 10 + 64:]
+        head = fmt["hash"](head + body.encode("utf-8", "surrogateescape")).digest()
+        line = body + ',"chain":"' + head.hex() + line[cut + 10 + fmt["chain_hex"]:]
     out.append(line)
 if not done:
     sys.exit(f"v1240_tamper: nothing to edit for {mode} {args}")

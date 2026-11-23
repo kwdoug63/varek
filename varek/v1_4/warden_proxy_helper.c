@@ -6,14 +6,25 @@
 
 #include "warden_proxy.h"
 #include "proxy_parse.h"
-#include "proxy_ca.h"
 #include "warden_secrets.h"     /* v1.28: struct ws_value */
 
+/* v1.41: the Defense build (VAREK_NO_TLS_INSPECT) compiles inspecting mode
+ * (v1.26.1) out of this program. What is left reads ClientHellos, CONNECTs
+ * and plain HTTP heads, asks the Warden, and relays bytes: it contains no TLS
+ * and no cryptography, and links no TLS or crypto library. In the core build
+ * inspecting mode is here, on the host's OpenSSL. */
+#ifndef VAREK_NO_TLS_INSPECT
+#include "proxy_ca.h"
+#include "varek_fips.h"
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
+#define WP_CLEANSE OPENSSL_cleanse
+#else
+#define WP_CLEANSE explicit_bzero
+#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -95,8 +106,10 @@ struct wp_held {
     unsigned  rport;             /* the port decided (a CONNECT's own) */
     int       tstage;            /* TS_* */
     short     swant;             /* the server handshake waits for this (POLLIN, POLLOUT) */
+#ifndef VAREK_NO_TLS_INSPECT
     SSL      *ss, *cs;           /* toward the server (on up), toward the client (memory BIOs) */
     BIO      *crb, *cwb;         /* the client's TLS bytes in, out */
+#endif
     uint8_t   server_cert[32];   /* SHA-256 of the server's certificate */
     char      tls_why[96];
     /* step 6: relaying, each request decided */
@@ -108,7 +121,9 @@ struct wp_held {
     int       pend_body;         /* its framing (WP_BODY_*) */
     uint64_t  pend_blen;
     uint64_t  max_body, body_n;  /* the allowed request's max_body, its body's bytes so far */
+#ifndef VAREK_NO_TLS_INSPECT
     EVP_MD_CTX *bh;              /* their SHA-256 */
+#endif
     bool      s_shut;            /* the server was told no more (close_notify, or SHUT_WR) */
     bool      c_sock_eof;        /* TLS: the client's socket has closed */
     bool      cut;               /* the connection is cut (max_body): no close_notify */
@@ -140,6 +155,7 @@ static size_t g_cv_len[WS_MAX_CREDS];
 static char g_ph[WS_MAX_CREDS][WP_PH_MAX];
 static bool g_cv_locked;
 static bool g_px_revoked;            /* v1.28 step 4: the run was revoked */
+static bool g_moved;                 /* the last pass moved something (main loop; v1.26.1) */
 
 /* Step 7: a relayed connection ends: report it (bytes each way, how long). */
 static void report_close(const struct wp_held *h, const char *why) {
@@ -162,26 +178,34 @@ static void report_close(const struct wp_held *h, const char *why) {
     (void)send(g_ctl, &m, sizeof m, MSG_NOSIGNAL);   /* blocking: a close report is never dropped */
 }
 
+#ifndef VAREK_NO_TLS_INSPECT
 static void report_body(struct wp_held *h, int exceeded);
 static void mcp_report_gone(struct wp_held *h);      /* v1.31: warden_proxy_mcp.inc.c */
+#endif
 
 static void held_drop(int k) {
+#ifndef VAREK_NO_TLS_INSPECT
     /* review: an allowed body still being sent when the connection ends: what
      * was sent of it, reported before the close (the Warden requires it) */
     if (g_held[k].bh) report_body(&g_held[k], 2);
     /* v1.31: an MCP call whose body did not all arrive: reported (refused) */
     if (g_held[k].ig == IG_MCPBODY && g_held[k].state == WH_TLS) mcp_report_gone(&g_held[k]);
+#endif
     free(g_held[k].mbody);
     if (g_held[k].state == WH_UPSTREAM)            /* the run ended while asking the upstream */
         report_close(&g_held[k], g_held[k].why ? g_held[k].why : "upstream_refused");
     else if (g_held[k].state == WH_RELAY) report_close(&g_held[k], g_held[k].why ? g_held[k].why : "closed");
     else if (g_held[k].state == WH_TLS) report_close(&g_held[k], g_held[k].why ? g_held[k].why : "reset");
+#ifndef VAREK_NO_TLS_INSPECT
     if (g_held[k].ss && SSL_is_init_finished(g_held[k].ss) && !g_held[k].cut && !g_held[k].s_shut)
         (void)SSL_shutdown(g_held[k].ss);            /* v1.26.1: a close_notify to the server */
     EVP_MD_CTX_free(g_held[k].bh);
+#endif
     free(g_held[k].cout);
+#ifndef VAREK_NO_TLS_INSPECT
     SSL_free(g_held[k].ss);                          /* (the client's SSL frees its BIOs) */
     SSL_free(g_held[k].cs);
+#endif
     close(g_held[k].fd);
     /* v1.30 (the RHEL 9 sweep): a cut connection (max_body) ends at the
      * server with a FIN after what was let through, not a reset. What the
@@ -195,18 +219,20 @@ static void held_drop(int k) {
     }
     if (g_held[k].up >= 0) close(g_held[k].up);
     if (g_held[k].credbuf && g_held[k].buf)
-        OPENSSL_cleanse(g_held[k].buf, g_held[k].bufcap ? g_held[k].bufcap : PP_IN_MAX);   /* v1.28 */
+        WP_CLEANSE(g_held[k].buf, g_held[k].bufcap ? g_held[k].bufcap : PP_IN_MAX);   /* v1.28 */
     free(g_held[k].buf);
     free(g_held[k].down);
     g_held[k] = g_held[--g_nheld];
 }
 
+#ifndef VAREK_NO_TLS_INSPECT
 /* v1.26.1: an inspected client whose handshake has not begun: a fatal
  * handshake_failure alert, in the clear */
 static void held_refuse_alert(struct wp_held *h) {
     static const uint8_t alert[] = { 21, 3, 3, 0, 2, 2, 40 };
     (void)send(h->fd, alert, sizeof alert, MSG_DONTWAIT | MSG_NOSIGNAL);
 }
+#endif
 
 /* Tell the client no, in its own protocol, and close. */
 static void held_refuse(int k) {
@@ -288,7 +314,9 @@ static int held_relay_up(int k, int fd, const char *name, unsigned port) {
     return 0;
 }
 
+#ifndef VAREK_NO_TLS_INSPECT
 static bool tls_begin(int k);                     /* v1.26.1, below */
+#endif
 
 /* Section 5: bytes from the upstream while waiting for its reply. False when
  * the connection is done (refused: reported, and the client refused). */
@@ -312,12 +340,14 @@ static bool held_upstream(int k) {
     if (h->doff == h->dlen) h->doff = h->dlen = 0;
     h->state = WH_RELAY;
     h->since = h->relay_at = mono_ms();
+#ifndef VAREK_NO_TLS_INSPECT
     /* v1.26.1: an inspected connection: TLS to the server through the tunnel
      * (the server sends nothing before the ClientHello it is owed) */
     if (h->inspect) {
         if (h->dlen) { h->why = "server_tls"; snprintf(h->tls_why, sizeof h->tls_why, "the server spoke first"); }
         return h->dlen == 0 && tls_begin(k);
     }
+#endif
     return true;
 }
 
@@ -421,6 +451,7 @@ static bool held_pump(int k, short crev, short srev) {
     return now - h->since <= WP_RELAY_IDLE;
 }
 
+#ifndef VAREK_NO_TLS_INSPECT
 /* v1.26.1: inspecting mode. The run's CA, made once, on WP_MSG_CA_GO. */
 static pca_t g_ca;
 static bool  g_inspect, g_ca_made;
@@ -889,7 +920,6 @@ static void gate_run(struct wp_held *h) {
 }
 
 static char kRefused[512];
-static bool g_moved;                               /* the last pass moved something (main loop) */
 
 /* One pass over inspected connection k. False when it is done (h->why says
  * why; held_drop reports it). */
@@ -1050,6 +1080,8 @@ static bool tls_step(int k, short crev, short srev) {
     return true;
 }
 
+#endif /* VAREK_NO_TLS_INSPECT: the end of inspecting mode's code */
+
 /* Read every control message waiting. Returns -1 when the Warden has gone. */
 static int wp_drain_ctl(int ctl) {
     for (;;) {
@@ -1078,16 +1110,32 @@ static int wp_drain_ctl(int ctl) {
                 if (passed) report_gone(m.v.id);
                 continue;
             }
+#ifdef VAREK_NO_TLS_INSPECT
+            /* v1.41, Defense build: no inspecting mode here. An allow that
+             * asks for inspection cannot be honoured, and is never relayed
+             * uninspected: refused (a Defense build's Warden never asks). */
+            if (m.v.allow && m.v.inspect) {
+                if (fd >= 0) close(fd);
+                if (passed) report_gone(m.v.id);
+                held_refuse(k);
+                continue;
+            }
+            g_held[k].inspect = false;
+#else
             /* v1.26.1: inspect, only with the run's CA made */
             g_held[k].inspect = m.v.allow && m.v.inspect;
+#endif
             if (!m.v.allow || fd < 0 || held_relay(k, fd) < 0) {
                 if (fd >= 0) close(fd);
                 if (passed) report_gone(m.v.id);
                 g_held[k].inspect = false;
                 held_refuse(k);
-            } else if (g_held[k].inspect && !tls_begin(k)) {
+            }
+#ifndef VAREK_NO_TLS_INSPECT
+            else if (g_held[k].inspect && !tls_begin(k)) {
                 held_drop(k);                       /* reported: server_tls */
             }
+#endif
             continue;
         }
         if (n == (ssize_t)sizeof m.u && m.type == WP_MSG_VERDICT_UP) {
@@ -1101,7 +1149,17 @@ static int wp_drain_ctl(int ctl) {
                 if (k >= 0 && g_held[k].state == WH_WAITING) held_refuse(k);
                 continue;
             }
+#ifdef VAREK_NO_TLS_INSPECT
+            if (m.u.allow && m.u.inspect) {             /* v1.41 Defense: cannot inspect: refused */
+                if (fd >= 0) close(fd);
+                if (passed) report_gone(m.u.id);
+                held_refuse(k);
+                continue;
+            }
+            g_held[k].inspect = false;
+#else
             g_held[k].inspect = m.u.allow && m.u.inspect;     /* v1.26.1 */
+#endif
             if (!m.u.allow || fd < 0 || held_relay_up(k, fd, m.u.name, m.u.port) < 0) {
                 if (g_held[k].state == WH_UPSTREAM || g_held[k].up >= 0) {
                     g_held[k].state = WH_UPSTREAM;     /* reported as upstream_refused */
@@ -1136,15 +1194,15 @@ static int wp_drain_ctl(int ctl) {
                         g_cv_len[i] = wv.len;
                         got++;
                     }
-                    OPENSSL_cleanse(&wv, sizeof wv);
+                    WP_CLEANSE(&wv, sizeof wv);
                     if (!good) break;
                 }
-                OPENSSL_cleanse(&wv, sizeof wv);         /* v1.28 review: a short read too */
+                WP_CLEANSE(&wv, sizeof wv);              /* v1.28 review: a short read too */
             }
             if (fd >= 0) close(fd);
             ok.n = got == m.cr.n ? got : 0;
             if (!ok.n) {                                 /* all or none */
-                if (g_cv) OPENSSL_cleanse(g_cv, (size_t)WS_MAX_CREDS * WS_MAX_VALUE);
+                if (g_cv) WP_CLEANSE(g_cv, (size_t)WS_MAX_CREDS * WS_MAX_VALUE);
                 memset(g_cv_len, 0, sizeof g_cv_len);
             }
             (void)send(ctl, &ok, sizeof ok, MSG_NOSIGNAL);
@@ -1154,9 +1212,9 @@ static int wp_drain_ctl(int ctl) {
         /* v1.28 step 4: the run is revoked: clear every value and
          * placeholder, close every connection, say how many values remain */
         if (n == (ssize_t)sizeof(struct wp_msg) && m.type == WP_MSG_REVOKE) {
-            if (g_cv) OPENSSL_cleanse(g_cv, (size_t)WS_MAX_CREDS * WS_MAX_VALUE);
+            if (g_cv) WP_CLEANSE(g_cv, (size_t)WS_MAX_CREDS * WS_MAX_VALUE);
             memset(g_cv_len, 0, sizeof g_cv_len);
-            OPENSSL_cleanse(g_ph, sizeof g_ph);
+            WP_CLEANSE(g_ph, sizeof g_ph);
             g_px_revoked = true;
             while (g_nheld) {
                 struct wp_held *h = &g_held[g_nheld - 1];
@@ -1176,6 +1234,7 @@ static int wp_drain_ctl(int ctl) {
             (void)send(ctl, &r, sizeof r, MSG_NOSIGNAL);
             continue;
         }
+#ifndef VAREK_NO_TLS_INSPECT
         /* v1.26.1, step 6: the verdict on an inspected request */
         if (n == (ssize_t)sizeof m.rv && m.type == WP_MSG_REQVERDICT) {
             int k = held_find(m.rv.id);
@@ -1214,6 +1273,7 @@ static int wp_drain_ctl(int ctl) {
             continue;
         }
         if (n == (ssize_t)sizeof(struct wp_msg) && m.type == WP_MSG_CA_GO) { ca_go(ctl); continue; }
+#endif /* VAREK_NO_TLS_INSPECT: a Defense build ignores these messages */
         if (n == (ssize_t)sizeof(struct wp_msg) && m.type == WP_MSG_FLUSH) {
             /* the run is ending: close everything, reporting each relay */
             while (g_nheld) {
@@ -1374,6 +1434,7 @@ int wp_helper_main(int ctl) {
                 if (h->off < h->len) se |= POLLOUT;
             }
             if (h->state == WH_UPSTREAM) se = POLLIN;
+#ifndef VAREK_NO_TLS_INSPECT
             if (h->state == WH_TLS) {                   /* v1.26.1 */
                 if (h->tstage == TS_SERVER) se = h->swant;
                 else {
@@ -1385,6 +1446,7 @@ int wp_helper_main(int ctl) {
                     }
                 }
             }
+#endif
             pfc[k] = h->fd;
             pfs[k] = h->state == WH_RELAY || h->state == WH_UPSTREAM || h->state == WH_TLS ? h->up : -1;
             /* v1.26 review: a relay side that can make no progress is not
@@ -1424,6 +1486,7 @@ int wp_helper_main(int ctl) {
                 if (!held_pump(k, crev, srev)) held_drop(k);
                 continue;
             }
+#ifndef VAREK_NO_TLS_INSPECT
             if (h->state == WH_TLS) {                       /* v1.26.1 */
                 if (pfs[j] != h->up) { srev = h->swant; crev = 0; }   /* began just now */
                 uint64_t mark = h->bytes_up + h->bytes_down + h->len + h->fwd + (uint64_t)h->tstage +
@@ -1439,6 +1502,7 @@ int wp_helper_main(int ctl) {
                 if (!ok) held_drop(k);
                 continue;
             }
+#endif
             if (h->state == WH_READING && (crev & (POLLIN | POLLHUP | POLLERR))) {
                 held_read(k);
                 /* v1.26 review: the deadline holds for a client that sends
@@ -1543,5 +1607,19 @@ int main(int argc, char **argv) {
         start_fail(3, "drop to its user", e);
         return 2;
     }
+#ifndef VAREK_NO_TLS_INSPECT
+    /* v1.41: the crypto backend, after the drop (as before, when OpenSSL was
+     * first touched in inspecting mode's setup). The host's OpenSSL
+     * configuration is read, so its crypto policy applies to the proxy's TLS;
+     * on a host in FIPS mode the FIPS provider is active. */
+    {
+        char why[256] = {0};
+        if (vfips_init(0, why, sizeof why) != 0) {
+            fprintf(stderr, "[proxy] %s\n", why);
+            start_fail(3, "crypto init", EIO);
+            return 2;
+        }
+    }
+#endif
     return wp_helper_main(3);
 }

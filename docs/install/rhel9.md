@@ -15,8 +15,9 @@ Run end to end on RHEL 9.8 (an Amazon EC2 image, kernel
 v1.36.1 tag, with no SELinux denial; the guide was then corrected from
 what that run showed (no CodeReady Builder, the first run, `varek doctor`'s
 note on the settings, `sudo` for `varek refusals`). This guide lives on the
-repository's main branch and applies to v1.36.1 and later; each release's
-own copy is at its tag
+repository's main branch and applies to v1.41.0 and later, which need
+nothing from outside RHEL (v1.36.1 to v1.40.0 also needed EPEL, for
+libsodium: follow the copy at their tag); each release's own copy is at its tag
 (`https://github.com/kwdoug63/varek/blob/<tag>/docs/install/rhel9.md`).
 
 ## What it needs
@@ -31,50 +32,38 @@ own copy is at its tag
   README's platform table).
 - Root, or `sudo`. The Warden needs CAP_SYS_ADMIN and refuses to start
   without it; the agent it runs holds none of its rights.
-- **EPEL 9**, for libsodium, which RHEL 9 does not ship. EPEL is the Fedora
-  project's repository for Enterprise Linux, not Red Hat's. Everything else
-  comes from RHEL's own BaseOS and AppStream.
+- Nothing from outside RHEL: every package comes from RHEL's own BaseOS and
+  AppStream (and, for one optional static build, CodeReady Builder). From
+  v1.41 the Warden's hashing and signing are RHEL's OpenSSL, so EPEL, which
+  earlier releases needed for libsodium, is not used. On a host in FIPS mode
+  the Warden activates RHEL's OpenSSL FIPS provider and uses it for all of
+  its hashing and signing.
 - SELinux stays enforcing: nothing here asks you to change it.
 
-## 1. EPEL 9
+## 1. The build's packages
 
 ```sh
-sudo dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+sudo dnf install -y gcc make git python3 libseccomp-devel openssl-devel
 ```
 
-With `-y`, dnf imports EPEL 9's signing key the first time it installs a
-package from EPEL. To check that the key is EPEL 9's (fingerprint
-`FF8A D134 4597 106E CE81 3B91 8A38 72BF 3228 467C`) after step 2:
-
-```sh
-rpm -q gpg-pubkey-3228467c
-```
-
-## 2. The build's packages
-
-```sh
-sudo dnf install -y gcc make git python3 libseccomp-devel libsodium-devel openssl-devel
-```
-
-`libsodium-devel` comes from EPEL, the rest from BaseOS and AppStream. dnf
-may also update `openssl`, `openssl-libs` and `python3` to the latest RHEL 9
-packages they need. At run time the Warden needs `libseccomp`, `libsodium`,
-`openssl-libs` and `python3`; the `-devel` packages bring them.
+All of them come from BaseOS and AppStream. dnf may also update `openssl`,
+`openssl-libs` and `python3` to the latest RHEL 9 packages they need. At run
+time the Warden needs `libseccomp`, `openssl-libs` and `python3`; the
+`-devel` packages bring them.
 
 No other repository is needed. CodeReady Builder only gives `glibc-static`,
 for a static `tools/bench_workload` (the workload of `varek bench`); without
 it `make` builds that one dynamically and says so, and the bench adds the
 loader's files to its policy. To have it static, enable CodeReady Builder
-and install `glibc-static` before step 3: on a cloud image whose
+and install `glibc-static` before step 2: on a cloud image whose
 repositories come from Red Hat's update infrastructure (RHUI, as on Amazon
 EC2), `sudo dnf config-manager --set-enabled codeready-builder-for-rhel-9-rhui-rpms`;
 on a host registered with Red Hat, `sudo subscription-manager repos --enable codeready-builder-for-rhel-9-$(arch)-rpms`.
-(EPEL's `crb enable` does nothing on an RHUI image, which leaves its
-repositories to dnf, though it exits 0.)
 
-## 3. Build and install a release
 
-The release's tag, here v1.40.0 (the list:
+## 2. Build and install a release
+
+The release's tag, here v1.41.0 (the list:
 https://github.com/kwdoug63/varek/releases):
 
 ```sh
@@ -88,7 +77,7 @@ in `/opt/varek`, and the `varek` command in `BINDIR`. `/usr/bin` because
 RHEL's `sudo` finds commands only in `/usr/sbin`, `/usr/bin` and the like
 (its `secure_path`), not `/usr/local/bin`, the default.
 
-## 4. Check the host
+## 3. Check the host
 
 ```sh
 sudo varek version
@@ -98,12 +87,12 @@ sudo varek doctor
 `varek version` names the `varek` command's version and the Warden's, the
 second line `VAREK Warden  1.40.0  (/opt/varek)`. `varek doctor` checks the
 kernel, the build and the host's settings, and names the fix for any it
-finds missing. Until step 6 it notes there are no settings at
-`/etc/varek/varek.conf`: a run needs none (step 5). From 1.36.2 that is a
+finds missing. Until step 5 it notes there are no settings at
+`/etc/varek/varek.conf`: a run needs none (step 4). From 1.36.2 that is a
 WARN; 1.36.1 reports it as a FAIL and exits 1, so on a fresh 1.36.1 host
 read the other checks.
 
-## 5. A first run
+## 4. A first run
 
 With nothing set up, a command runs under VAREK's baseline policy and the
 profile its name chooses:
@@ -121,7 +110,7 @@ the key that signs the streams, `/etc/varek/log.key` (mode 600), with its
 public key beside it. Your agent runs the same way, for example
 `sudo varek run -- python3 agent.py` from the agent's directory.
 
-## 6. A policy pack, signing and the settings
+## 5. A policy pack, signing and the settings
 
 For a policy pack of your sector, set it up once and try it:
 
@@ -144,8 +133,29 @@ The full command reference is `varek/v1_4/README.md`.
 
 ## Upgrading and removing
 
-To upgrade, build and install the next release's tag the same way. To
-remove VAREK, from the same directory:
+To upgrade, build and install the next release's tag the same way.
+
+**Upgrading from v1.40 or earlier to v1.41.** v1.41 signs the verdict
+stream with ECDSA P-384 (format chain-2: a SHA-384 chain), computed by RHEL's
+OpenSSL, and no longer uses the Ed25519 key earlier releases made. After
+installing it, run once:
+
+```sh
+sudo varek init
+```
+
+It replaces the signing key `/etc/varek/log.key` with a P-384 key, keeps the
+old key's public half as `/etc/varek/log.key.v140.pub` (`varek audit` and
+`varek export` use it for the runs the old key signed, which stay
+verifiable), removes the old private half, and leaves the settings and the
+policy as they are. Until then `varek run` refuses to start and `varek
+doctor` names the key. Auditors who check streams with
+`tools/varek_audit.py --pubkey` need the new `log.key.pub` for runs from the
+upgrade on. EPEL and `libsodium` are no longer needed; you may remove them
+(`sudo dnf remove libsodium-devel libsodium epel-release`) if nothing else
+uses them.
+
+To remove VAREK, from the same directory:
 
 ```sh
 sudo make uninstall BINDIR=/usr/bin

@@ -162,31 +162,33 @@ static int exec_script_interp(int fd, char *out, size_t outn) {
 
 /* v1.29 (step 9): SHA-256 by OpenSSL's libcrypto, which uses the CPU's
  * SHA extensions (or AVX2) where it has them: libsodium's portable code
- * took about 0.6 s on a 123 MB Node.js at every start. Only the digest is
- * used; OpenSSL's configuration file is never read (no module or provider
- * it names is loaded into the Warden: warden.c calls OPENSSL_init_crypto
- * with OPENSSL_INIT_NO_LOAD_CONFIG first), and the built-in default
- * provider's SHA-256 is fetched once. */
-static EVP_MD *g_sha256;
-
+ * took about 0.6 s on a 123 MB Node.js at every start. OpenSSL's
+ * configuration file is never read (warden.c initialises the crypto backend
+ * with VFIPS_INIT_NO_CONFIG before anything is hashed).
+ *
+ * v1.41: through the shared backend, with no provider named. Through v1.40
+ * this fetched SHA-256 with the property query "provider=default", which
+ * pinned the non-validated default provider: on a host in FIPS mode that
+ * either failed (no default provider loaded, so every launch rule refused)
+ * or bypassed the FIPS module. The fetch now follows the library's default
+ * properties, so the FIPS provider performs it when it is active. A failure
+ * is -1: the caller refuses the launch (fail closed). */
 static int exec_hash_fd(int fd, char out[65]) {
-    if (!g_sha256 && !(g_sha256 = EVP_MD_fetch(NULL, "SHA2-256", "provider=default"))) return -1;
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    if (!ctx || EVP_DigestInit_ex(ctx, g_sha256, NULL) != 1) { EVP_MD_CTX_free(ctx); return -1; }
+    vfips_md *m = vfips_md_new(256);
+    if (!m) return -1;
     static unsigned char buf[1 << 20];
     off_t at = 0;
     for (;;) {
         ssize_t n = pread(fd, buf, sizeof buf, at);
-        if (n < 0 || (n > 0 && EVP_DigestUpdate(ctx, buf, (size_t)n) != 1)) { EVP_MD_CTX_free(ctx); return -1; }
+        if (n < 0 || (n > 0 && vfips_md_update(m, buf, (size_t)n) != 0)) { vfips_md_free(m); return -1; }
         if (n == 0) break;
         at += n;
     }
-    unsigned char h[EVP_MAX_MD_SIZE];
-    unsigned int hl = 0;
-    int ok = EVP_DigestFinal_ex(ctx, h, &hl) == 1 && hl == 32;
-    EVP_MD_CTX_free(ctx);
+    unsigned char h[VFIPS_SHA256_LEN];
+    int ok = vfips_md_final(m, h) == 0;
+    vfips_md_free(m);
     if (!ok) return -1;
-    sodium_bin2hex(out, 65, h, 32);
+    vfips_bin2hex(out, 65, h, sizeof h);
     return 0;
 }
 
