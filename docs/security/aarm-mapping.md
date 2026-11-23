@@ -222,8 +222,8 @@ The conformance page lists a minimum test per requirement. VAREK today:
 
 ## What would close the gaps
 
-1. **v1.42.0, STEP_UP and DEFER** (`docs/security/v1.42-step-up-defer.md`). This closes R4 and the DEFER parts of R1, R3, R5 and R6.
-2. **Recording the original request** (R2): a `--intent` given to the run, recorded in `run_start` and shown to approvers.
+1. **v1.42.0, STEP_UP and DEFER** (`docs/security/v1.42-step-up-defer.md`), with approvers from a Unix group and a notification to each approver. This closes R4 and the DEFER parts of R1, R3, R5 and R6.
+2. **Recording the original request** (R2): `varek run --intent`, recorded in `run_start` and shown to approvers, planned for v1.42.0.
 3. **Context across runtime calls** (R2, R3): labels on what the agent reads, and a rule that refuses or steps up a later send. This is VAREK's cross-action data-flow candidate (v1.11).
 4. **A general MODIFY,** for example narrowing an MCP call's arguments, kept to transformations the checker can verify.
 5. **SVID revocation checks** (R6).
