@@ -66,6 +66,8 @@ VAREK is not a kernel-only monitor:
 
 So VAREK combines A, B and C, with one decision point and one signed record.
 
+VAREK is also designed to keep the human out of the loop at run time (HOOTL). People decide when they write the policy and approve the plan, and the machine checks every call against those decisions. Its planned approvals follow suit (v1.42.0, below): an approval is a signed, scoped grant that the machine checks, given before the run where possible.
+
 ## Requirement by requirement
 
 ### R1: Pre-execution interception (MUST)
@@ -130,7 +132,11 @@ AARM's test for a context-dependent allow expects STEP_UP or ALLOW.
 | STEP_UP | No: planned for v1.42.0. |
 | DEFER | No: planned for v1.42.0. UNKNOWN is refused today. |
 
-Because the kernel already holds the call while the Warden decides, seccomp user-notify can keep it held until an approver answers. See `docs/security/v1.42-step-up-defer.md`.
+v1.42.0 is planned to add STEP_UP and DEFER (`docs/security/v1.42-step-up-defer.md`), with approvals designed to go beyond AARM's model:
+- **An approval is a grant, not a verdict.** A person approves a signed, scoped rule (this object, this many times, until this time, for this user or sub-agent), within the policy's `step_up` rule. The approved call is then decided by the machine against the policy plus the grant, with a certificate the checker verifies.
+- **The audit replays every approval.** Each call falls within its grant, and each grant within its `step_up` rule.
+- **People approve ahead of time where they can.** That means a plan approved before the run, or standing grants. At run time the default is `mode=grant`: the call is refused at once, and its retry passes once the grant is approved, so the agent never waits on a person.
+- **AARM's hold mode** (`mode=hold`) keeps the call held at the kernel (seccomp user-notify) until the approver answers. AARM's conformance test uses that mode.
 
 **Tests:** `make test-v1280` (the credential swap).
 
@@ -222,7 +228,13 @@ The conformance page lists a minimum test per requirement. VAREK today:
 
 ## What would close the gaps
 
-1. **v1.42.0, STEP_UP and DEFER** (`docs/security/v1.42-step-up-defer.md`), with approvers from a Unix group and a notification to each approver. This closes R4 and the DEFER parts of R1, R3, R5 and R6.
+1. **v1.42.0, STEP_UP and DEFER** (`docs/security/v1.42-step-up-defer.md`):
+   - approvals as signed, scoped grants that the machine checks and the audit replays;
+   - plan approval and standing grants ahead of time;
+   - `mode=grant` by default, and `mode=hold` for AARM's test;
+   - approvers from a Unix group, with a webhook carrying each proposed grant.
+
+   This closes R4 and the DEFER parts of R1, R3, R5 and R6.
 2. **Recording the original request** (R2): `varek run --intent`, recorded in `run_start` and shown to approvers, planned for v1.42.0.
 3. **Context across runtime calls** (R2, R3): labels on what the agent reads, and a rule that refuses or steps up a later send. This is VAREK's cross-action data-flow candidate (v1.11).
 4. **A general MODIFY,** for example narrowing an MCP call's arguments, kept to transformations the checker can verify.
