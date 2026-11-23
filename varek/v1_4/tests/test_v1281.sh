@@ -50,7 +50,13 @@ fail=0 skips=0
 pass()  { printf '  PASS   %s\n' "$1"; }
 flunk() { printf '  FAIL   %s\n' "$1"; fail=1; }
 skip()  { printf '  SKIP   %s\n' "$1"; skips=$((skips + 1)); }
-check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else flunk "$d"; fi; }
+check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else flunk "$d"; return 1; fi; }
+# why RUN: two lines for a failed run's check, right after its FAIL line (the
+# node-agent sweep copies them into the job's log): its exit code and the
+# Warden's last words. The run's files are gone after the suite.
+why()   { printf '     why: rc=%s; %s\n' "$(cat "$OUT/$1.rc" 2>/dev/null || echo '?')" \
+            "$(grep -v '^$' "$OUT/$1.out" 2>/dev/null | tail -2 | tr '\n' '|' | cut -c1-240)"
+          printf '     why: %s\n' "$(grep -i 'token\|refus\|error' "$OUT/$1.out" 2>/dev/null | tail -1 | cut -c1-240)"; }
 trap '[ -n "${KEEP:-}" ] && echo "kept $OUT" || rm -rf "$OUT"' EXIT
 
 echo "== 1. the grammar =="
@@ -206,7 +212,8 @@ for l in open(sys.argv[1]):
         n="${c%%:*}"; a="$(echo "$c" | cut -d: -f2)"; k="${c##*:}"
         if [ "$n" = eddsa ] && [ "$ED" = 0 ]; then skip "an EdDSA token (this host's provider offers no Ed25519: FIPS mode)"; continue; fi
         mint "$n"; go "$n" "$T/p.txt" --on-behalf-of "$T/tok"
-        check "a $a token: verified with the issuer's key $k" sh -c "grep -qx 0 '$OUT/$n.rc' && grep -q 'token verified ($a, key $k)' '$OUT/$n.out'"
+        check "a $a token: verified with the issuer's key $k" sh -c "grep -qx 0 '$OUT/$n.rc' && grep -q 'token verified ($a, key $k)' '$OUT/$n.out'" ||
+            why "$n"
     done
     mint es256-nokid; go nokid "$T/p.txt" --on-behalf-of "$T/tok"
     check "a token naming no key, with one key for its algorithm: verified" sh -c "grep -qx 0 '$OUT/nokid.rc' && grep -q 'token verified (ES256)' '$OUT/nokid.out'"
