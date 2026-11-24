@@ -12,7 +12,7 @@ The release also:
 - moves the sector packs to `require warden 1.29`;
 - adds an export to CrowdStrike Falcon Next-Gen SIEM, tested against a stand-in.
 
-CrowdStrike Falcon Foundry and Wiz, still waiting on their partner programs' tenants, move to v1.43.0; v1.42.0 is planned for the human-approval (STEP UP) and deferral (DEFER) decisions of the AARM specification. The policy grammar stays 1.35.
+CrowdStrike Falcon Foundry and Wiz, still waiting on their partner programs' tenants, move to v1.44.0. v1.42.0 is planned for the human-approval (STEP UP) and deferral (DEFER) decisions of the AARM specification, and v1.43.0 for Google Security Operations. The policy grammar stays 1.35.
 
 > Not reviewed by a human or a third party, or by a separate review pass: the changes were tested as below.
 
@@ -144,5 +144,5 @@ MIT · github.com/kwdoug63/varek
 - **EdDSA in FIPS mode:** Red Hat's FIPS provider offers no Ed25519. So in FIPS mode, `warden-secrets` refuses EdDSA-signed tokens, and v1.40 logs are checked on a host not in FIPS mode.
 - **The Defense build leaves out inspecting mode,** and with it request rules, MCP tool-call rules, credential release and passthrough hosts. Bringing it back on the FIPS provider is a question for counsel.
 - **Acceptance so far:** only on RHEL 9.8 on EC2, with FIPS mode enabled after installation rather than at install time.
-- **Falcon:** tested against a stand-in only. Falcon Foundry and Wiz are v1.43.0.
+- **Falcon:** tested against a stand-in only. Falcon Foundry and Wiz are v1.44.0.
 - **From v1.40.0, unchanged:** the Sentinel and pack limits in `RELEASE-v1.40.0.md`.
