@@ -18,7 +18,9 @@ and Ed25519 code are gone. The verdict stream moves to format chain-2
 (`make DEFENSE=1`) runs only on a host in FIPS mode with its FIPS 140-3
 validated module servicing it, and leaves TLS-inspecting mode out. The
 sector packs move to `require warden 1.29`; the Falcon Next-Gen SIEM
-export is in, tested against a stand-in. v1.42.0 is planned for AARM's
+export is in, tested against a stand-in. The 24-hour soak passed (the
+shared soak, and the packs on the core build and on the Defense build in
+FIPS mode). v1.42.0 is planned for AARM's
 STEP UP and DEFER decisions and v1.43.0 for Google Security Operations;
 CrowdStrike Falcon Foundry and Wiz move to v1.44.0.
 

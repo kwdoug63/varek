@@ -106,7 +106,7 @@ MIT · github.com/kwdoug63/varek
 
 ## Tested
 
-- **CI** on every PR (#214 to #238), x86-64 and arm64. Each runs every job its files trigger, including:
+- **CI** on every PR (#214 to #240, and this release's PR), x86-64 and arm64. Each runs every job its files trigger, including:
   - the Warden build's suites (the v1.41 suite `test-v1410` among them);
   - the container image's sweep;
   - the node agent's suites;
@@ -133,7 +133,23 @@ MIT · github.com/kwdoug63/varek
     - the audit's own crypto in FIPS mode: MD5 refused, ECDSA P-384 verifying RFC 6979's vector, and a v1.40 log reported as not checkable there.
   - **Evidence:** SHA-256 `0c9453c55e7d2b459ac589bd7b794c26dcacf9c4963d930c419ce91254d13de8`.
 - **RHEL 9.8 not in FIPS mode,** with Red Hat's FIPS provider installed: `test_v1410` passed. The Defense build refused at start, refused to supervise or lint, and `varek_keygen` made no key.
-- **The 24-hour soak on the release's code:** the shared soak, the packs and the export, and the Defense build's pack loop in FIPS mode. *Results to be added when it ends.*
+- **The 24-hour soak: PASS, all three parts** (November 23 to 24, 2026, CST), on `91e76b5`, main after #238. Since then, the Warden's code and the tools are unchanged: #240 changed only test diagnostics, and this PR changes versions and docs.
+  - **Before it began,** on all three hosts: each built `91e76b5`, the acceptance's token check was in, and the Defense host was in FIPS mode.
+  - **The FIPS acceptance on the Defense host** (`varek-rhel9-fips`, RHEL 9.8, OpenSSL's FIPS provider 3.0.7): RESULT: PASS, exit 0.
+    - `test_v1281` passed in FIPS mode: 232 checks, 1 skipped (the EdDSA token, which FIPS mode doesn't offer).
+    - RS384, PS384 and ES384 tokens were each verified in FIPS mode.
+    - Evidence: SHA-256 `f39a7d698745f7244a6dbdd0c93b6424716130e9dc249002d06f082f6d0f3732`.
+  - **Part A, the shared soak** (09:05 Monday to 09:08 Tuesday): `soak_check: PASS`, the Warden 1.41.0 throughout.
+    - **A:** 1,440 turns, every task and probe as expected. The run was revoked 0.02 s after the user's token expired, with no working turn after. Its audit passed. The OCSF export: 11,719 events, none invalid against OCSF 1.9.0, the chain intact.
+    - **B, enforcing:** 1,440 turns, work 1,296 of 1,296, probes 48 of 48 each; its audit passed.
+    - **C, a dry run:** 1,440 of 1,440 turns; its audit said `VERIFIED: DRY RUN` (exit 3, as designed), and the draft policy let nothing through.
+    - **Memory:** no growth over 144 samples; the largest change was `gh`'s, 20.1 to 21.1 MB.
+  - **Part B, the packs on the core build** (09:01 Monday to 09:01 Tuesday): 1,440 runs, 288 for each pack, all as expected, with the default provider. PASS.
+  - **Part C, the packs on the Defense build in FIPS mode** (`varek-rhel9-fips`, 09:08 Monday to 09:08 Tuesday): 1,440 runs, 288 for each pack, all as expected, with the FIPS provider. PASS.
+  - **At the end,** each host had been up 26 hours, with a load of 0.00, no swap used, and its disk 24 to 37% full.
+  - **Not as planned:**
+    - The Defense host had no swap on, so one was created first, as the plan says.
+    - The trial before Part C ran 16 times, not about 20, because runs take longer in FIPS mode.
 
 ## Known limits
 
