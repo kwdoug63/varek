@@ -43,13 +43,15 @@ libsodium: follow the copy at their tag); each release's own copy is at its tag
 ## 1. The build's packages
 
 ```sh
-sudo dnf install -y gcc make git python3 libseccomp-devel openssl-devel
+sudo dnf install -y gcc make git python3 python3-cryptography libseccomp-devel openssl-devel
 ```
 
 All of them come from BaseOS and AppStream. dnf may also update `openssl`,
 `openssl-libs` and `python3` to the latest RHEL 9 packages they need. At run
 time the Warden needs `libseccomp`, `openssl-libs` and `python3`; the
-`-devel` packages bring them.
+`-devel` packages bring them. From v1.41 the audit (`varek audit`, and the
+check `varek export` runs first) verifies signatures with
+`python3-cryptography`, on the same OpenSSL.
 
 No other repository is needed. CodeReady Builder only gives `glibc-static`,
 for a static `tools/bench_workload` (the workload of `varek bench`); without
@@ -67,7 +69,7 @@ The release's tag, here v1.41.0 (the list:
 https://github.com/kwdoug63/varek/releases):
 
 ```sh
-git clone --branch v1.40.0 --depth 1 https://github.com/kwdoug63/varek.git && cd varek/varek/v1_4
+git clone --branch v1.41.0 --depth 1 https://github.com/kwdoug63/varek.git && cd varek/varek/v1_4
 make
 sudo make install BINDIR=/usr/bin
 ```
@@ -85,7 +87,7 @@ sudo varek doctor
 ```
 
 `varek version` names the `varek` command's version and the Warden's, the
-second line `VAREK Warden  1.40.0  (/opt/varek)`. `varek doctor` checks the
+second line `VAREK Warden  1.41.0  (/opt/varek)`. `varek doctor` checks the
 kernel, the build and the host's settings, and names the fix for any it
 finds missing. Until step 5 it notes there are no settings at
 `/etc/varek/varek.conf`: a run needs none (step 4). From 1.36.2 that is a
