@@ -672,6 +672,7 @@ def parse_lines(raw_lines, path):
         return k
     issuers, spiffe, require_obo = [], [], False   # v1.28.1
     require_plan = False                           # v1.35 step 4
+    max_seen = set()                               # v1.42: max_held, max_pending
     if True:
         for lineno, raw in enumerate(raw_lines, 1):
             if b"\0" in raw:
@@ -700,6 +701,13 @@ def parse_lines(raw_lines, path):
                     raise PolicyError(f"{path}:{lineno}: bad require plan")
                 require_plan = True
                 continue
+            if toks[0] in ("max_held", "max_pending"):
+                # v1.42: max_held N, max_pending N (1 to 1024, each once)
+                if req < (1, 42) or len(toks) != 2 or not re.fullmatch(r"[1-9][0-9]{0,3}", toks[1]) or \
+                        int(toks[1]) > 1024 or toks[0] in max_seen:
+                    raise PolicyError(f"{path}:{lineno}: bad {toks[0]}")
+                max_seen.add(toks[0])
+                continue
             if toks[0] == "trust":
                 # v1.28.1
                 if req < (1, 28):
@@ -721,7 +729,7 @@ def parse_lines(raw_lines, path):
                 if len(toks) != 3 or toks[1] != "warden" or not m:
                     raise PolicyError(f"{path}:{lineno}: bad directive")
                 v = (int(m.group(1)), int(m.group(2)))
-                if v > (1, 35):                    # v1.35 step 4: the grammar is 1.35
+                if v > (1, 42):                    # v1.42: the grammar is 1.42
                     raise PolicyError(f"{path}:{lineno}: requires newer Warden")
                 if legacy_name and v >= (1, 24):
                     raise PolicyError(f"{path}:{lineno}: require warden 1.24 after a host name")
@@ -811,8 +819,31 @@ def parse_lines(raw_lines, path):
                 subj_register(len(rules) - 1, True, f"{path}:{lineno}")
                 continue
             verb, kind = toks[0], toks[1]
-            if verb not in ("allow", "deny"):
+            if verb not in ("allow", "deny", "step_up"):
                 raise PolicyError(f"{path}:{lineno}: verb")
+            su_opts = {}
+            if verb == "step_up":
+                # v1.42: its options come last: mode= approvers= timeout= scope= notify=
+                if req < (1, 42):
+                    raise PolicyError(f"{path}:{lineno}: step_up before 1.42")
+                while len(toks) > 3:
+                    o = toks[-1]
+                    k = o.split("=", 1)[0] if "=" in o else ""
+                    if k not in ("mode", "approvers", "timeout", "scope", "notify"):
+                        break
+                    if k in su_opts:
+                        raise PolicyError(f"{path}:{lineno}: step_up option twice")
+                    v_ = o.split("=", 1)[1]
+                    ok = (k == "mode" and v_ in ("grant", "hold")) or \
+                         (k == "scope" and v_ in ("thread", "run")) or \
+                         (k == "timeout" and re.fullmatch(r"[1-9][0-9]{0,3}", v_) is not None and int(v_) <= 3600) or \
+                         (k == "approvers" and re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}|[a-z_][a-z0-9_-]{0,30}\$", v_) is not None) or \
+                         (k == "notify" and 9 <= len(v_) <= 512 and v_.startswith("https://") and
+                          v_[8] not in "/?#" and all(0x21 <= ord(ch) <= 0x7e for ch in v_))
+                    if not ok:
+                        raise PolicyError(f"{path}:{lineno}: bad step_up option")
+                    su_opts[k] = v_
+                    toks = toks[:-1]
             if kind == "request":
                 # v1.26.1: <verb> request METHOD URL [max_body=N]
                 if req < (1, 26) or len(toks) < 4:
@@ -1272,9 +1303,15 @@ def oracle_symbolic(rx, rules, sval, kind="path"):
                          if rules[i]["verb"] == "allow"] or [smt.BoolVal(False, ctx=CTX)])
     deny_first = smt.Or([fires_first(rx, rules, i, s, f) for i in idx
                         if rules[i]["verb"] == "deny"] or [smt.BoolVal(False, ctx=CTX)])
+    # v1.42: a step_up rule refuses too, but is an outcome of its own: a mix
+    # of deny and step_up over the flags is UNKNOWN, as the procedure has it
+    step_first = smt.Or([fires_first(rx, rules, i, s, f) for i in idx
+                        if rules[i]["verb"] == "step_up"] or [smt.BoolVal(False, ctx=CTX)])
     if not sat(domain(s, f), pin, smt.Not(allow_first)):
         return "SATISFIED"
     if not sat(domain(s, f), pin, smt.Not(deny_first)):
+        return "UNSATISFIED"
+    if not sat(domain(s, f), pin, smt.Not(step_first)):
         return "UNSATISFIED"
     return "UNKNOWN"
 
@@ -1525,6 +1562,9 @@ AMBIGUOUS = ["allow path glob readonly", "deny path suffix -O_CREAT", "allow pat
              "deny path prefix glob", "allow path glob access=rw", "deny path contains +O_EXCL x"]
 
 
+FUZZ = {"v142": False}       # v1.42: the policy being written requires 1.42 (step_up rules)
+
+
 def fuzz_line(rng, prior, strings, wide):
     frags = ["/a", "/a/", "/a/b", "/ab", "/b/", "/a/b/c", "x", "x:1", "/", "[::1]", "[a]", "[:]",
              "1.2.3.4", "1.2.3.4:5", "01.2.3.4", "256.1.1.1", "unix", "unix:/a"]
@@ -1587,6 +1627,8 @@ def fuzz_line(rng, prior, strings, wide):
         elif r < 0.12:
             c = c + rand_const_bytes(rng)                  # non-ASCII byte in a constant
     verb = rng.choice(["allow", "deny"])
+    if FUZZ["v142"] and rng.random() < 0.3:
+        verb = "step_up"                                # v1.42
     clauses = []
     if kind == "path":
         if wide:
@@ -1606,6 +1648,15 @@ def fuzz_line(rng, prior, strings, wide):
         clauses += rng.choice([["acknowledge=dns-channel"]] * 8 +
                               [["acknowledge=dns"], ["acknowledge="],
                                ["acknowledge=dns-channel", "acknowledge=dns-channel"]])
+    if verb == "step_up" and rng.random() < 0.6:
+        # v1.42: a step_up rule's options, valid and not
+        opts = ["mode=grant", "mode=hold", "approvers=varek-approvers", "approvers=_x$", "timeout=1",
+                "timeout=3600", "timeout=300", "scope=thread", "scope=run", "notify=https://h.example/x"]
+        bad = ["mode=x", "timeout=0", "timeout=3601", "timeout=01", "approvers=Ops", "approvers=",
+               "scope=all", "notify=http://h.example/x", "notify=https:///x", "mode=hold"]
+        clauses += rng.sample(opts, rng.randint(1, 3))
+        if rng.random() < 0.15:
+            clauses.append(rng.choice(bad))
     line = " ".join([verb, kind] + ([matcher] if matcher else []) + [c] + clauses)
     if rng.random() < 0.05:
         line += "\r"                                   # CRLF
@@ -1723,14 +1774,18 @@ def fuzz_v131(rng, lines, valid, cred_names):
         lines.append(line)
 
 
-def fuzz_policy(rng, path):
+def fuzz_policy(rng, path, v142=False):
     """A random policy. Seven in ten are kept valid (each line is regenerated
     until this file's parser accepts it; the C parser must agree, which the
     check verifies), so most policies reach the reachability and query checks;
-    the rest may carry any number of malformed lines, for the parsers."""
+    the rest may carry any number of malformed lines, for the parsers.
+    v1.42: with v142, a policy after `require warden 1.42`, with step_up
+    rules (written in a run of their own, from their own random stream, so
+    the policies without them are the ones earlier versions wrote)."""
+    FUZZ["v142"] = v142
     valid = rng.random() < 0.7
     lines = []
-    if rng.random() < 0.3:
+    if not v142 and rng.random() < 0.3:
         # v1.26.1: an inspecting-mode policy: host rules, request rules over
         # them (allow and deny, exact and wildcard hosts, globs in the path,
         # queries), passthrough hosts, max_body, and (when the policy may be
@@ -1937,7 +1992,14 @@ def fuzz_policy(rng, path):
         with open(path, "w", encoding="latin-1", newline="") as fh:
             fh.write("\n".join(lines) + "\n")
         return
-    if rng.random() < 0.3:
+    if v142:
+        # v1.42: step_up rules, max_held and max_pending
+        lines.append("require warden 1.42")
+        if rng.random() < 0.3:
+            lines.append(rng.choice(["max_held 8", "max_pending 16", "max_held 1024"] +
+                                    ([] if valid else ["max_held 0", "max_held 1025", "max_pending x",
+                                                       "max_held 8\nmax_held 8"])))
+    elif rng.random() < 0.3:
         lines.append(rng.choice(["require warden 1.14", "require warden 1.13", "require warden 01.14",
                                  "require warden 1.15", "require warden 1.16", "require warden 1.21",
                                  "require warden 1.24", "require warden 1.24", "require warden 1.25",
@@ -1960,7 +2022,7 @@ def fuzz_policy(rng, path):
             if not valid:
                 break
             try:
-                parse_lines([line.encode("latin-1")], "line")
+                parse_lines(([b"require warden 1.42"] if FUZZ["v142"] else []) + [line.encode("latin-1")], "line")
                 break
             except PolicyError:
                 continue
@@ -2414,6 +2476,9 @@ def main():
                     "certificate the procedure emits, and forged and mutated ones")
     ap.add_argument("--fuzz", type=int, default=0, help="random policies to generate")
     ap.add_argument("--seed", type=int, default=1010)
+    ap.add_argument("--fuzz-v142", type=int, default=None,
+                    help="v1.42: random policies with step_up rules, after the others, from a random "
+                         "stream of their own (default: a fifth of --fuzz)")
     ap.add_argument("--queries", type=int, default=60)
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("policies", nargs="*")
@@ -2439,6 +2504,20 @@ def main():
                     dst.write(src.read())
                 fails.append(f"(failing fuzz policy saved to {keep})")
                 break
+        # v1.42: policies with step_up rules, from their own stream
+        rng2 = random.Random(a.seed * 7919 + 142)
+        n142 = a.fuzz // 5 if a.fuzz_v142 is None else a.fuzz_v142
+        for k in range(n142 if not fails else 0):
+            p = os.path.join(td, f"fuzz142_{k}.txt")
+            fuzz_policy(rng2, p, v142=True)
+            fails += check_policy(a.vdp, p, rng2, a.queries, stats, a.verbose, a.cert)
+            if fails and not a.verbose:
+                keep = os.path.join(tempfile.gettempdir(), f"vdp_fail_142_{k}.txt")
+                with open(p, encoding="latin-1") as src, open(keep, "w", encoding="latin-1") as dst:
+                    dst.write(src.read())
+                fails.append(f"(failing fuzz policy saved to {keep})")
+                break
+            stats["v142_policies"] = stats.get("v142_policies", 0) + 1
     total = stats["reach"] + stats["reach_forced_checked"] + stats["ground"] + stats["symbolic"]
     print(f"smt_crosscheck: {stats['policies']} policies ({stats['string_policies']} with "
           f"suffix/contains/glob rules, {stats['request_policies']} with request rules, {stats['launch_policies']} with launches, {stats['open_as_agent_policies']} opening as the agent; "

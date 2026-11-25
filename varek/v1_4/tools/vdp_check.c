@@ -29,6 +29,7 @@
 #endif
 #include "../smt_decide.h"
 #include "../shared_domains.h"
+#include <errno.h>
 #include <fcntl.h>
 
 #include <stdio.h>
@@ -36,6 +37,39 @@
 #include <string.h>
 
 static vdp_policy_t g_pol;
+/* v1.42: the grants batch decides within (batch GRANT_FILE...) */
+#define MAX_GRANTS 16
+static vdp_grant_t *g_grants[MAX_GRANTS];
+static size_t g_ngrants;
+
+static void print_witness(const char *key, const vdp_cert_t *c, int rc) {
+    if (rc < 0) printf(",\"%s\":\"!\"", key);
+    else if (c->wkind == VDP_WIT_OFFSET) printf(",\"%s\":\"c:%u\"", key, c->off);
+    else if (c->wkind == VDP_WIT_SPANS) {
+        printf(",\"%s\":\"g:", key);
+        for (uint32_t k = 0; k < c->nspan; k++)
+            printf("%s%u-%u", k ? "," : "", c->span[k][0], c->span[k][1]);
+        printf("\"");
+    } else printf(",\"%s\":\"-\"", key);
+}
+
+/* v1.42: read a grant file against g_pol; NULL with the reason on stderr */
+static vdp_grant_t *load_grant(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "grant %s: %s\n", path, strerror(errno)); return NULL; }
+    static char buf[VDP_GRANT_TEXT_MAX + 2];
+    size_t n = fread(buf, 1, sizeof buf, f);
+    fclose(f);
+    vdp_grant_t *g = calloc(1, sizeof *g);
+    char err[512];
+    if (!g) return NULL;
+    if (vdp_grant_parse(&g_pol, buf, n, g, err, sizeof err) < 0) {
+        fprintf(stderr, "grant %s: %s\n", path, err);
+        free(g);
+        return NULL;
+    }
+    return g;
+}
 
 static int hexval(int c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -94,22 +128,29 @@ static int do_batch(void) {
         }
         s[sl] = '\0';
         if (bad || memchr(s, '\0', sl)) { printf("{\"error\":\"bad hex\"}\n"); continue; }
-        int ri;
+        int ri, gi = -1, gr = -1;
         vdp_why_t why;
-        vdp_verdict_t v = vdp_decide_subj(&g_pol, (int)subj, kind, s, flags, has_flags, &ri, &why);
+        vdp_verdict_t v = g_ngrants
+            ? vdp_decide_grant(&g_pol, (const vdp_grant_t *const *)g_grants, g_ngrants, (int)subj, kind, s,
+                               flags, has_flags, &ri, &why, &gi, &gr)
+            : vdp_decide_subj(&g_pol, (int)subj, kind, s, flags, has_flags, &ri, &why);
         printf("{\"verdict\":\"%s\",\"rule\":%d,\"line\":%d,\"why\":\"%s\"",
                vdp_verdict_name(v), ri, ri >= 0 ? g_pol.rules[ri].line : -1,
                vdp_why_name(why));
+        /* v1.42: the deciding rule's verb, when one rule decided */
+        if (ri >= 0) printf(",\"verb\":\"%s\"", vdp_verb_name(g_pol.rules[ri].verb));
         if (v == VDP_SATISFIED) {
             vdp_cert_t c;
-            if (vdp_certificate(&g_pol, ri, s, &c) < 0) printf(",\"w\":\"!\"");
-            else if (c.wkind == VDP_WIT_OFFSET) printf(",\"w\":\"c:%u\"", c.off);
-            else if (c.wkind == VDP_WIT_SPANS) {
-                printf(",\"w\":\"g:");
-                for (uint32_t k = 0; k < c.nspan; k++)
-                    printf("%s%u-%u", k ? "," : "", c.span[k][0], c.span[k][1]);
-                printf("\"");
-            } else printf(",\"w\":\"-\"");
+            int crc = vdp_certificate(&g_pol, ri, s, &c);
+            print_witness("w", &c, crc);
+            if (gi >= 0) {
+                /* v1.42: allowed under grant gi: its rule, and the certificate's second half */
+                vdp_cert_t gc;
+                int grc = vdp_grant_certificate(g_grants[gi], gr, s, &gc);
+                printf(",\"grant\":%d,\"grant_rule\":%d,\"grant_line\":%d", gi, gr,
+                       gr >= 0 ? g_grants[gi]->lines[gr] : -1);
+                print_witness("gw", &gc, grc);
+            }
         }
         printf("}\n");
     }
@@ -123,11 +164,13 @@ static const char *reach_name(vdp_reach_t r) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3 && !(argc == 4 && !strcmp(argv[2], "analyze") && !strcmp(argv[3], "automaton"))) {
-        fprintf(stderr, "usage: %s <policy> lint|analyze [automaton]|batch|launches|mounts|openas|credentials|identity\n", argv[0]);
+    bool batch = argc >= 3 && !strcmp(argv[2], "batch"), grant = argc == 4 && !strcmp(argv[2], "grant");
+    if (argc != 3 && !(argc == 4 && !strcmp(argv[2], "analyze") && !strcmp(argv[3], "automaton")) &&
+        !(batch && argc <= 3 + MAX_GRANTS) && !grant) {
+        fprintf(stderr, "usage: %s <policy> lint|analyze [automaton]|batch [GRANT...]|grant GRANT|launches|mounts|openas|credentials|identity\n", argv[0]);
         return 2;
     }
-    if (argc == 4) vdp_reach_force_automaton = true;
+    if (argc == 4 && !batch && !grant) vdp_reach_force_automaton = true;
     char err[512];
     if (vdp_policy_load(argv[1], &g_pol, err, sizeof err) < 0) {
         if (!strcmp(argv[2], "lint")) fprintf(stderr, "policy error: %s\n", err);
@@ -135,7 +178,26 @@ int main(int argc, char **argv) {
         if (strcmp(argv[2], "lint")) fprintf(stderr, "policy error: %s\n", err);
         return 2;
     }
-    if (!strcmp(argv[2], "batch")) return do_batch();
+    if (batch) {
+        /* v1.42: batch GRANT...: the queries are decided within these grants */
+        for (int i = 3; i < argc; i++) {
+            vdp_grant_t *g = load_grant(argv[i]);
+            if (!g) return 2;
+            g_grants[g_ngrants++] = g;
+        }
+        return do_batch();
+    }
+    /* v1.42: grant FILE: read a grant against the policy, and say what it holds */
+    if (grant) {
+        vdp_grant_t *g = load_grant(argv[3]);
+        if (!g) return 2;
+        printf("{\"ok\":true,\"step_up_line\":%d,\"rules\":%zu,\"count\":%u,\"until\":%lld,"
+               "\"user\":\"%s\",\"subagent\":\"%s\",\"run\":\"%s\",\"lines\":[",
+               g->su_line, g->n, g->count, (long long)g->until, g->user, g->subagent, g->run);
+        for (size_t i = 0; i < g->n; i++) printf("%s%d", i ? "," : "", g->lines[i]);
+        printf("]}\n");
+        return 0;
+    }
     /* v1.27: are launches after the first decided (require warden 1.27)? */
     if (!strcmp(argv[2], "launches")) {
         printf("%s\n", g_pol.launches ? "on" : "off");
@@ -214,7 +276,7 @@ int main(int argc, char **argv) {
             vdp_reach_t rr = vdp_rule_reachable_witness(&g_pol, i, wit, sizeof wit, &wl, &wf);
             printf("{\"index\":%zu,\"line\":%d,\"kind\":\"%s\",\"verb\":\"%s\",\"reach\":\"%s\"",
                    i, r->line, vdp_kind_name(r->kind),
-                   r->verb == VDP_ALLOW ? "allow" : "deny", reach_name(rr));
+                   vdp_verb_name(r->verb), reach_name(rr));
             if (rr == VDP_REACHABLE) {
                 printf(",\"witness\":\"");
                 for (size_t k = 0; k < wl; k++) printf("%02x", (unsigned char)wit[k]);
@@ -257,7 +319,7 @@ int main(int argc, char **argv) {
                 const vdp_rule_t *r = &g_pol.rules[i];
                 printf("%s:%d: %s %s %s%s can never fire (every action it matches is decided "
                        "by an earlier rule, or it matches no string within the length bound)\n",
-                       argv[1], r->line, r->verb == VDP_ALLOW ? "allow" : "deny",
+                       argv[1], r->line, vdp_verb_name(r->verb),
                        vdp_kind_name(r->kind), vdp_matcher_prefix(r), r->s.c);
                 dead++;
             } else if (rr == VDP_REACH_UNKNOWN) {

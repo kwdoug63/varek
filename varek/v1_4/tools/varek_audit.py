@@ -4943,7 +4943,7 @@ def report(a, meta, sec, k, integrity, run, warden, complete, nrec, prules, rule
                 for i, r in enumerate(rules):
                     if i < len(row) and row[i] == "1" and r[0] == "p" and \
                             (flv & int(r[3], 16)) == int(r[4], 16):
-                        if r[1] == "d":
+                        if r[1] != "a":                      # v1.42: or a step_up rule ('s')
                             sec["views"].append(f"seq {seq}: a {rule} served, but policy "
                                                 f"rule {i} denies {resolved}")
                         break
