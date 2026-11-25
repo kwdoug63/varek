@@ -589,6 +589,13 @@ static int policy_load(const char *path, struct policy *p) {
                 "`on unknown` line differently; refusing to start\n", path);
         return -1;
     }
+    /* v1.42 step 5b: and the `on outside_plan` line */
+    if (p->v.op_line != p->c.op_line || p->v.op_timeout != p->c.op_timeout ||
+        p->v.op_scope != (uint8_t)p->c.op_scope || strcmp(p->v.op_approvers, p->c.op_approvers)) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read the "
+                "`on outside_plan` line differently; refusing to start\n", path);
+        return -1;
+    }
     /* v1.26: and the proxy directives */
     bool proxy_same = p->v.proxy == (p->c.proxy != 0) && p->v.proxy_nports == p->c.proxy_nports;
     for (size_t k = 0; proxy_same && k < p->v.proxy_nports; k++)

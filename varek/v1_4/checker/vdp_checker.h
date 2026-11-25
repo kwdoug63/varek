@@ -158,6 +158,10 @@ typedef struct {
     uint32_t      unk_timeout;        /* ... its timeout=, 0: not set */
     int           unk_scope;          /* ... scope= (0 thread, 1 run; default run) */
     char          unk_approvers[33];  /* ... approvers= */
+    int           op_line;            /* v1.42 step 5b: `on outside_plan defer`'s line, 0: none */
+    uint32_t      op_timeout;         /* ... its timeout=, 0: not set */
+    int           op_scope;           /* ... scope= (0 thread, 1 run; default run) */
+    char          op_approvers[33];   /* ... approvers= */
     vdpc_subject_t subjects[32];      /* v1.31: subject k is subjects[k - 1] */
     size_t        nsubjects;
     vdpc_mcpres_t mcpres[8];          /* v1.31 */

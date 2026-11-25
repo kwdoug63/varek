@@ -1323,6 +1323,7 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
     int rc = 0;
     int req_maj = 0, req_min = 0;       /* highest `require warden` seen so far */
     bool seen_unknown = false;          /* v1.42 step 5: an `on unknown` line */
+    bool seen_outside = false;          /* v1.42 step 5b: an `on outside_plan` line */
     int legacy_name_line = 0;           /* v1.24: a host name read before `require warden 1.24` */
     size_t glob_tokens = 0;
     while ((got = getline(&line, &cap, f)) >= 0) {
@@ -1391,6 +1392,34 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             p->unk_timeout = o.su_timeout;
             p->unk_scope = o.su_scope;
             memcpy(p->unk_approvers, o.su_approvers, sizeof p->unk_approvers);
+            continue;
+        }
+        /* v1.42 step 5b: on outside_plan deny | on outside_plan defer [timeout=N] [scope=..] [approvers=G] */
+        if (!strcmp(tok[0], "on") && nt >= 2 && !strcmp(tok[1], "outside_plan")) {
+            if (!(req_maj > 1 || (req_maj == 1 && req_min >= 42))) {
+                rc = perr(err, errlen, path, lineno, "`on outside_plan` needs `require warden 1.42` before it");
+                break;
+            }
+            if (p->op_line || seen_outside) { rc = perr(err, errlen, path, lineno, "`on outside_plan` given twice"); break; }
+            seen_outside = true;
+            if (nt == 3 && !strcmp(tok[2], "deny")) continue;
+            if (nt < 3 || strcmp(tok[2], "defer")) {
+                rc = perr(err, errlen, path, lineno, "need: on outside_plan deny, or on outside_plan defer [timeout=N] "
+                          "[scope=thread|run] [approvers=GROUP]");
+                break;
+            }
+            vdp_rule_t o;
+            memset(&o, 0, sizeof o);
+            o.su_scope = VDP_SCOPE_RUN;
+            const char *why = su_options(tok + 3, nt - 3, VDP_DEFER, &o, true);
+            if (!why && o.su_escalate)
+                why = "escalate is not taken here: an outside_plan call is resolved by a plan extension, "
+                      "`varek plan extend`";
+            if (why) { rc = perr(err, errlen, path, lineno, "%s", why); break; }
+            p->op_line = lineno;
+            p->op_timeout = o.su_timeout;
+            p->op_scope = o.su_scope;
+            memcpy(p->op_approvers, o.su_approvers, sizeof p->op_approvers);
             continue;
         }
         /* v1.42: max_held N, max_pending N */
