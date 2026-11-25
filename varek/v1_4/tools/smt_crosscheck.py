@@ -860,7 +860,10 @@ def parse_lines(raw_lines, path):
                     raise PolicyError(f"{path}:{lineno}: {verb} before 1.42")
                 while len(toks) > 3:
                     o = toks[-1]
+                    # escalate is a bare word: `escalate=...` is no option (the rule's own token)
                     k = o.split("=", 1)[0] if "=" in o else ("escalate" if o == "escalate" else "")
+                    if k == "escalate" and o != "escalate":
+                        k = ""
                     if k not in ("mode", "approvers", "timeout", "scope", "notify", "until", "escalate"):
                         break
                     if (verb == "step_up") != (k not in ("until", "escalate")) and k not in ("approvers", "timeout", "scope"):
