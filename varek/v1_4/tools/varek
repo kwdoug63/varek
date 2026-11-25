@@ -2208,13 +2208,46 @@ def cmd_pending(args):
     if not props:
         info(f"{run}: no proposal you may answer is open.")
         return 0
+    defers = [p for p in props if p.get("defer") == "outside_plan"]
     for p in props:
+        if p in defers:
+            continue
         info(f"proposal {p['id']} (policy line {p['rule_line']}, ends in {p['expires_in']} s)"
              + (f", approvers {p['approvers']}" if p.get("approvers") else ""))
         for ln in p["proposal"].splitlines():
             info(f"    {ln}")
-    info(f"\nAnswer with `varek approve {run} ID` (or --narrow FILE) or `varek deny {run} ID`.")
+    # v1.42 step 5b: calls outside the run's plan, waiting for a plan extension
+    for p in defers:
+        info(f"outside the plan: {p['id']} (policy line {p['rule_line']}, ends in {p['expires_in']} s): "
+             f"{p['action']} {p['resolved']}")
+        if p.get("extension"):
+            info("    an extension that covers it:")
+            for ln in p["extension"].splitlines():
+                info(f"        {ln}")
+    if len(defers) < len(props):
+        info(f"\nAnswer with `varek approve {run} ID` (or --narrow FILE) or `varek deny {run} ID`.")
+    if defers:
+        info(f"\nExtend the run's plan with `varek plan extend {run} PLAN`.")
     return 0
+
+
+def cmd_plan_extend(args):
+    """v1.42 step 5b: steps added to a running run's plan, through its plan gate"""
+    run = apv_run(args.run)
+    with open(args.plan, encoding="utf-8") as fh:
+        text = fh.read()
+    if len(text.encode("utf-8")) > 16384:
+        raise CliError("a plan extension is at most 16 KiB")
+    ans = apv_ask(run, "extend\n" + text)
+    if ans is None:
+        fail(f"{run}: no such run is running")
+        return 1
+    ans = ans.strip()
+    if ans.startswith("extended"):
+        ok(f"{run}: {ans}")
+        return 0
+    fail(f"{run}: {ans}")
+    return 1
 
 
 def cmd_approve(args, deny=False):
@@ -3610,6 +3643,15 @@ def build_parser():
     x.add_argument("-o", "--output", help="write the plan here (default: standard output)")
     x.add_argument("--force", action="store_true", help="write over --output")
     x.set_defaults(fn=cmd_plan_merge)
+    x = plsub.add_parser("extend", help="v1.42: add steps to a running run's plan (an approver of its "
+                                        "`on outside_plan defer` line), decided by its plan gate",
+                         description="Send PLAN to the run's Warden over the approvers' socket. The Warden decides "
+                                     "it with the plan gate; the steps of a plan it authorizes join the run's plan, "
+                                     "and each call held outside the plan that they cover is decided again. "
+                                     "`varek pending` suggests one for each such call.")
+    x.add_argument("run", help="the run's id (or its verdict stream)")
+    x.add_argument("plan", help="the plan's steps (plan 1.35 format)")
+    x.set_defaults(fn=cmd_plan_extend)
 
     sp = add("preflight", cmd_preflight, "check the deployment before running agents")
     sp.add_argument("--run", action="store_true", help="also do a real trial run and audit it (root)")

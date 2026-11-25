@@ -1152,6 +1152,7 @@ static bool frz_wanted(const struct policy *p) {
         if (r->verb == VDP_STEP_UP && r->su_mode == VDP_SU_HOLD && r->su_scope == VDP_SCOPE_RUN) return true;
         if (r->verb == VDP_DEFER && r->su_scope == VDP_SCOPE_RUN) return true;      /* v1.42 step 5 */
     }
+    if (p->v.op_line && p->v.op_scope == VDP_SCOPE_RUN && g_hold_req) return true;   /* v1.42 step 5b */
     return p->v.unk_line && p->v.unk_scope == VDP_SCOPE_RUN;
 }
 

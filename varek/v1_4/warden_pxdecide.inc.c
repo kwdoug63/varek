@@ -42,6 +42,8 @@ static const vdp_rule_t *px_rl(const struct policy *p, const struct action *a) {
     static const vdp_rule_t none;
     return a->rule_index >= 0 && (size_t)a->rule_index < p->v.n ? &p->v.rules[a->rule_index] : &none;
 }
+static bool op_take(const struct action *a, decision_t d_raw, const char *rule_id, uint64_t latency_ns,
+                    int what, uint64_t conn, const void *msg, size_t len, bool f1, bool f2, int cred);   /* v1.42 step 5b */
 static bool px_hold_take(const struct action *a, decision_t d_raw, int what, uint64_t conn, const void *msg,
                          size_t len, bool f1, bool f2);
 
@@ -877,6 +879,12 @@ static int px_httpreq_decide(const struct policy *p, struct px_open *o, const st
     if (d_final == DEC_ALLOW && hold_refuses_cred(p, a, px_rl(p, a)->cred)) {
         d_final = DEC_DENY;
         rule = "outside_plan";
+        /* v1.42 step 5b: deferred until a plan extension names the credential */
+        if (hold == PXH_DECIDE && op_take(a, d_raw, rule, 0, PXH_HTTP, m->id, m, sizeof *m, false, false,
+                                          px_rl(p, a)->cred)) {
+            free(a);
+            return 0;
+        }
     }
     /* v1.29: a dry run relays a request the policy refuses, with no
      * credential and no body limit, as not enforced */
@@ -1109,6 +1117,7 @@ static int px_mcpreq_decide(const struct policy *p, struct px_open *o, struct wp
             rule = "credential_expired";
         }
         /* v1.35 step 4: a call, or a credential it carries, no step of the run's plan names */
+        int opc = 0;
         if (d_final == DEC_ALLOW && hold_refuses(a)) {
             d_final = DEC_DENY;
             rule = "outside_plan";
@@ -1116,7 +1125,14 @@ static int px_mcpreq_decide(const struct policy *p, struct px_open *o, struct wp
         } else if (d_final == DEC_ALLOW && hold_refuses_cred(p, a, px_rl(p, a)->cred)) {
             d_final = DEC_DENY;
             rule = "outside_plan";
+            opc = px_rl(p, a)->cred;
             snprintf(why, sizeof why, "it carries a credential no step of the run's plan names");
+        }
+        /* v1.42 step 5b: deferred until a plan extension covers it */
+        if (hold == PXH_DECIDE && !strcmp(rule, "outside_plan") &&
+            op_take(a, d_raw, rule, 0, PXH_MCP, m->id, m, sizeof *m, false, false, opc)) {
+            free(a);
+            return 0;
         }
         if (d_final == DEC_ALLOW) snprintf(why, sizeof why, "allowed");
         else if (!strcmp(rule, "max_body"))

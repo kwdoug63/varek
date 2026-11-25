@@ -630,7 +630,15 @@ class GrantsCheck:
     SHA-256). An ALLOW under a marker with no deferral names the marker
     too, and its certificate is re-checked as a defer rule's (MainLoop's row
     ends in `defer`). A deferral with scope=run freezes the run as a held
-    step_up call does."""
+    step_up call does.
+
+    v1.42 step 5b (on outside_plan defer): a deferral of a call outside the
+    run's plan (`"outside_plan":true`) never escalates; it ends resolved by
+    a plan extension (plan_extension, the SHA-256 of a plan_extended record
+    before it whose verdict is SATISFIED), and its call, decided again after
+    that ending, is allowed as any call the plan covers (no marker). Each
+    plan_extended record names its text's SHA-256, its verdict and its
+    approver."""
 
     def __init__(self, run, problems, rs=None):
         self.run, self.problems = run, problems
@@ -641,6 +649,7 @@ class GrantsCheck:
         self.runheld = set()                 # held with scope=run, not yet thawed after
         self.replays = set()                 # approved, held with scope=run: decided again before the thaw
         self.defers = {}                     # v1.42 step 5: deferral id -> its state
+        self.exts = {}                       # v1.42 step 5b: a plan extension's SHA-256 -> its verdict
         self.await_prop = None               # an escalated deferral's proposal, whose step_up record comes next
         self.ndefer = 0
         self.props = {}                      # id -> {"seq", "ended", "text"}
@@ -741,6 +750,8 @@ class GrantsCheck:
         """v1.42 step 5: a decision record's deferral fields"""
         p, d = self.problems, r.get("defer")
         seq = r.get("seq")
+        dfo = self.defers.get(d) if isinstance(d, str) else None
+        op = dfo is not None and dfo.get("op")            # v1.42 step 5b: released by a plan extension
         if r.get("cert_defer") is True:
             m = r.get("defer_marker")
             if r.get("decision_final") != "ALLOW":
@@ -748,7 +759,7 @@ class GrantsCheck:
             elif not isinstance(m, dict) or not isinstance(m.get("path"), str) or \
                     not re.fullmatch(r"[0-9a-f]{64}", str(m.get("sha256", ""))):
                 p.append(f"seq {seq}: allowed under a defer rule's marker, which it does not name")
-        elif r.get("decision_final") == "ALLOW" and d is not None and d != "none":
+        elif r.get("decision_final") == "ALLOW" and d is not None and d != "none" and not op:
             p.append(f"seq {seq}: allowed after deferral {d!r}, but not under its marker")
         if d is None:
             return
@@ -770,7 +781,7 @@ class GrantsCheck:
             return
         df["decided"] = True
         self.replays.discard(d)
-        if r.get("decision_final") == "ALLOW":
+        if r.get("decision_final") == "ALLOW" and not op:
             m = r.get("defer_marker")
             if not isinstance(m, dict) or m.get("sha256") != df["sha"]:
                 p.append(f"seq {seq}: allowed after deferral {d}, under a marker other than the one that resolved it")
@@ -793,7 +804,10 @@ class GrantsCheck:
                 p.append(f"defer {did}: a state the Warden does not write")
             sc = e.get("scope")
             self.defers[did] = {"ended": False, "ending": None, "refused": False, "decided": False, "sha": None,
-                                "unknown": e.get("unknown") is True, "escalate": e.get("escalate") is True}
+                                "unknown": e.get("unknown") is True, "escalate": e.get("escalate") is True,
+                                "op": e.get("outside_plan") is True}
+            if e.get("outside_plan") is True and e.get("escalate") is not False:
+                p.append(f"defer {did}: outside the plan, and escalating (a plan extension resolves it)")
             self.ndefer += 1
             if sc not in ("run", "thread"):
                 p.append(f"defer {did}: held with a scope the Warden does not write ({sc!r})")
@@ -814,9 +828,19 @@ class GrantsCheck:
             if end == "resolved":
                 if df["unknown"]:
                     p.append(f"defer_end for {did}: resolved, but nothing resolves a call deferred as UNKNOWN")
-                sha = e.get("marker_sha256")
-                if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
-                    p.append(f"defer_end for {did}: resolved, with no marker's SHA-256")
+                if df["op"]:                         # v1.42 step 5b: by a plan extension
+                    ext = e.get("plan_extension")
+                    if ext not in self.exts:
+                        p.append(f"defer_end for {did}: resolved by a plan extension {ext!r} no plan_extended "
+                                 f"record before it holds")
+                    elif self.exts[ext] != "SATISFIED":
+                        p.append(f"defer_end for {did}: resolved by plan extension {str(ext)[:16]}, which the plan "
+                                 f"gate did not authorize ({self.exts[ext]})")
+                    sha = None
+                else:
+                    sha = e.get("marker_sha256")
+                    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+                        p.append(f"defer_end for {did}: resolved, with no marker's SHA-256")
                 df["sha"] = sha
                 if did in self.runheld:
                     self.replays.add(did)
@@ -833,6 +857,16 @@ class GrantsCheck:
                     self.await_prop = sid
             elif end != "abandoned":
                 p.append(f"defer_end for {did}: an ending {end!r} the Warden does not write")
+            return
+        if ev == "plan_extended":             # v1.42 step 5b
+            sha, vd = e.get("sha256"), e.get("verdict")
+            if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha) or not isinstance(vd, str) or \
+                    not isinstance(e.get("approver_uid"), int):
+                p.append(f"a plan_extended record with a malformed SHA-256, verdict or approver ({sha!r})")
+                return
+            if vd != "SATISFIED" and self.exts.get(sha) == "SATISFIED":
+                return                               # a refused resend of an authorized one keeps it
+            self.exts[sha] = vd
             return
         if ev == "run_frozen":               # v1.42 step 4
             self._prop_due()
