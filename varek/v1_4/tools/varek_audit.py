@@ -4875,8 +4875,10 @@ class MainLoop:
             problems.append(f"seq {rec.get('seq')}: authorized open of {rec.get('resolved')!r} "
                             f"without an accepted certificate")
             return
-        if prules and (type(cr) is not int or not 0 <= cr < len(prules) or
-                       rec.get("policy_line") != prules[cr]["line"]):
+        # v1.42 step 5: a grant under the `on unknown` line has no policy rule (cert_rule -1, policy_line -1)
+        unk_grant = cr == -1 and rec.get("cert_grant") is not None and rec.get("policy_line") == -1
+        if prules and not unk_grant and (type(cr) is not int or not 0 <= cr < len(prules) or
+                                         rec.get("policy_line") != prules[cr]["line"]):
             # v1.31 review: the line a decision cites is its certificate's rule's
             self.cited.append(f"seq {rec.get('seq')}: a decision citing policy line {rec.get('policy_line')!r}, "
                             f"but its certificate's rule is "

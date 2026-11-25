@@ -1150,8 +1150,9 @@ static bool frz_wanted(const struct policy *p) {
     for (size_t i = 0; i < p->v.n; i++) {
         const vdp_rule_t *r = &p->v.rules[i];
         if (r->verb == VDP_STEP_UP && r->su_mode == VDP_SU_HOLD && r->su_scope == VDP_SCOPE_RUN) return true;
+        if (r->verb == VDP_DEFER && r->su_scope == VDP_SCOPE_RUN) return true;      /* v1.42 step 5 */
     }
-    return false;
+    return p->v.unk_line && p->v.unk_scope == VDP_SCOPE_RUN;
 }
 
 /* After sub_setup: the run's group for freezing. Not fatal: where the run

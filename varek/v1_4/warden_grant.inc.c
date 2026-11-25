@@ -1457,7 +1457,11 @@ static void apv_service(void) {
     bool approver = false;
     for (size_t i = 0; !ans && !approver && i < g_gr_p->v.n; i++) {
         char who[64];
-        approver = g_gr_p->v.rules[i].verb == VDP_STEP_UP && !apv_may(cr.uid, cr.gid, &g_gr_p->v.rules[i], who);
+        approver = vdp_rule_grantable(&g_gr_p->v.rules[i]) && !apv_may(cr.uid, cr.gid, &g_gr_p->v.rules[i], who);
+    }
+    if (!ans && !approver && g_gr_p->v.unk_line) {       /* v1.42 step 5: or under the `on unknown` line */
+        char who[64];
+        approver = !apv_may(cr.uid, cr.gid, &g_unk_rule, who);
     }
     if (!ans && !approver) ans = "refused: not an approver in this run";
     long long deadline = gr_now_ms() + 500;
