@@ -94,6 +94,7 @@ says, by the node's own clock, as the report says.
 import argparse
 import bisect
 import collections
+import datetime
 import hashlib
 import ipaddress
 import json
@@ -276,15 +277,16 @@ class Spool:
         for _ in range(self.n):
             yield pickle.load(self.ctx)
 
-    def ask(self, checker, policy, mode):
+    def ask(self, checker, policy, mode, extra=()):
         """Run the checker's mode over the rows. Returns (ok, its answers in a
         file, how many, stderr): "holds" answers one word a row, "batch" one
-        JSON object a line."""
+        JSON object a line. v1.42: extra, the grant files a batch's rows may
+        name."""
         self.rows.flush()
         self.rows.seek(0)
         out = tempfile.TemporaryFile("w+", encoding="utf-8", errors="surrogateescape")
         err = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
-        rc = subprocess.run([checker, policy, mode], stdin=self.rows, stdout=out, stderr=err).returncode
+        rc = subprocess.run([checker, policy, mode, *extra], stdin=self.rows, stdout=out, stderr=err).returncode
         out.seek(0)
         err.seek(0)
         n = 0
@@ -599,6 +601,150 @@ class HoldCheck:
         elif r.get("plan") != hold.get("plan"):
             problems.append(f"seq {r.get('seq')}: an outside_plan record names the plan {r.get('plan')!r}, "
                             f"not the run's {hold.get('plan')!r}")
+
+
+class GrantsCheck:
+    """v1.42 step 2 (docs/security/v1.42-step-up-defer.md): runtime grants.
+    A refusal by a step_up rule names its proposal ("step_up"), recorded by
+    the step_up record that follows it; each proposal ends once (approved,
+    denied, timeout or abandoned); a grant is its approval's, its id the
+    SHA-256 of its text; an ALLOW under a grant names it (cert_grant), within
+    its count, its time and its run, and its certificate's two halves are
+    re-checked by the checker (MainLoop's rows name the grant's file). The
+    checker reads each grant itself: one it refuses fails the batch."""
+
+    def __init__(self, run, problems):
+        self.run, self.problems = run, problems
+        self.props = {}                      # id -> {"seq", "ended", "text"}
+        self.named = {}                      # proposal id named by a decision -> its seq
+        self.grants = {}                     # id -> {"index", "count", "until", "run", "used", "text"}
+        self.dir = None
+        self.files = []
+        self.nprop = self.nuse = 0
+
+    def _parse(self, text):
+        g = {"count": 0, "until": 0, "run": ""}
+        for ln in text.splitlines():
+            w = ln.split()
+            if len(w) == 2 and w[0] == "count" and w[1].isdigit():
+                g["count"] = int(w[1])
+            elif len(w) == 2 and w[0] == "until":
+                try:
+                    g["until"] = int(datetime.datetime.strptime(w[1], "%Y-%m-%dT%H:%M:%SZ")
+                                     .replace(tzinfo=datetime.timezone.utc).timestamp())
+                except ValueError:
+                    return None
+            elif w and w[0] == "for":
+                for x in w[1:]:
+                    if x.startswith("run="):
+                        g["run"] = x[4:]
+        return g
+
+    def rec(self, r):
+        p = self.problems
+        if "step_up" in r:
+            if r.get("decision_final") == "ALLOW" or r.get("decision_raw") != "DENY":
+                p.append(f"seq {r.get('seq')}: a step_up proposal on a call not refused by a step_up rule")
+            sid = r.get("step_up")
+            if sid != "none":
+                if not isinstance(sid, str):
+                    p.append(f"seq {r.get('seq')}: a malformed step_up id")
+                elif sid in self.props and self.props[sid]["ended"]:
+                    p.append(f"seq {r.get('seq')}: names proposal {sid}, which has ended")
+                elif sid not in self.props:
+                    self.named.setdefault(sid, r.get("seq"))
+        cg = r.get("cert_grant")
+        if cg is None:
+            return
+        g = self.grants.get(cg)
+        if g is None:
+            p.append(f"seq {r.get('seq')}: allowed under grant {cg!r}, which no grant record before it holds")
+            return
+        if r.get("decision_final") != "ALLOW":
+            return
+        g["used"] += 1
+        self.nuse += 1
+        ts = r.get("timestamp_ns")
+        if g["count"] and g["used"] > g["count"]:
+            p.append(f"seq {r.get('seq')}: grant {cg[:16]} used {g['used']} times, past its count {g['count']}")
+        if g["until"] and (type(ts) is not int or ts // 1000000000 >= g["until"]):
+            p.append(f"seq {r.get('seq')}: grant {cg[:16]} used after its time")
+        if g["run"] and g["run"] != self.run:
+            p.append(f"seq {r.get('seq')}: grant {cg[:16]} is for run {g['run']!r}, not this one")
+
+    def ev(self, e):
+        p = self.problems
+        ev = e.get("event")
+        if ev == "step_up":
+            sid = e.get("id")
+            if not isinstance(sid, str) or sid in self.props:
+                p.append(f"a step_up record with a malformed or repeated id {sid!r}")
+                return
+            if self.named.pop(sid, None) is None:
+                p.append(f"step_up {sid}: no decision record before it names it")
+            if not isinstance(e.get("proposal"), str):
+                p.append(f"step_up {sid}: no proposal")
+            self.props[sid] = {"ended": False, "text": e.get("proposal")}
+            self.nprop += 1
+        elif ev == "grant":
+            gid, text, prop = e.get("id"), e.get("text"), e.get("proposal")
+            if not isinstance(text, str) or not isinstance(gid, str) or \
+                    hashlib.sha256(text.encode("utf-8", errors="surrogateescape")).hexdigest() != gid:
+                p.append(f"grant {gid!r}: its id is not the SHA-256 of its text")
+                return
+            if prop not in self.props or self.props[prop]["ended"]:
+                p.append(f"grant {gid[:16]}: approves {prop!r}, which is not an open proposal")
+            if gid in self.grants:
+                p.append(f"grant {gid[:16]} recorded twice")
+                return
+            g = self._parse(text)
+            if g is None:
+                p.append(f"grant {gid[:16]}: its until is not a time")
+                return
+            if not isinstance(e.get("approver_uid"), int):
+                p.append(f"grant {gid[:16]}: no approver")
+            if self.dir is None:
+                self.dir = tempfile.TemporaryDirectory()
+            path = os.path.join(self.dir.name, f"g{len(self.files)}.txt")
+            with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
+                fh.write(text)
+            g.update(index=len(self.files), used=0, prop=prop)
+            self.files.append(path)
+            self.grants[gid] = g
+        elif ev == "step_up_end":
+            sid, end = e.get("id"), e.get("ending")
+            pr = self.props.get(sid)
+            if pr is None or pr["ended"]:
+                p.append(f"step_up_end for {sid!r}, which is not an open proposal")
+                return
+            pr["ended"] = True
+            if end not in ("approved", "denied", "timeout", "abandoned"):
+                p.append(f"step_up_end for {sid}: an ending {end!r} the Warden does not write")
+            elif end == "approved":
+                g = self.grants.get(e.get("grant"))
+                if g is None or g["prop"] != sid:
+                    p.append(f"step_up_end for {sid}: approved, but no grant record of its approval before it")
+            elif end == "denied" and not isinstance(e.get("approver_uid"), int):
+                p.append(f"step_up_end for {sid}: denied by no one")
+
+    def finish(self, complete):
+        for sid, seq in self.named.items():
+            self.problems.append(f"seq {seq}: names proposal {sid}, which no step_up record holds")
+        if complete:
+            for sid, pr in self.props.items():
+                if not pr["ended"]:
+                    self.problems.append(f"step_up {sid}: never ended")
+
+    def row(self, rec):
+        """MainLoop's certificate row's grant part, or None"""
+        cg = rec.get("cert_grant")
+        if cg is None:
+            return ""
+        g = self.grants.get(cg)
+        gr, gw = rec.get("cert_grant_rule"), rec.get("cert_grant_witness")
+        if g is None or type(gr) is not int or not isinstance(gw, str) or " " in gw or not gw:
+            return None
+        return f" grant={g['index']}:{gr}:{gw}"
 
 
 PLAN_VERDICTS = ("SATISFIED", "UNSATISFIED", "UNKNOWN")
@@ -4291,6 +4437,7 @@ class MainLoop:
         self.handoff_ids = IdSet()       # v1.26: connects handed to the proxy
         self.certs, self.view_recs, self.others, self.handoff_cands = Spool(), Spool(), Spool(), Spool()
         self.nothers = 0                 # connects decided over candidates
+        self.grants = None               # v1.42: the run's GrantsCheck
 
     def rec(self, rec, pos):
         a, meta, problems = self.a, self.meta, self.problems
@@ -4569,8 +4716,13 @@ class MainLoop:
             problems.append(f"seq {rec.get('seq')}: certificate recorded for subject {rec.get('cert_subject', 0)!r}, "
                             f"but the decision was for subject {ks} (its chain {rec.get('obo')!r})")
             return
+        gpart = self.grants.row(rec) if self.grants is not None else ""       # v1.42
+        if gpart is None:
+            problems.append(f"seq {rec.get('seq')}: an ALLOW under a grant without its grant or its certificate's "
+                            f"second half")
+            return
         self.certs.add(f"{'mcp' if is_mcp else 'request' if is_req else 'exec' if is_exec else 'host' if is_conn_like else 'path'} "
-                       f"{fl} {hx} {cr} {cw}" + (f" @{ks}" if ks else ""), (rec.get("seq"), rec.get("resolved")))
+                       f"{fl} {hx} {cr} {cw}" + (f" @{ks}" if ks else "") + gpart, (rec.get("seq"), rec.get("resolved")))
         if is_conn and ("candidates" in rec or "candidates_sha256" in rec):
             try:
                 oc = check_names(rec, pos, self.res, problems, exact_grace=exact_grace)
@@ -4588,7 +4740,7 @@ SECTIONS = (
     "integ_head", "integ_sigs", "integ_end", "integ_every", "integ_gaps", "integ_tail", "integ_aread",
     "integ_unanchored", "integ_anchor",
     "run", "testbuild", "phash", "prules", "pproxy", "plaunch", "execset", "popenas", "changes", "openas",
-    "baseline", "dry_head", "dry_recs", "dry_dns", "dry_refused", "dry_tail", "hold_head", "hold", "plan",
+    "baseline", "dry_head", "dry_recs", "dry_dns", "dry_refused", "dry_tail", "hold_head", "hold", "grants", "plan",
     "noexec", "noexec_loop", "noexec_exec", "noexec_fail", "shared",
     "dns_head", "dns_syn", "dns_loop", "dns_tail", "dns_exc", "hostnames",
     "loop", "views", "certs", "cited", "others",
@@ -4855,6 +5007,7 @@ def start_checks(a, meta, rs, run, sec, res, prules, rules, names_policy, proxy_
     k["changes"] = ChangesCheck(openas_policy, sec["changes"])
     k["dry"] = DryCheck(rs, sec)
     k["hold"] = HoldCheck(rs, sec["hold_head"], sec["hold"])
+    k["grants"] = GrantsCheck(run, sec["grants"])                         # v1.42
     try:                                                                  # v1.27.1
         nx = check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, Section(), quiet=True)
     except (OSError, ValueError):
@@ -4869,6 +5022,7 @@ def start_checks(a, meta, rs, run, sec, res, prules, rules, names_policy, proxy_
                          openas_policy,
                          # v1.25 review: from 1.25 the Warden records the end of every grace
                          _version_at_least(rs.get("warden"), (1, 25)))
+    k["loop"].grants = k["grants"]
     k["dialed"] = Spool()
     k["proxied"] = ProxiedCheck(res, sec["proxied"], k["dialed"], upstream, exact_hosts, passthrough)
     k["closes"] = ClosesCheck(sec["closes"])
@@ -4882,6 +5036,7 @@ def start_checks(a, meta, rs, run, sec, res, prules, rules, names_policy, proxy_
             lambda r, pos, line: k["changes"].rec(r),
             lambda r, pos, line: k["dry"].rec(r),
             lambda r, pos, line: k["hold"].rec(r),
+            lambda r, pos, line: k["grants"].rec(r),
             lambda r, pos, line: k["loop"].rec(r, pos),
             lambda r, pos, line: k["proxied"].rec(r, pos),
             lambda r, pos, line: k["closes"].rec(r, pos),
@@ -4894,6 +5049,7 @@ def start_checks(a, meta, rs, run, sec, res, prules, rules, names_policy, proxy_
     if k["launches"] is not None:
         recs.append(lambda r, pos, line: k["launches"].rec(r))
     evs = [lambda e, before, line: k["execset"].ev(e),
+           lambda e, before, line: k["grants"].ev(e),                     # v1.42
            lambda e, before, line: k["dry"].ev(e),
            lambda e, before, line: k["dns"].ev(e),
            lambda e, before, line: k["proxied"].ev(e),
@@ -4917,6 +5073,7 @@ def report(a, meta, sec, k, integrity, run, warden, complete, nrec, prules, rule
     k["changes"].finish()
     check_open_as(meta, openas_policy, sec["openas"])                     # v1.29
     check_baseline(meta, a.policy, sec["baseline"])
+    k["grants"].finish(complete)                                          # v1.42
     k["dry"].head(meta, sec["dry_head"])
     dry_run = k["dry"].finish(meta, sec["dry_tail"])
     plan_gate = check_plan_gate(meta, Count(nrec), sec["plan"], a.plan, complete)    # v1.35 step 7
@@ -4949,7 +5106,7 @@ def report(a, meta, sec, k, integrity, run, warden, complete, nrec, prules, rule
                         break
     checked = 0
     if len(loop.certs) and not sec.before("certs"):
-        ok, out, n, err = loop.certs.ask(a.checker, a.policy, "batch")
+        ok, out, n, err = loop.certs.ask(a.checker, a.policy, "batch", k["grants"].files)   # v1.42
         if not ok:
             sec["certs"].append(f"checker failed: {err.strip()}")
         else:

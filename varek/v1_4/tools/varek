@@ -2138,6 +2138,111 @@ def cmd_revoke(args):
     return rc
 
 
+# v1.42 step 2 (docs/security/v1.42-step-up-defer.md): approving a grant the
+# Warden proposed for a call a step_up rule refused, through the run's
+# approvers' socket (/run/varek-approve/<run>.sock). The Warden names the
+# approver by the kernel's peer credentials: a member of the rule's
+# approvers= group, or root when it names none; never the agent's own user.
+APV_DIR = "/run/varek-approve"
+
+
+def apv_ask(run, request):
+    """The Warden's answer to one request, or None when no run by that id is running."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(30)
+    try:
+        s.connect(os.path.join(APV_DIR, run + ".sock"))
+        s.sendall(request.encode("utf-8"))
+        s.shutdown(socket.SHUT_WR)
+        out = b""
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            out += b
+        return out.decode("utf-8", "replace")
+    except (FileNotFoundError, ConnectionRefusedError):
+        return None
+    except OSError as e:
+        return f"refused: {e.strerror or e}"
+    finally:
+        s.close()
+
+
+def apv_run(arg):
+    run = arg or ""
+    if run and os.path.isfile(run):
+        first = next((r for r in read_records(run) if r.get("event") == "run_start"), {})
+        run = first.get("run", "")
+    if not run:
+        try:
+            runs = sorted(f[:-5] for f in os.listdir(APV_DIR) if f.endswith(".sock") and RUN_ID_RX.match(f[:-5]))
+        except OSError:
+            runs = []
+        if len(runs) == 1:
+            return runs[0]
+        raise CliError("which run?", fix="`varek pending <run>` (the Warden prints it at the start)"
+                       + (f"; running: {', '.join(runs)}" if runs else ""))
+    if not RUN_ID_RX.match(run):
+        raise CliError(f"not a run id: {arg}", fix="a run id is 32 hex digits; the Warden prints it at the start")
+    return run
+
+
+def cmd_pending(args):
+    run = apv_run(args.run)
+    ans = apv_ask(run, "pending")
+    if ans is None:
+        fail(f"{run}: no such run is running (or it has no step_up rule)")
+        return 1
+    props = []
+    for line in ans.splitlines():
+        if line == "end":
+            break
+        if line.startswith("refused"):
+            fail(f"{run}: {line}")
+            return 1
+        props.append(json.loads(line))
+    if args.json:
+        print(json.dumps(props, indent=2))
+        return 0
+    if not props:
+        info(f"{run}: no proposal you may answer is open.")
+        return 0
+    for p in props:
+        info(f"proposal {p['id']} (policy line {p['rule_line']}, ends in {p['expires_in']} s)"
+             + (f", approvers {p['approvers']}" if p.get("approvers") else ""))
+        for ln in p["proposal"].splitlines():
+            info(f"    {ln}")
+    info(f"\nAnswer with `varek approve {run} ID` (or --narrow FILE) or `varek deny {run} ID`.")
+    return 0
+
+
+def cmd_approve(args, deny=False):
+    run = apv_run(args.run)
+    req = f"{'deny' if deny else 'approve'} {args.id}\n"
+    if args.reason:
+        if "\n" in args.reason:
+            raise CliError("a reason is one line")
+        req += f"reason {args.reason}\n"
+    if not deny and args.narrow:
+        with open(args.narrow, encoding="utf-8") as fh:
+            req += fh.read()
+    ans = apv_ask(run, req)
+    if ans is None:
+        fail(f"{run}: no such run is running")
+        return 1
+    ans = ans.strip()
+    if ans.startswith("approved") or ans == "denied":
+        ok(f"{run}: {ans}")
+        return 0
+    fail(f"{run}: {ans}")
+    return 1
+
+
+def cmd_deny(args):
+    return cmd_approve(args, deny=True)
+
+
 def policy_line_text(path, n):
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
@@ -3556,6 +3661,23 @@ def build_parser():
                     "on, held to refusals, and ends as it would.")
     sp.add_argument("run", nargs="?", help="the run id (or a running run's verdict log)")
     sp.add_argument("--all", action="store_true", help="revoke every running run")
+
+    sp = add("pending", cmd_pending, "list a run's proposed grants you may answer (v1.42)",
+             epilog="A call a step_up rule refuses proposes the narrowest grant that would allow it. "
+                    "Approve it, as proposed or narrowed, and the agent's next try is decided against "
+                    "the policy and the grant, with a certificate the checker verifies.")
+    sp.add_argument("run", nargs="?", help="the run id (or its verdict log); the only running one by default")
+    sp.add_argument("--json", action="store_true", help="the proposals as JSON")
+    sp = add("approve", cmd_approve, "approve a proposed grant, as proposed or narrowed (v1.42)")
+    sp.add_argument("run", help="the run id (or its verdict log)")
+    sp.add_argument("id", help="the proposal's id (varek pending)")
+    sp.add_argument("--narrow", metavar="FILE", help="a grant narrower than the proposal: its count, time "
+                    "and scope no wider")
+    sp.add_argument("--reason", help="why, recorded with the grant")
+    sp = add("deny", cmd_deny, "refuse a proposed grant (v1.42)")
+    sp.add_argument("run", help="the run id (or its verdict log)")
+    sp.add_argument("id", help="the proposal's id (varek pending)")
+    sp.add_argument("--reason", help="why, recorded")
 
     sp = add("refusals", cmd_refusals, "list the actions refused in a run, and why")
     sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")

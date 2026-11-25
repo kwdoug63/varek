@@ -290,6 +290,9 @@ struct action {
     bool          certified;            /* v1.15: the checker accepted the certificate */
     char          cert[420];            /* v1.15: the certificate, as record fields */
     char          check_why[160];       /* v1.15: why the checker refused it */
+    int           grant;                /* v1.42: 1 + the live grant that allowed it, 0: none */
+    int           grant_rule;           /* v1.42: the deciding rule in that grant */
+    char          gcert[600];           /* v1.42: the certificate's second half, as record fields */
     int           connect_family;
     int           connect_port;
     /* v1.21: decided connections and relayed sends */
@@ -1294,6 +1297,16 @@ static int sub_policy_subject(int s);  /* v1.31: warden_subagent.inc.c */
 static int act_policy_subject(const struct action *a) {
     return a->plan_psubj > 0 ? a->plan_psubj - 1 : sub_policy_subject(a->subject);
 }
+/* v1.42 step 2 (warden_grant.inc.c): runtime grants */
+static vdp_verdict_t grant_decide(const struct policy *p, const struct action *a, int subj, vdp_kind_t kind,
+                                  const char *s, uint32_t flags, bool has_flags, int *ri, vdp_why_t *why,
+                                  int *grant, int *grant_rule);
+static bool grant_certify(const struct policy *p, struct action *a, int subj, int kind, const char *s,
+                          bool has_flags, const vdpc_cert_t *su);
+static void step_up_note(const struct action *a, decision_t d_raw, decision_t d_final, char *buf, size_t n);
+static void step_up_after(uint64_t seq);
+static void grant_end_all(void);
+
 static decision_t policy_decide(const struct policy *p, struct action *a)
 {
     /* v1.13: every decision is made by the SMT decision procedure
@@ -1306,6 +1319,8 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
     a->policy_line = -1;
     a->rule_index = -1;
     a->why = NULL;
+    a->grant = 0;                        /* v1.42 */
+    a->grant_rule = -1;
     /* v1.28 step 4: after `varek revoke`, nothing more is allowed */
     if (g_revoked) { a->why = "revoked"; return DEC_DENY; }
     vdp_kind_t kind;
@@ -1343,10 +1358,11 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
     }
     int ri;
     vdp_why_t why;
-    /* v1.31: by the calling subject's rules (the Warden's attribution) */
-    vdp_verdict_t v = vdp_decide_subj(&p->v, act_policy_subject(a), kind, s, vdp_oflags_from_native((uint32_t)a->open_flags),
-                                      kind == VDP_KIND_PATH && a->flags_known,
-                                      &ri, &why);
+    /* v1.31: by the calling subject's rules (the Warden's attribution);
+     * v1.42: within the run's live grants, when a step_up rule decides */
+    vdp_verdict_t v = grant_decide(p, a, act_policy_subject(a), kind, s, vdp_oflags_from_native((uint32_t)a->open_flags),
+                                   kind == VDP_KIND_PATH && a->flags_known,
+                                   &ri, &why, &a->grant, &a->grant_rule);
     a->why = vdp_why_name(why);
     a->rule_index = ri;
     if (ri >= 0) a->policy_line = p->v.rules[ri].line;
@@ -1387,6 +1403,7 @@ static int exec_access_x(int ofd, const struct action *a);   /* v1.27: warden_ex
 static bool certify(const struct policy *p, struct action *a) {
     a->certified = false;
     a->cert[0] = '\0';
+    a->gcert[0] = '\0';
     a->check_why[0] = '\0';
     int kind;
     const char *s;
@@ -1438,7 +1455,9 @@ static bool certify(const struct policy *p, struct action *a) {
      * attribution (not the procedure's), recorded when it is not the agent */
     int subj = act_policy_subject(a);
     if (subj && (size_t)n < sizeof a->cert) snprintf(a->cert + n, sizeof a->cert - (size_t)n, ",\"cert_subject\":%d", subj);
-    if (!vdpc_check_subj(&p->c, subj, kind, s, strlen(s), vdp_oflags_from_native((uint32_t)a->open_flags), has_flags, &cc,
+    /* v1.42: an ALLOW under a grant: the checker verifies both halves */
+    if (a->grant > 0 ? !grant_certify(p, a, subj, kind, s, has_flags, &cc) :
+        !vdpc_check_subj(&p->c, subj, kind, s, strlen(s), vdp_oflags_from_native((uint32_t)a->open_flags), has_flags, &cc,
                          a->check_why, sizeof a->check_why)) {
         for (char *q = a->check_why; *q; q++)          /* recorded inside a JSON string */
             if (*q == '"' || *q == '\\' || (unsigned char)*q < 0x20) *q = '\'';
@@ -3041,6 +3060,7 @@ static unsigned g_exec_mismatch;       /* v1.27: processes killed by the identit
 static void exec_finish(void);         /* v1.27: warden_exec.inc.c */
 static void ctl_close(void);
 static void emit_run_end(int exit_status) {
+    grant_end_all();                     /* v1.42: open proposals end `abandoned` before run_end */
     ctl_close();                        /* v1.28 step 4: no revocation after the end */
     px_finish();                        /* v1.26: every relay's proxy_close */
     exec_finish();                      /* v1.27: launches never seen */
@@ -3111,6 +3131,9 @@ static void emit_pathology(uint64_t seq,
      * first, here. */
     if (checkpoints_on() && g_since_ckpt >= g_ckpt_every) emit_checkpoint();
     if (a->dry) d_final = DEC_DENY;      /* v1.29: a call a dry run let through was refused by the policy */
+    /* v1.42: a refusal by a step_up rule proposes a grant, which the record names */
+    char su_json[200];
+    step_up_note(a, d_raw, d_final, su_json, sizeof su_json);
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     char flags_json[40] = "";
@@ -3155,8 +3178,8 @@ static void emit_pathology(uint64_t seq,
         "\"rule\":\"%s\","
         "\"policy_line\":%d,"
         "%s%s%s"
+        "%s%s%s%s%s%s%s"
         "%s%s%s%s%s%s"
-        "%s%s%s%s%s"
         "\"kernel_verdict\":\"%s\","
         "\"errno\":%d,"
         "\"latency_us\":%" PRIu64 ","
@@ -3168,11 +3191,11 @@ static void emit_pathology(uint64_t seq,
         /* v1.15: the open flags, so an audit can re-check the certificate */
         flags_json[0] ? "\"open_flags\":\"" : "", flags_json, flags_json[0] ? "\"," : "",
         /* v1.15: the certificate and the checker's answer */
-        "", a->cert, a->cert[0] ? "," : "",
+        "", a->cert, a->gcert, a->cert[0] ? "," : "",
         a->cert[0] ? (a->certified ? "\"check\":\"ok\"," : "\"check\":\"refused\",\"check_why\":\"") : "",
         a->cert[0] && !a->certified ? a->check_why : "",
         a->cert[0] && !a->certified ? "\"," : "",
-        net_json, a->extra,
+        net_json, a->extra, su_json,
         /* v1.35 step 4: an outside_plan refusal names the plan the run is held to */
         held ? "\"plan\":\"" : "", held ? g_hold_plan_json : "", held ? "\"," : "",
         /* v1.12.1: an ALLOW whose open then failed (EEXIST, ENXIO, ...)
@@ -3192,6 +3215,7 @@ static void emit_pathology(uint64_t seq,
     rec_end(NULL);
     g_records++;
     g_since_ckpt++;
+    step_up_after(seq);                  /* v1.42: a new proposal's record */
 }
 
 /* ---------------- Kernel Injection ---------------- */
@@ -4173,6 +4197,7 @@ static void syn_hosts_view(const struct policy *p, FILE *f);
 #include "warden_revoke.inc.c"       /* v1.28 step 4: revoking a run */
 #include "warden_trust.inc.c"        /* v1.26.1: the run's CA and the trust views */
 #include "warden_subagent.inc.c"     /* v1.28.1: sub-agents' control groups and attribution */
+#include "warden_grant.inc.c"        /* v1.42 step 2: runtime grants */
 #include "warden_exec.inc.c"         /* v1.27: the launch set and its Landlock ruleset */
 #include "warden_noexec.inc.c"       /* v1.27.1: writable directories mounted noexec */
 #include "warden_change.inc.c"       /* v1.29: changes by name */
@@ -4209,7 +4234,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * finished for the agent (warden_net.inc.c). */
         /* v1.24: also on the resolver helper's results. */
         /* v1.25: and on the stub resolver's sockets (warden_stub.inc.c). */
-        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN + 1 + PX_MAX_DIAL + 3] = {
+        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN + 1 + PX_MAX_DIAL + 4] = {
             { .fd = notify_fd,    .events = POLLIN },
             { .fd = target_pidfd, .events = POLLIN },
             { .fd = agent_err_fd, .events = POLLIN },
@@ -4246,11 +4271,15 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         pfds[rvi] = (struct pollfd){ .fd = g_ctl_listen, .events = POLLIN };
         pfds[rvi + 1] = (struct pollfd){ .fd = g_secrets.ctl, .events = POLLIN };
         pfds[rvi + 2] = (struct pollfd){ .fd = g_cn, .events = POLLIN };     /* v1.28.1 review: process events */
+        pfds[rvi + 3] = (struct pollfd){ .fd = g_apv_listen, .events = POLLIN };   /* v1.42: approvers */
         /* v1.28.1 step 4: and the user's token's expiry */
         int oto = obo_timeout_ms();
         if (oto >= 0 && (to < 0 || oto < to)) to = oto;
-        int pr = poll(pfds, (nfds_t)(rvi + 3), to);
+        int gto = grant_timeout_ms();                                        /* v1.42: proposals ending */
+        if (gto >= 0 && (to < 0 || gto < to)) to = gto;
+        int pr = poll(pfds, (nfds_t)(rvi + 4), to);
         if (pr >= 0) obo_check(notify_fd);
+        if (pr >= 0) grant_expire();
         if (pr > 0 && (pfds[rvi + 2].revents & POLLIN)) sub_cn_drain();
         if (pr < 0) {
             if (errno == EINTR) continue;
@@ -4264,6 +4293,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         stub_service(p, &pfds[4 + npoll], nstub);
         px_service(p, &pfds[pxi + 1], npx);
         if (g_ctl_listen >= 0 && (pfds[rvi].revents & POLLIN)) ctl_service(notify_fd);   /* v1.28 step 4 */
+        if (g_apv_listen >= 0 && (pfds[rvi + 3].revents & POLLIN)) apv_service();          /* v1.42 */
         if (g_secrets.ctl >= 0 && (pfds[rvi + 1].revents & (POLLIN | POLLHUP | POLLERR)) && secrets_service(p) < 0) {
             log_line_start();
             fprintf(g_log, "[warden] warden-secrets has gone: leased secrets will not be renewed or revoked\n");
@@ -6460,6 +6490,7 @@ int main(int argc, char **argv) {
         ra.drop = g_nr.uid != 0;
         if (ra.drop && ra.gid == 0) node_fail("an unprivileged user in group 0 (root)");
     }
+    g_agent_uid = ra.drop ? ra.uid : 0;                                  /* v1.42: never an approver */
     if (!ra.drop)
         fprintf(stderr, "[warden] WARNING: --run-as root: the agent runs as root with every "
                 "capability (the pre-v1.17 behaviour); only the seccomp filter holds it back\n");
@@ -6484,6 +6515,11 @@ int main(int argc, char **argv) {
     /* ~2 MB (512 rules x 4 KB constants): static, not on the stack. */
     static struct policy p;
     if (policy_load(policy_path, &p) < 0) return 1;
+    /* v1.42 step 2: runtime grants (mode=grant); what is not built yet is refused */
+    if (grant_policy_check(&p, policy_path) < 0) {
+        if (g_nr.on) node_fail("the policy needs a step_up option not built yet");
+        return 2;
+    }
     /* v1.29: a dry run (section 3), on the command line only (D3); not with
      * a plan, credentials or sub-agents (dry_refusal). v1.36 step 7 (D6):
      * under the node agent, the pod's VarekPolicy's, refused the same */
@@ -7039,6 +7075,7 @@ int main(int argc, char **argv) {
     }
     if (!g_nr.on) emit_run_start(policy_path, &p);     /* v1.34 step 3: node_supervise's, after the launch set */
     ctl_open();                                                            /* v1.28 step 4 */
+    if (!g_nr.on) apv_open();                                              /* v1.42: approvals */
     /* v1.24: every allowed host name is resolved before the agent runs.
      * Refreshes then run in a resolver helper process (warden_resolve.c),
      * started now: while the Warden is single-threaded and before the agent's

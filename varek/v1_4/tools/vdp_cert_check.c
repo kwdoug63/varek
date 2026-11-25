@@ -182,7 +182,7 @@ static int load_grant_file(const vdpc_policy_t *pol, const char *path, vdpc_gran
 
 int main(int argc, char **argv) {
     /* v1.42: batch GRANT..., and grant GRANT */
-    bool gbatch = argc > 3 && argc <= 3 + 16 && !strcmp(argv[2], "batch");
+    bool gbatch = argc > 3 && argc <= 3 + 64 && !strcmp(argv[2], "batch");
     bool gcheck = argc == 4 && !strcmp(argv[2], "grant");
     if (gbatch || gcheck) goto args_ok;
     if (argc != 3 || (strcmp(argv[2], "digest") && strcmp(argv[2], "batch") &&
@@ -419,7 +419,7 @@ args_ok:;
         return 0;
     }
     /* v1.42: the grants the batch's certificates may name */
-    static vdpc_grant_t grants[16];
+    static vdpc_grant_t grants[64];
     size_t ngrants = 0;
     if (gcheck || gbatch) {
         for (int i = 3; i < argc; i++) {

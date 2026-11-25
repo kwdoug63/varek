@@ -138,8 +138,8 @@ jobs:
           set -o pipefail
           sudo make -C varek/v1_4 test-v1350 VAREK_FW_PYTHON=/var/tmp/varek-fw/bin/python3 | tee "$RUNNER_TEMP/v1350.log"
           ! grep -q 'the code adapters under the Warden: not tried' "$RUNNER_TEMP/v1350.log"
-      - name: v1.42 approvals as grants (step 1, the grammar, grants and the two-part certificate, procedure and checker)
-        run: make -C varek/v1_4 test-v1420
+      - name: v1.42 approvals as grants (the grammar, grants and the two-part certificate; runtime grants in mode=grant)
+        run: sudo make -C varek/v1_4 test-v1420
       - name: v1.34 steps 3 and 5 the NRI plugin and the admission webhook (gofmt, go vet, their unit tests)
         run: |
           go version

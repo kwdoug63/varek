@@ -101,7 +101,7 @@ CHECKER := checker/vdp_checker.c checker/vdp_checker.h
 # uses the host's resolver library.
 RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c shared_domains.c shared_domains.h warden_proxy.c warden_proxy.h proxy_parse.h warden_secrets.c warden_secrets.h warden_revoke.inc.c
 
-warden: warden.c warden_node.inc.c node_json.c node_json.h warden_oci.c warden_oci.h warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c warden_exec.inc.c warden_noexec.inc.c warden_subagent.inc.c warden_revoke.inc.c warden_asagent.inc.c warden_change.inc.c warden_hold.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(CRYPTO) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
+warden: warden.c warden_node.inc.c node_json.c node_json.h warden_oci.c warden_oci.h warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c warden_exec.inc.c warden_noexec.inc.c warden_subagent.inc.c warden_revoke.inc.c warden_grant.inc.c warden_asagent.inc.c warden_change.inc.c warden_hold.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(CRYPTO) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
 	@# v1.27: Landlock does not govern a memfd, so the agent must never make one
 	@# (docs/security/v1.27-program-launches.md): memfd_create stays hard-denied
@@ -315,9 +315,10 @@ test-v1410: all
 
 # v1.42 (docs/security/v1.42-step-up-defer.md): approvals as grants, STEP_UP
 # and DEFER. Step 1: the grammar, grants and the two-part certificate, in the
-# decision procedure and the certificate checker (no root needed).
+# decision procedure and the certificate checker; step 2: runtime grants in
+# mode=grant, the approvers' socket, the audit (as root).
 test-v1420: warden tools/vdp_check tools/vdp_cert_check
-	@./tests/test_v1420.sh
+	@sudo ./tests/test_v1420.sh
 
 # v1.41: the Defense build's acceptance on RHEL 9 in FIPS mode (run there, as
 # root): it refuses to run off FIPS mode, and writes its evidence to OUT.

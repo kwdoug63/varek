@@ -26,7 +26,21 @@
 #      another object, a grant's half missing or naming a rule that does not
 #      hold, symbolic flags a grant does not cover).
 #
-# Usage: ./test_v1420.sh   (from varek/v1_4, after `make warden tools/vdp_check tools/vdp_cert_check`)
+# Step 2, runtime grants in mode=grant (section 5, as root):
+#   5. A policy needing a step not built yet (mode=hold) is refused at start.
+#      A read the step_up rule refuses proposes the narrowest grant, which
+#      the approvers' socket lists only to who may answer it. The agent's own
+#      user, another user (no approvers=), and grants wider than the proposal
+#      (count, time, run, another step_up rule) are refused; root approves,
+#      the next read is allowed with both halves checked, exactly once; a
+#      denial and a late answer; the records; the audit passes, and refuses
+#      each forgery for its own reason (the text edited, the grant or a
+#      proposal's record or ending dropped, the object changed, a second use,
+#      a grant for no open proposal). With approvers=GROUP: outsiders and
+#      root alone refused, a member approves; a proposal times out.
+#
+# Usage: sudo ./test_v1420.sh   (from varek/v1_4, after `make warden tools/vdp_check tools/vdp_cert_check`;
+#        sections 1 to 4 need no root, and run without it)
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 VDP="$HERE/tools/vdp_check"
@@ -196,6 +210,157 @@ rej "a grant rule that does not exist"         "path 0 $R 2 - grant=0:1:-"
 rej "symbolic flags the read-only grant does not cover" "path - $R 2 - grant=0:0:-"
 o="$(chk x "path 0 $R 2 - grant=7:0:-")"
 grep -q '"check":"error"' <<<"$o" && pass "checker: a grant not given is an error" || flunk "unknown grant: $o"
+
+echo "== 5. step 2: runtime grants, mode=grant (as root) =="
+if [ "$(id -u)" != 0 ] || ! command -v setpriv > /dev/null; then
+    echo "  SKIP   section 5 needs root and setpriv"
+else
+W="$T/w"; mkdir -p "$W/bin" "$W/data"; chmod 755 "$T" "$W" "$W/bin" "$W/data"
+echo "a,b" > "$W/data/r.csv"; chmod 644 "$W/data/r.csv"
+cat > "$W/bin/agent.sh" <<'AG'
+# read the file every quarter second, N times; say what each try got
+for i in $(seq 1 "$2"); do
+  if read -r l < "$1"; then echo "$i ok"; else echo "$i no"; fi
+  sleep 0.25
+done
+AG
+cat > "$W/bin/apv.py" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])
+s.sendall(sys.argv[2].encode()); s.shutdown(socket.SHUT_WR)
+out = b""
+while True:
+    b = s.recv(65536)
+    if not b: break
+    out += b
+sys.stdout.write(out.decode())
+PY
+chmod 755 "$W/bin/agent.sh" "$W/bin/apv.py"
+BASE="require warden 1.42\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /lib64 readonly\nallow path /etc/ readonly\nallow path $W/bin/ readonly\nallow exec /usr/bin/sleep\nallow exec /usr/bin/seq\n"
+# apv UID GID REQUEST: a request on the approvers' socket, as that user
+apv() { setpriv --reuid="$1" --regid="$2" --clear-groups python3 -I "$W/bin/apv.py" "$SOCK" "$(printf '%b' "$3")"; }
+# wait_prop [OLD]: the next open proposal's id other than OLD (as AU:AG, an approver), within 10 s
+AU=0; AG=0
+wait_prop() {
+    local k
+    for k in $(seq 1 40); do
+        local id; id="$(apv "$AU" "$AG" pending | python3 -c 'import json,sys; l=sys.stdin.readline(); print(json.loads(l)["id"] if l.startswith("{") else "")' 2>/dev/null)"
+        [ -n "$id" ] && [ "$id" != "${1:-}" ] && { echo "$id"; return 0; }
+        sleep 0.25
+    done
+    return 1
+}
+start() {   # start POLICY OUT N: the Warden on the agent, in the background; SOCK and RUN
+    "$WARDEN" "$1" -- /bin/bash "$W/bin/agent.sh" "$W/data/r.csv" "$3" > "$2.out" 2> "$2.log" &
+    WPID=$!
+    SOCK=""; local k
+    for k in $(seq 1 40); do
+        SOCK="$(grep -o '/run/varek-approve/[0-9a-f]*\.sock' "$2.log" 2>/dev/null | head -1)"
+        [ -n "$SOCK" ] && [ -S "$SOCK" ] && break
+        sleep 0.25
+    done
+    RUN="$(basename "$SOCK" .sock)"
+}
+recs() { python3 -c "import json,sys; rs=[json.loads(l) for l in open(sys.argv[1]) if l.startswith('{')]; sys.exit(0 if $2 else 1)" "$1"; }
+
+printf "${BASE}step_up path $W/data/ mode=hold\n" > "$W/hold.txt"
+o="$("$WARDEN" "$W/hold.txt" --check-startup 2>&1)"
+grep -q "mode=hold is not built yet" <<<"$o" && pass "a policy with mode=hold is refused at start (built in step 3)" || flunk "mode=hold at start: $o"
+
+printf "${BASE}step_up path $W/data/ timeout=30\nstep_up host api.example.test:443\n" > "$W/p1.txt"     # step_up on line 9, the host one 10
+start "$W/p1.txt" "$W/r1" 80
+[ -n "$SOCK" ] && pass "the run opens its approvers' socket ($SOCK)" || flunk "no approvers' socket: $(tail -3 "$W/r1.log")"
+ID1="$(wait_prop)"
+[ -n "$ID1" ] && pass "a read the step_up rule refuses proposes a grant ($ID1)" || flunk "no proposal"
+o="$(apv 0 0 pending)"
+grep -q "allow path exact $W/data/r.csv access=ro -O_CREAT -O_TRUNC -O_APPEND" <<<"$o" && grep -q "step_up line 9" <<<"$o" \
+  && grep -q "for run=$RUN" <<<"$o" && grep -q 'count 1' <<<"$o" \
+  && pass "... the narrowest: the exact file, the call's access, this run, count 1, until the rule's timeout" || flunk "the proposal: $o"
+o="$(apv 65534 65534 pending)"
+grep -q "not an approver in this run" <<<"$o" && pass "the agent's own user is no approver: pending shows it nothing" || flunk "pending as the agent: $o"
+o="$(apv 65534 65534 "approve $ID1")"
+grep -q "not an approver in this run" <<<"$o" && pass "... and its approval is refused" || flunk "approve as the agent: $o"
+o="$(apv 4242 4242 "approve $ID1")"
+grep -q "not an approver in this run" <<<"$o" && pass "another user is refused, where the rule names no approvers= (root alone)" || flunk "approve as uid 4242: $o"
+o="$(timeout 3 setpriv --reuid=4242 --regid=4242 --clear-groups python3 -I -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.settimeout(2); print(s.recv(200).decode().strip())" "$SOCK")"
+grep -q "not an approver" <<<"$o" && pass "a user who connects and sends nothing is answered at once (no wait on another user)" || flunk "silent outsider: $o"
+U="$(date -u -d '+20 seconds' +%Y-%m-%dT%H:%M:%SZ)"; L="$(date -u -d '+2 hours' +%Y-%m-%dT%H:%M:%SZ)"
+o="$(apv 0 0 "approve $ID1\ngrant\nstep_up line 9\nallow path $W/data/\nfor run=$RUN\ncount 5\nuntil $U\n")"
+grep -q "count is wider" <<<"$o" && pass "a grant with a wider count is refused" || flunk "wider count: $o"
+o="$(apv 0 0 "approve $ID1\ngrant\nstep_up line 9\nallow path $W/data/r.csv\nfor run=$RUN\ncount 1\nuntil $L\n")"
+grep -q "time is later" <<<"$o" && pass "... a later time" || flunk "later time: $o"
+o="$(apv 0 0 "approve $ID1\ngrant\nstep_up line 9\nallow path $W/data/r.csv\nfor run=0123456789abcdef0123456789abcdef\ncount 1\nuntil $U\n")"
+grep -q "not for this run" <<<"$o" && pass "... another run's" || flunk "another run: $o"
+o="$(apv 0 0 "approve $ID1\ngrant\nstep_up line 10\nallow host api.example.test:443\nfor run=$RUN\ncount 1\nuntil $U\n")"
+grep -q "another step_up rule" <<<"$o" && pass "... one under another step_up rule" || flunk "another rule: $o"
+o="$(apv 0 0 "approve $ID1\ngrant\nstep_up line 9\ndeny path $W/data/r.csv\nfor run=$RUN\ncount 1\n")"
+grep -q "refused" <<<"$o" && pass "... a grant the procedure does not read (a deny rule)" || flunk "deny rule in a grant: $o"
+o="$(apv 0 0 "approve $ID1\nreason test_v1420")"
+GID1="$(sed -n 's/^approved \([0-9a-f]\{64\}\)$/\1/p' <<<"$o")"
+[ -n "$GID1" ] && pass "root approves it as proposed: grant $(cut -c1-16 <<<"$GID1")" || flunk "approve: $o"
+for k in $(seq 1 40); do grep -q ' ok$' "$W/r1.out" && break; sleep 0.25; done
+grep -q ' ok$' "$W/r1.out" && pass "the agent's next read is allowed" || flunk "no read allowed: $(tail -3 "$W/r1.out")"
+ID2="$(wait_prop "$ID1")"
+[ -n "$ID2" ] && [ "$ID2" != "$ID1" ] && pass "its count used, the read after is refused and proposed again ($ID2)" || flunk "no second proposal"
+o="$(apv 0 0 "deny $ID2\nreason no more")"
+[ "$o" = "denied" ] && pass "root denies the second" || flunk "deny: $o"
+o="$(apv 0 0 "approve $ID2")"
+grep -q "no open proposal" <<<"$o" && pass "an answer for a proposal that has ended is refused" || flunk "answer after the end: $o"
+wait "$WPID"
+[ "$(grep -c ' ok$' "$W/r1.out")" = 1 ] && pass "exactly one read was allowed (count 1)" || flunk "reads allowed: $(grep -c ' ok$' "$W/r1.out")"
+check() { if "${@:2}"; then pass "$1"; else flunk "$1"; fi; }
+check "the allowed read: cert_grant, both halves checked (check ok)" recs "$W/r1.log" \
+  "[r for r in rs if r.get('cert_grant') == '$GID1' and r['decision_final'] == 'ALLOW' and r['check'] == 'ok' and r['cert_grant_rule'] == 0]"
+check "the grant record: its text, approver root, the reason" recs "$W/r1.log" \
+  "[r for r in rs if r.get('event') == 'grant' and r['id'] == '$GID1' and r['approver_uid'] == 0 and r['reason'] == 'test_v1420' and r['proposal'] == '$ID1']"
+check "the endings: approved, denied, and abandoned for what was open at the end" recs "$W/r1.log" \
+  "[r['ending'] for r in rs if r.get('event') == 'step_up_end' and r['ending'] != 'abandoned'] == ['approved', 'denied'] and all(r['ending'] in ('approved', 'denied', 'abandoned') for r in rs if r.get('event') == 'step_up_end')"
+check "every refusal by the step_up rule names a proposal" recs "$W/r1.log" \
+  "all(r.get('step_up') for r in rs if r.get('policy_line') == 9 and r.get('decision_final') == 'DENY')"
+o="$(python3 "$HERE/tools/varek_audit.py" --policy "$W/p1.txt" --checker "$CERT" "$W/r1.log" 2>&1)"
+grep -q 'varek_audit: PASS' <<<"$o" && pass "the audit passes the run (the grant's certificate re-checked by the checker)" || flunk "audit: $(grep PROBLEM <<<"$o" | head -3)"
+qforge() {   # qforge LABEL PYTHON WORDS: the audit fails the forged stream for its reason
+    (cd "$HERE/tests" && python3 v1270_forge.py "$W/r1.log" "$W/f.log" "$2") > /dev/null 2>&1
+    if python3 "$HERE/tools/varek_audit.py" --policy "$W/p1.txt" --checker "$CERT" "$W/f.log" > "$W/f.out" 2>&1; then
+        flunk "forged: $1 (the audit passed it)"
+    elif grep -qF -- "$3" "$W/f.out"; then pass "forged: $1"
+    else flunk "forged: $1 (not for its own reason: $(grep '^  PROBLEM' "$W/f.out" | head -2 | tr '\n' ' '))"; fi
+}
+G="[r for r in recs if isinstance(r, dict) and r.get('event') == 'grant'][0]"
+qforge "the grant's count edited" "$G['text'] = $G['text'].replace('count 1', 'count 9')" "its id is not the SHA-256 of its text"
+qforge "the grant record dropped" "recs.remove($G)" "which no grant record before it holds"
+qforge "a proposal's ending dropped" "recs.remove([r for r in recs if isinstance(r, dict) and r.get('event') == 'step_up_end' and r['ending'] == 'denied'][0])" "never ended"
+qforge "a proposal's record dropped" "recs.remove([r for r in recs if isinstance(r, dict) and r.get('event') == 'step_up'][0])" "which no step_up record holds"
+qforge "the allowed read's object changed" "[r.__setitem__('resolved', '$W/data/other.csv') for r in recs if isinstance(r, dict) and r.get('cert_grant')]" "refused"
+# a later refusal of the same read rewritten as an allow under the grant, its certificate copied
+FT="A = [r for r in recs if isinstance(r, dict) and r.get('cert_grant')][0]
+B = [r for r in recs if isinstance(r, dict) and r.get('step_up') and r.get('seq', 0) > A['seq']][0]
+B.pop('step_up')
+for k in ('decision_raw', 'decision_final', 'kernel_verdict', 'rule', 'errno', 'cert_rule', 'cert_witness', 'cert_grant', 'cert_grant_rule', 'cert_grant_witness', 'check'):
+    B[k] = A[k]"
+qforge "the grant used twice" "$FT" "past its count"
+qforge "a grant approving no open proposal" "$G['proposal'] = 'ffffffffffffffff'" "which is not an open proposal"
+
+groupadd -f vk1420 2>/dev/null; GG="$(getent group vk1420 | cut -d: -f3)"
+AU=4243; AG="$GG"                    # pending, as a member of the rule's approvers
+printf "${BASE}step_up path $W/data/ approvers=vk1420 timeout=3\n" > "$W/p2.txt"
+start "$W/p2.txt" "$W/r2" 40
+ID3="$(wait_prop)"
+o="$(apv 4243 4243 "approve $ID3")"
+grep -q "not an approver in this run" <<<"$o" && pass "approvers=vk1420: a user outside the group may not approve" || flunk "outside the group: $o"
+o="$(apv 0 0 "approve $ID3")"
+grep -q "not an approver in this run" <<<"$o" && pass "... nor root alone, outside it" || flunk "root outside the group: $o"
+o="$(apv 4243 "$GG" "approve $ID3")"
+grep -q '^approved ' <<<"$o" && pass "... a user whose group it is may" || flunk "in the group: $o"
+ID4="$(wait_prop "$ID3")"
+sleep 4
+o="$(apv 4243 "$GG" "approve $ID4")"
+grep -q "no open proposal\|has ended" <<<"$o" && pass "a proposal not answered within the rule's timeout ends; an answer after is refused" || flunk "after the timeout: $o"
+wait "$WPID"
+check "... recorded as timeout" recs "$W/r2.log" "[r for r in rs if r.get('event') == 'step_up_end' and r['id'] == '$ID4' and r['ending'] == 'timeout']"
+o="$(python3 "$HERE/tools/varek_audit.py" --policy "$W/p2.txt" --checker "$CERT" "$W/r2.log" 2>&1)"
+grep -q 'varek_audit: PASS' <<<"$o" && pass "the audit passes the second run" || flunk "audit 2: $(grep PROBLEM <<<"$o" | head -3)"
+fi
 
 echo
 [ $fail = 0 ] && echo "test_v1420: PASS ($n checks)" || echo "test_v1420: FAIL"
