@@ -79,6 +79,7 @@ struct wp_held {
     bool      acked;             /* its CONNECT was answered */
     pp_kind_t kind;
     int64_t   since;             /* accepted, or (waiting) asked */
+    int64_t   wait_ms;           /* v1.42 step 3b: a held verdict's wait (0: WP_VERDICT_MS) */
     uint8_t  *buf;               /* what it sent, up to PP_IN_MAX; relaying: client -> server */
     size_t    len, off;          /* relaying: buf[off, len) is still to send */
     size_t    skip;              /* bytes of buf the server is not sent (an answered CONNECT) */
@@ -1061,10 +1062,10 @@ static bool tls_step(int k, short crev, short srev) {
             else if (h->cs) (void)SSL_shutdown(h->cs);
             else (void)shutdown(h->fd, SHUT_WR);
             h->tstage = TS_FINAL;
-        } else if ((h->ig == IG_WAIT || h->ig == IG_MCPWAIT) && mono_ms() - h->since > WP_VERDICT_MS) {
+        } else if ((h->ig == IG_WAIT || h->ig == IG_MCPWAIT) && mono_ms() - h->since > (h->wait_ms ? h->wait_ms : WP_VERDICT_MS)) {
             if (h->ig == IG_MCPWAIT) h->mcp_refused = true;
             gate_stop(h, "no verdict from the Warden");
-        } else if (h->ig == IG_MCPBODY && (h->eof_c || mono_ms() - h->since > WP_VERDICT_MS)) {
+        } else if (h->ig == IG_MCPBODY && (h->eof_c || mono_ms() - h->since > (h->wait_ms ? h->wait_ms : WP_VERDICT_MS))) {
             /* v1.31: the body did not all arrive: reported, and refused when the Warden answers */
             mcp_report(h, h->eof_c ? "the connection ended before the body did" : "the body did not arrive in time",
                        WP_MCP_UNREADABLE);
@@ -1087,7 +1088,7 @@ static int wp_drain_ctl(int ctl) {
     for (;;) {
         union { struct wp_conn c; struct wp_verdict v; struct wp_verdict_up u; struct wp_inspect in;
                 struct wp_ca_name cn; struct wp_reqverdict rv; struct wp_ph ph; struct wp_creds cr;
-                struct wp_mcpverdict mv; uint32_t type; } m;
+                struct wp_mcpverdict mv; struct wp_heldnote hn; uint32_t type; } m;
         union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
         struct iovec iv = { &m, sizeof m };
         struct msghdr mh = { .msg_iov = &iv, .msg_iovlen = 1, .msg_control = cb.b, .msg_controllen = sizeof cb.b };
@@ -1104,6 +1105,7 @@ static int wp_drain_ctl(int ctl) {
         if (n == (ssize_t)sizeof m.v && m.type == WP_MSG_VERDICT) {
             /* step 6: allow carries the socket the Warden dialed */
             int k = held_find(m.v.id);
+            if (k >= 0) g_held[k].wait_ms = 0;            /* v1.42 step 3b: a hold's wait ends with its verdict */
             bool passed = m.v.allow && (fd >= 0 || ctrunc);  /* the Warden counted it open */
             if (k < 0 || g_held[k].state != WH_WAITING) {
                 if (fd >= 0) close(fd);
@@ -1234,10 +1236,21 @@ static int wp_drain_ctl(int ctl) {
             (void)send(ctl, &r, sizeof r, MSG_NOSIGNAL);
             continue;
         }
+        /* v1.42 step 3b: the verdict this connection waits for is held:
+         * waited for until the hold ends, not WP_VERDICT_MS */
+        if (n == (ssize_t)sizeof m.hn && m.type == WP_MSG_HELDNOTE) {
+            int k = held_find(m.hn.id);
+            if (k >= 0 && m.hn.ms <= 3600000u) {
+                g_held[k].since = mono_ms();
+                g_held[k].wait_ms = (int64_t)m.hn.ms + WP_HELD_SLACK_MS;
+            }
+            continue;
+        }
 #ifndef VAREK_NO_TLS_INSPECT
         /* v1.26.1, step 6: the verdict on an inspected request */
         if (n == (ssize_t)sizeof m.rv && m.type == WP_MSG_REQVERDICT) {
             int k = held_find(m.rv.id);
+            if (k >= 0) g_held[k].wait_ms = 0;            /* v1.42 step 3b */
             if (k >= 0 && g_held[k].state == WH_TLS && g_held[k].tstage == TS_RELAY) {
                 gate_verdict(&g_held[k], &m.rv);
                 g_moved = true;
@@ -1247,6 +1260,7 @@ static int wp_drain_ctl(int ctl) {
         /* v1.31: the verdict on an MCP call */
         if (n == (ssize_t)sizeof m.mv && m.type == WP_MSG_MCPVERDICT) {
             int k = held_find(m.mv.id);
+            if (k >= 0) g_held[k].wait_ms = 0;            /* v1.42 step 3b */
             if (k >= 0 && g_held[k].state == WH_TLS && g_held[k].tstage == TS_RELAY) {
                 mcp_verdict(&g_held[k], &m.mv);
                 g_moved = true;
@@ -1517,7 +1531,7 @@ int wp_helper_main(int ctl) {
                 held_refuse(k);
             } else if (h->state == WH_WAITING && (crev & (POLLHUP | POLLERR))) {
                 held_drop(k);                                       /* the client went */
-            } else if (h->state == WH_WAITING && now - h->since > WP_VERDICT_MS) {
+            } else if (h->state == WH_WAITING && now - h->since > (h->wait_ms ? h->wait_ms : WP_VERDICT_MS)) {
                 held_refuse(k);                                     /* no verdict: refused */
             }
         }

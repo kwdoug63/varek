@@ -47,9 +47,15 @@
 #      once; another process's calls go on while one is held; a symlink
 #      swapped while held is refused when decided again; a held launch,
 #      approved, runs (the step_up program is in the launch set); a step_up
-#      rule that writes gets its noexec mount; mode=hold on a request rule is
-#      refused at start; the audit passes each run and refuses a held call's
-#      refusal dropped.
+#      rule that writes gets its noexec mount; the audit passes each run and
+#      refuses a held call's refusal dropped.
+#
+# Step 3b, held at the egress proxy (section 7, as root, a local DNS and
+# HTTP server):
+#   7. A plain-HTTP request and an MCP call a mode=hold rule decides are held
+#      at the proxy, each proposal the call itself; approved, each is sent
+#      on; denied, the request is refused (403) and never reaches the server;
+#      the records and the audit.
 #
 # Usage: sudo ./test_v1420.sh   (from varek/v1_4, after `make warden tools/vdp_check tools/vdp_cert_check`;
 #        sections 1 to 4 need no root, and run without it)
@@ -481,7 +487,70 @@ printf "${BASE}step_up path $W/data/ access=rw mode=hold\n" > "$W/h8.txt"
 check "a step_up rule that may write: its directory is mounted noexec, as an allow rule's" sh -c "'$WARDEN' '$W/h8.txt' -- /bin/true 2>&1 | grep -q 'noexec: 1 writable director'"
 printf "require warden 1.42\nproxy inspect\nallow host api.example.test:443\nstep_up request POST https://api.example.test/x mode=hold\n" > "$W/h9.txt"
 o="$("$WARDEN" "$W/h9.txt" --check-startup 2>&1)"
-grep -q "mode=hold on a request or mcp rule" <<<"$o" && pass "mode=hold on a request rule is refused at start (held at the proxy: a later step)" || flunk "hold on a request rule: $o"
+! grep -q "not built yet" <<<"$o" && pass "mode=hold on a request rule is accepted at start (held at the proxy, step 3b)" || flunk "hold on a request rule: $o"
+
+
+echo "== 7. step 3b: held at the egress proxy (requests and MCP calls, as root) =="
+HOSTIP=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("10.255.255.255", 1)); print(s.getsockname()[0])')
+HP=$((25000 + RANDOM % 4000)); DP=$((20000 + RANDOM % 2000))
+touch "$W/echo.log"; chmod 666 "$W/echo.log"
+python3 "$HERE/tests/v1261_echo_server.py" "$HOSTIP" "$HP" "$W/echo.log" > /dev/null 2>&1 &
+SRVS="$!"
+printf '{"api.example.com": {"ttl": 30, "a": ["%s"]}}\n' "$HOSTIP" > "$W/zone.json"
+python3 "$HERE/tests/dns_test_server.py" --port "$DP" --zone "$W/zone.json" --log "$W/q.log" --ready "$W/dns.ready" > /dev/null 2>&1 &
+SRVS="$SRVS $!"
+trap 'kill $SRVS 2>/dev/null; rm -rf "$T"' EXIT
+for _ in $(seq 50); do [ -e "$W/dns.ready" ] && python3 -c "import socket; socket.create_connection(('$HOSTIP', $HP), 0.2)" 2>/dev/null && break; sleep 0.1; done
+mkdir -p "$W/a"; chmod 755 "$W/a"
+cat > "$W/a/px.py" <<'PY'
+import json, socket, sys
+P = int(sys.argv[1])
+def one(tag, raw):
+    s = socket.create_connection(("api.example.com", P), 60)
+    s.settimeout(60)
+    s.sendall(raw)
+    buf = b""
+    try:
+        while b"\r\n\r\n" not in buf:
+            d = s.recv(65536)
+            if not d: break
+            buf += d
+    except OSError:
+        pass
+    print(tag, (buf.split(b"\r\n")[0].decode(errors="replace").split(" ") + ["", "-"])[1], flush=True)
+    s.close()
+H = "Host: api.example.com:%d\r\n" % P
+one("PLAIN", ("GET /plain HTTP/1.1\r\n" + H + "\r\n").encode())
+one("PLAIN2", ("GET /plain2 HTTP/1.1\r\n" + H + "\r\n").encode())
+b = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "refund", "arguments": {}}}).encode()
+one("MCP", ("POST /mcp HTTP/1.1\r\n" + H + "Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n"
+            "Content-Length: %d\r\n\r\n" % len(b)).encode() + b)
+PY
+chmod 644 "$W/a/px.py"
+printf "require warden 1.42\nproxy inspect\nproxy ports $HP\nallow host api.example.com\nstep_up request GET http://api.example.com:$HP/plain* mode=hold timeout=20\nstep_up mcp http://api.example.com:$HP/mcp tools/call * mode=hold timeout=20\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ readonly\nallow path $W/a/\n" > "$W/x.txt"
+# the host's CA bundle (the requests are plain HTTP; the Warden only needs one to start): Debian and
+# Ubuntu name it ca-certificates.crt, RHEL, Rocky and Amazon Linux ca-bundle.crt
+TB=""; for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/certs/ca-bundle.crt; do [ -f "$f" ] && TB="$f" && break; done
+env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$W/x.txt" --dns-server "127.0.0.1:$DP" --trust-bundle "$TB" \
+    -- /usr/bin/python3 "$W/a/px.py" "$HP" > "$W/x.out" 2> "$W/x.log" &
+WPID=$!
+SOCK=""; for _ in $(seq 40); do SOCK="$(grep -o '/run/varek-approve/[0-9a-f]*\.sock' "$W/x.log" 2>/dev/null | head -1)"; [ -n "$SOCK" ] && [ -S "$SOCK" ] && break; sleep 0.25; done
+AU=0; AG=0
+X1="$(wait_prop)"; o="$(apv 0 0 pending)"
+grep -q "allow request GET http://api.example.com:$HP/plain\\\\n" <<<"$o" && pass "a request a mode=hold rule decides is held at the proxy, its proposal the request itself" || flunk "request proposal: $o"
+apv 0 0 "approve $X1" > /dev/null
+X2="$(wait_prop "$X1")"
+apv 0 0 "deny $X2" > /dev/null
+X3="$(wait_prop "$X2")"; o="$(apv 0 0 pending)"
+grep -q "allow mcp http://api.example.com:$HP/mcp tools/call refund" <<<"$o" && pass "an MCP call is held too, its proposal the call (its server, method and tool)" || flunk "mcp proposal: $o"
+apv 0 0 "approve $X3" > /dev/null
+wait "$WPID"
+grep -qx "PLAIN 200" "$W/x.out" && pass "approved, the held request is sent on and answered" || flunk "approved request: $(cat "$W/x.out")"
+grep -qx "PLAIN2 403" "$W/x.out" && ! grep -q "GOT GET /plain2" "$W/echo.log" && pass "denied, it is refused (403) and never reaches the server" || flunk "denied request: $(cat "$W/x.out")"
+grep -qx "MCP 200" "$W/x.out" && grep -q "GOT POST /mcp" "$W/echo.log" && pass "approved, the held MCP call is sent on" || flunk "approved mcp call: $(cat "$W/x.out")"
+check "the records: three held, two allowed under their grants, one refused naming its proposal" recs "$W/x.log" \
+  "len([r for r in rs if r.get('event') == 'step_up' and r.get('state') == 'held']) == 3 and len([r for r in rs if r.get('cert_grant') and r.get('decision_final') == 'ALLOW' and r.get('action') in ('net.request', 'net.mcp')]) == 2 and [r for r in rs if r.get('held') is True and r.get('action') == 'net.request' and r['decision_final'] == 'DENY']"
+audit_ok "$W/x.txt" "$W/x.log" && pass "the audit passes the run" || flunk "audit x: $(grep PROBLEM "$W/x.log.audit" | head -2)"
 
 fi
 
