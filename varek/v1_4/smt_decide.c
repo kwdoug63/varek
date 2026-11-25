@@ -3681,7 +3681,8 @@ size_t vdp_exec_advisory(const vdp_policy_t *p, size_t i, char *buf, size_t n) {
  * directory not mapped executable. (v1.32: moved here from the Warden's
  * warden_noexec.inc.c, so vdp_check asks the same.) */
 bool vdp_rule_may_write(const vdp_rule_t *r) {
-    if (r->kind != VDP_KIND_PATH || r->verb != VDP_ALLOW) return false;
+    /* v1.42: a step_up rule writes too, once a grant allows it */
+    if (r->kind != VDP_KIND_PATH || r->verb == VDP_DENY) return false;
     static const uint32_t cand[] = {
         1u, 2u, K_O_TRUNC, K_O_CREAT, 1u | K_O_TRUNC, 2u | K_O_TRUNC, 1u | K_O_CREAT, 2u | K_O_CREAT,
         K_O_CREAT | K_O_TRUNC, 1u | K_O_CREAT | K_O_TRUNC, 2u | K_O_CREAT | K_O_TRUNC,

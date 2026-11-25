@@ -617,6 +617,12 @@ int install_baseline_user_notif_filter_ex(int observe, int flags) {
     scmp_filter_ctx ctx;
     if (build(&ctx, observe, flags) < 0) return -1;
 
+#ifdef SCMP_FLTATR_CTL_WAITKILL
+    // v1.42 step 3: a held call's wait ends only on a fatal signal; a kernel
+    // without it (before 5.19) refuses the attribute: loaded without it
+    if ((flags & WD_FILTER_WAITKILL) && seccomp_attr_set(ctx, SCMP_FLTATR_CTL_WAITKILL, 1) < 0)
+        (void)0;
+#endif
     if (seccomp_load(ctx) < 0) { seccomp_release(ctx); return -1; }
 
     // libseccomp installs with SECCOMP_FILTER_FLAG_NEW_LISTENER because the
@@ -625,4 +631,12 @@ int install_baseline_user_notif_filter_ex(int observe, int flags) {
     int notify_fd = seccomp_notify_fd(ctx);
     seccomp_release(ctx);
     return notify_fd;   // >=0 on success, -1 if no listener was created
+}
+
+int wd_filter_waitkill_built(void) {
+#ifdef SCMP_FLTATR_CTL_WAITKILL
+    return 1;
+#else
+    return 0;
+#endif
 }

@@ -405,7 +405,7 @@ def policy_rules(checker, policy):
         f = ln.split()
         if len(f) != 11:
             raise ValueError(f"unexpected checker output {ln!r}")
-        out.append({"kind": f[0], "allow": f[1] == "a", "name": f[2] == "n", "mask": f[3],
+        out.append({"kind": f[0], "allow": f[1] == "a", "step_up": f[1] == "s", "name": f[2] == "n", "mask": f[3],
                      "value": f[4], "wild": f[5] == "w", "line": int(f[6]), "names": int(f[7]),
                      "rate": int(f[8]), "max_body": int(f[9]),
                      "c": "" if f[10] == "=" else bytes.fromhex(f[10]).decode("latin-1")})
@@ -651,6 +651,16 @@ class GrantsCheck:
                     p.append(f"seq {r.get('seq')}: a malformed step_up id")
                 elif sid in self.props and self.props[sid]["ended"]:
                     p.append(f"seq {r.get('seq')}: names proposal {sid}, which has ended")
+                elif r.get("held") is True:
+                    # v1.42 step 3: a held call's refusal, recorded when it ends (denied or timeout)
+                    pr = self.props.get(sid)
+                    if pr is None or not pr["held"] or pr["refused"]:
+                        p.append(f"seq {r.get('seq')}: a held call's refusal naming {sid}, which is not a call held "
+                                 f"and not yet refused")
+                    else:
+                        pr["refused"] = True
+                elif sid in self.props and self.props[sid]["held"]:
+                    p.append(f"seq {r.get('seq')}: names held proposal {sid} without being its refusal")
                 elif sid not in self.props:
                     self.named.setdefault(sid, r.get("seq"))
         cg = r.get("cert_grant")
@@ -680,11 +690,17 @@ class GrantsCheck:
             if not isinstance(sid, str) or sid in self.props:
                 p.append(f"a step_up record with a malformed or repeated id {sid!r}")
                 return
-            if self.named.pop(sid, None) is None:
+            held = e.get("mode") == "hold" and e.get("state") == "held"   # v1.42 step 3: no decision yet
+            if not held and self.named.pop(sid, None) is None:
                 p.append(f"step_up {sid}: no decision record before it names it")
+            if held and sid in self.named:
+                p.append(f"step_up {sid}: held, but a decision record before it names it")
+            if e.get("mode") not in ("grant", "hold") or e.get("state") not in ("proposed", "held") or \
+                    (e.get("mode") == "hold") != (e.get("state") == "held"):
+                p.append(f"step_up {sid}: a mode and state the Warden does not write")
             if not isinstance(e.get("proposal"), str):
                 p.append(f"step_up {sid}: no proposal")
-            self.props[sid] = {"ended": False, "text": e.get("proposal")}
+            self.props[sid] = {"ended": False, "text": e.get("proposal"), "held": held, "refused": False}
             self.nprop += 1
         elif ev == "grant":
             gid, text, prop = e.get("id"), e.get("text"), e.get("proposal")
@@ -718,6 +734,11 @@ class GrantsCheck:
                 p.append(f"step_up_end for {sid!r}, which is not an open proposal")
                 return
             pr["ended"] = True
+            # v1.42 step 3: a held call denied or timed out was refused, recorded before its proposal ends
+            if pr["held"] and end in ("denied", "timeout") and not pr["refused"]:
+                p.append(f"step_up_end for {sid}: a held call {end}, with no record of its refusal before")
+            if pr["held"] and end in ("approved", "abandoned") and pr["refused"]:
+                p.append(f"step_up_end for {sid}: {end}, but its held call was refused")
             if end not in ("approved", "denied", "timeout", "abandoned"):
                 p.append(f"step_up_end for {sid}: an ending {end!r} the Warden does not write")
             elif end == "approved":
@@ -1203,7 +1224,7 @@ def path_rule_writable(r):
     access mode of write or read-write, O_TRUNC or O_CREAT)? As the Warden
     reads it (warden_noexec.inc.c): the flags the rule requires, the rest
     free."""
-    if r["kind"] != "p" or not r["allow"]:
+    if r["kind"] != "p" or not (r["allow"] or r.get("step_up")):    # v1.42: a step_up rule writes under a grant
         return False
     mask, value = int(r["mask"], 16), int(r["value"], 16)      # the checker prints them in hex
     for c in (1, 2, O_TRUNC, O_CREAT, 1 | O_TRUNC, 2 | O_TRUNC, 1 | O_CREAT, 2 | O_CREAT,

@@ -338,7 +338,11 @@ static int exec_confined_checks(const struct policy *p) {
 static int exec_consider(const struct policy *p, const char *cand, size_t *admitted, char *err, size_t en) {
     int ri = -1;
     vdp_why_t why;
-    if (vdp_decide_subj(&p->v, g_exec_subj, VDP_KIND_EXEC, cand, 0, false, &ri, &why) != VDP_SATISFIED || ri < 0)
+    vdp_verdict_t cv = vdp_decide_subj(&p->v, g_exec_subj, VDP_KIND_EXEC, cand, 0, false, &ri, &why);
+    /* v1.42: a program a step_up rule decides is in the set too: Landlock
+     * lets it run, and the Warden decides each launch (a grant may allow it) */
+    bool su = cv == VDP_UNSATISFIED && ri >= 0 && p->v.rules[ri].verb == VDP_STEP_UP;
+    if ((cv != VDP_SATISFIED && !su) || ri < 0)
         return 0;
     /* v1.27 review: a deny exec rule on the file's own path keeps it out,
      * whatever other name an allow rule reaches it by (a symlink) */
@@ -346,7 +350,8 @@ static int exec_consider(const struct policy *p, const char *cand, size_t *admit
     int dri = -1;
     if (realpath(cand, real) && strcmp(real, cand) != 0 &&
         vdp_decide_subj(&p->v, g_exec_subj, VDP_KIND_EXEC, real, 0, false, &dri, &why) == VDP_UNSATISFIED &&
-        dri >= 0 && p->v.rules[dri].verb != VDP_ALLOW) {           /* v1.42: or step_up */
+        dri >= 0 && (p->v.rules[dri].verb == VDP_DENY ||
+                     (p->v.rules[dri].verb == VDP_STEP_UP && !su))) {   /* v1.42: or step_up, by an allow's name */
         fprintf(stderr, "[warden] note: launch set: %s (line %d) is %s, which line %d denies; it is not "
                 "in the launch set\n", cand, p->v.rules[ri].line, real, p->v.rules[dri].line);
         return 0;
@@ -404,7 +409,7 @@ static int exec_ruleset_build(const struct policy *p, const char *boot_path) {
     int rc = 0;
     for (size_t i = 0; rc == 0 && !g_exec_rules_off && i < p->v.n; i++) {
         const vdp_rule_t *r = &p->v.rules[i];
-        if (r->kind != VDP_KIND_EXEC || r->verb != VDP_ALLOW) continue;
+        if (r->kind != VDP_KIND_EXEC || r->verb == VDP_DENY) continue;   /* v1.42: and step_up */
         g_exec_subj = r->subj;               /* v1.31 */
         /* an exact or prefix constant not starting with '/' matches no
          * launch (the Warden decides on absolute paths; lint notes it) */
