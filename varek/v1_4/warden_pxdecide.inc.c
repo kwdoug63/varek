@@ -32,6 +32,12 @@
  *   resolution_failed (no address), address_refused (every address special,
  *   synthetic or denied). */
 
+/* v1.42 step 3b: holding at the proxy (warden_grant.inc.c) */
+enum { PXH_DECIDE = 0, PXH_AGAIN = 1, PXH_REFUSE = 2 };     /* the decide functions' hold */
+enum { PXH_HTTP = 1, PXH_MCP = 2 };                         /* what is held */
+static bool px_hold_take(const struct action *a, decision_t d_raw, int what, uint64_t conn, const void *msg,
+                         size_t len, bool f1, bool f2);
+
 #define PX_MAX_DIAL   64                 /* requests waiting on a lookup or a dial */
 #define PX_DIAL_MS    5000               /* per address */
 #define PX_MAX_TRIES  4                  /* addresses tried per request */
@@ -237,6 +243,9 @@ static void px_close_record(uint64_t id, const char *why, const struct wp_close 
 
 struct policy;
 static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m);
+static int px_httpreq_decide(const struct policy *p, struct px_open *o, const struct wp_httpreq *m, bool mcp_ep,
+                             bool mcp_var, int hold);                /* v1.42 step 3b */
+static int px_mcpreq_decide(const struct policy *p, struct px_open *o, struct wp_mcpreq *m, int hold);
 
 /* A close report: 0, or -1 (not a connection passed to the proxy and still
  * open, or a malformed report: the proxy is not behaving). */
@@ -811,6 +820,18 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
             return 0;
         }
     }
+    return px_httpreq_decide(p, o, m, mcp_ep, mcp_var, PXH_DECIDE);
+}
+
+/* v1.42 step 3b: an inspected request decided (after px_httpreq's checks,
+ * once). hold: PXH_DECIDE, and a request a mode=hold rule refuses is held
+ * (no verdict: px_hold_take); PXH_AGAIN, a held request decided again after
+ * its approval; PXH_REFUSE, a held request refused (denied, or past its
+ * time), recorded naming its proposal. */
+static int px_httpreq_decide(const struct policy *p, struct px_open *o, const struct wp_httpreq *m, bool mcp_ep,
+                             bool mcp_var, int hold) {
+    const char *ob = m->object;
+    size_t ol = strlen(ob);
     struct action *a = calloc(1, sizeof *a);
     if (!a) return -1;
     struct timespec t0, t1;
@@ -824,6 +845,12 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     decision_t d_final = d_raw == DEC_ALLOW ? DEC_ALLOW : DEC_DENY;
     const char *rule = mcp_ep ? "mcp_query" : mcp_var ? "mcp_endpoint_variant"
                      : d_raw == DEC_ALLOW ? "request_allowed" : decision_rule_id(a, d_raw);
+    /* v1.42 step 3b: held (no verdict yet), or a held one's refusal */
+    if (hold == PXH_DECIDE && !mcp_ep && !mcp_var && px_hold_take(a, d_raw, PXH_HTTP, m->id, m, sizeof *m, false, false)) {
+        free(a);
+        return 0;
+    }
+    if (hold == PXH_REFUSE) d_final = DEC_DENY;
     uint64_t maxb = 0;
     char why[96];
     if (d_final == DEC_ALLOW && !certify(p, a)) {
@@ -857,6 +884,7 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     else if (mcp_var) snprintf(why, sizeof why, "another spelling of an MCP endpoint (its case or a trailing /)");
     else if (d_raw == DEC_DENY) snprintf(why, sizeof why, "the policy denies it (line %d)", a->policy_line);
     else snprintf(why, sizeof why, "no request rule allows it");
+    if (hold == PXH_REFUSE) snprintf(why, sizeof why, "held for a person's approval, which was not given");
     static const char *const kBody[] = { "none", "length", "chunked" };
     snprintf(a->extra, sizeof a->extra, "\"proxy_conn\":%llu,\"request_seq\":%llu,\"body\":\"%s\",",
              (unsigned long long)m->id, (unsigned long long)m->seq, kBody[m->body]);
@@ -1002,6 +1030,12 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
         return -1;
     for (uint32_t k = 0; k < WP_AUD_MAX; k++) if (!memchr(m->aud[k], 0, sizeof m->aud[k])) return -1;
     o->mcp_seq = 0;
+    return px_mcpreq_decide(p, o, m, PXH_DECIDE);
+}
+
+/* v1.42 step 3b: an MCP call decided (after px_mcpreq's checks, once);
+ * hold as px_httpreq_decide's */
+static int px_mcpreq_decide(const struct policy *p, struct px_open *o, struct wp_mcpreq *m, int hold) {
     struct action *a = calloc(1, sizeof *a);
     if (!a) return -1;
     struct timespec t0, t1;
@@ -1037,6 +1071,15 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
         d_raw = policy_decide(p, a);
         d_final = d_raw == DEC_ALLOW ? DEC_ALLOW : DEC_DENY;
         rule = d_raw == DEC_ALLOW ? "mcp_allowed" : decision_rule_id(a, d_raw);
+        /* v1.42 step 3b: held (no verdict yet), or a held one's refusal */
+        if (hold == PXH_DECIDE && px_hold_take(a, d_raw, PXH_MCP, m->id, m, sizeof *m, false, false)) {
+            free(a);
+            return 0;
+        }
+        if (hold == PXH_REFUSE) {
+            d_final = DEC_DENY;
+            snprintf(why, sizeof why, "held for a person's approval, which was not given");
+        }
         if (d_final == DEC_ALLOW && !certify(p, a)) {
             d_final = DEC_DENY;
             rule = "certificate_refused";

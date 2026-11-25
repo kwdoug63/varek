@@ -79,9 +79,7 @@ static int grant_policy_check(const struct policy *p, const char *path) {
     for (size_t i = 0; i < p->v.n; i++) {
         const vdp_rule_t *r = &p->v.rules[i];
         if (r->verb != VDP_STEP_UP) continue;
-        const char *what = r->su_scope == VDP_SCOPE_RUN ? "scope=run" : r->su_notify[0] ? "notify=" :
-                           r->su_mode == VDP_SU_HOLD && (r->kind == VDP_KIND_REQUEST || r->kind == VDP_KIND_MCP)
-                           ? "mode=hold on a request or mcp rule (held at the egress proxy)" : NULL;
+        const char *what = r->su_scope == VDP_SCOPE_RUN ? "scope=run" : r->su_notify[0] ? "notify=" : NULL;
         if (what) {
             fprintf(stderr, "[warden] policy %s:%d: %s is not built yet (v1.42 is being built in steps; "
                     "this one has mode=grant and mode=hold); refusing to start\n", path, r->line, what);
@@ -228,8 +226,25 @@ static char *proposal_text(const struct action *a, const vdp_rule_t *su, uint32_
             if (!gr_token_ok(obj)) { *why = "the program is not one token of printable bytes"; return NULL; }
             snprintf(rule, sizeof rule, "allow exec %s", obj);
             break;
+        case VDP_KIND_REQUEST: {
+            /* v1.42 step 3b: the object is METHOD scheme://name:port/path[?query]; a request rule
+             * reads it back as METHOD and URL (a glob: an object holding one of its specials is
+             * not one the grammar can name exactly) */
+            const char *sp = strchr(obj, ' ');
+            if (!sp || !gr_token_ok(sp + 1) || strpbrk(obj, "*[]")) { *why = "the request is not one a rule can name exactly"; return NULL; }
+            snprintf(rule, sizeof rule, "allow request %.*s %s", (int)(sp - obj), obj, sp + 1);
+            break;
+        }
+        case VDP_KIND_MCP: {
+            /* v1.42 step 3b: the object is <URL>#<method>#<name> */
+            const char *h1 = strchr(obj, '#'), *h2 = h1 ? strchr(h1 + 1, '#') : NULL;
+            if (!h2 || h2 == h1 + 1 || strpbrk(obj, "*?[]")) { *why = "the MCP call is not one a rule can name exactly"; return NULL; }
+            if (h2[1]) snprintf(rule, sizeof rule, "allow mcp %.*s %.*s %s", (int)(h1 - obj), obj, (int)(h2 - h1 - 1), h1 + 1, h2 + 1);
+            else snprintf(rule, sizeof rule, "allow mcp %.*s %.*s", (int)(h1 - obj), obj, (int)(h2 - h1 - 1), h1 + 1);
+            break;
+        }
         default:
-            *why = "a proposal for a request or an MCP call is not built yet";
+            *why = "no proposal for this kind of call";
             return NULL;
     }
     char scope[400];
@@ -281,16 +296,27 @@ static int prop_make(const struct action *a, bool dedupe, const char **why, int 
     *same = -1;
     char *t = proposal_text(a, su, timeout, &until, why);
     if (!t) return -1;
-    /* both parsers must read it, as any grant */
+    /* both parsers must read it, as any grant, and it must allow the very
+     * call it is proposed for (v1.42 step 3b: a proposal never names more
+     * or less than it means) */
     vdp_grant_t *vg = calloc(1, sizeof *vg);
     vdpc_grant_t cg;
     char e[300];
     if (!vg) *why = "out of memory";
     else if (vdp_grant_parse(&g_gr_p->v, t, strlen(t), vg, e, sizeof e) < 0) *why = "the proposal does not parse";
     else {
+        const vdp_grant_t *one[1] = { vg };
+        const char *obj = su->kind == VDP_KIND_EXEC && !a->resolved[0] ? a->target : a->resolved;
+        bool hf = su->kind == VDP_KIND_PATH && a->flags_known;
+        int ri = -1, gi = -1, gr = -1;
+        vdp_why_t w;
+        if (vdp_decide_grant(&g_gr_p->v, one, 1, act_policy_subject(a), su->kind, obj,
+                             vdp_oflags_from_native((uint32_t)a->open_flags), hf, &ri, &w, &gi, &gr) != VDP_SATISFIED ||
+            gi != 0)
+            *why = "the proposal would not allow the call";
         vdp_grant_free(vg);
-        if (vdpc_grant_load(&g_gr_p->c, t, strlen(t), &cg, e, sizeof e) < 0) *why = "the checker does not read the proposal";
-        else vdpc_grant_free(&cg);
+        if (!*why && vdpc_grant_load(&g_gr_p->c, t, strlen(t), &cg, e, sizeof e) < 0) *why = "the checker does not read the proposal";
+        else if (!*why) vdpc_grant_free(&cg);
     }
     free(vg);
     if (*why) { free(t); return -1; }
@@ -378,6 +404,10 @@ static void step_up_note(const struct action *a, decision_t d_raw, decision_t d_
  * the approvers' socket open: without it nobody could answer. */
 
 struct held_call {
+    int                  what;       /* v1.42 step 3b: 0 a notification; PXH_HTTP, PXH_MCP at the proxy */
+    void                *msg;        /* PXH_*: the proxy's report, to decide again */
+    uint64_t             conn;       /* PXH_*: its connection */
+    bool                 f1, f2;
     struct seccomp_notif req;
     struct action       *act;        /* the call as decided, for its refusal's record */
     decision_t           d_raw;
@@ -397,7 +427,8 @@ static int g_grant_notify_fd = -1;
 
 static bool hold_kind(const struct action *a) {
     return a->kind == ACT_FILE_OPEN || a->kind == ACT_FILE_STAT || a->kind == ACT_FILE_ACCESS ||
-           a->kind == ACT_FILE_READLINK || a->kind == ACT_NET_CONNECT || a->kind == ACT_PROCESS_EXEC;
+           a->kind == ACT_FILE_READLINK || a->kind == ACT_NET_CONNECT || a->kind == ACT_PROCESS_EXEC ||
+           a->kind == ACT_NET_REQUEST || a->kind == ACT_NET_MCP;       /* v1.42 step 3b: at the proxy */
 }
 
 static void held_refuse(size_t i);
@@ -508,6 +539,57 @@ static bool hold_take(pid_t pid, const struct action *a, decision_t d_raw, decis
     return true;
 }
 
+/* v1.42 step 3b: hold a request or MCP call the proxy reported (what), if
+ * a mode=hold rule refuses it: the report kept (msg, len), a grant
+ * proposed, the proxy told to wait for the verdict that long. True when
+ * held: no verdict and no decision record now. */
+static bool px_hold_take(const struct action *a, decision_t d_raw, int what, uint64_t conn, const void *msg,
+                         size_t len, bool f1, bool f2) {
+    if (!g_gr_p || g_replaying || g_held_end || d_raw != DEC_DENY || a->dry || a->rule_index < 0 ||
+        (size_t)a->rule_index >= g_gr_p->v.n || g_apv_listen < 0 || g_proxy.ctl < 0)
+        return false;
+    const vdp_rule_t *su = &g_gr_p->v.rules[a->rule_index];
+    if (su->verb != VDP_STEP_UP || su->su_mode != VDP_SU_HOLD || (a->why && !strcmp(a->why, "revoked"))) return false;
+    uint32_t maxh = g_gr_p->v.max_held ? g_gr_p->v.max_held : VDP_MAX_HELD_DEFAULT;
+    if (g_nheld >= maxh) return false;                  /* refused now, its record saying max_held */
+    if (g_nheld == g_held_cap) {
+        size_t nc = g_held_cap ? g_held_cap * 2 : 8;
+        struct held_call *nh = realloc(g_held, nc * sizeof *nh);
+        if (!nh) return false;
+        g_held = nh;
+        g_held_cap = nc;
+    }
+    void *copy = malloc(len);
+    if (!copy) return false;
+    const char *why;
+    int same;
+    int k = prop_make(a, false, &why, &same);
+    if (k < 0) { free(copy); return false; }
+    memcpy(copy, msg, len);
+    struct held_call *h = &g_held[g_nheld++];
+    memset(h, 0, sizeof *h);
+    h->what = what;
+    h->msg = copy;
+    h->conn = conn;
+    h->f1 = f1;
+    h->f2 = f2;
+    memcpy(h->prop, g_prop[k].id, sizeof h->prop);
+    clock_gettime(CLOCK_MONOTONIC, &h->t0);
+    uint32_t timeout = su->su_timeout ? su->su_timeout : VDP_SU_TIMEOUT_DEFAULT;
+    struct wp_heldnote hn = { .type = WP_MSG_HELDNOTE, .ms = timeout * 1000u, .id = conn };
+    (void)send(g_proxy.ctl, &hn, sizeof hn, MSG_DONTWAIT | MSG_NOSIGNAL);
+    FILE *f = rec_begin();
+    fprintf(f, "{\"event\":\"step_up\",\"run\":\"%s\",\"id\":\"%s\",\"mode\":\"hold\",\"state\":\"held\","
+            "\"rule_line\":%d,\"timeout\":%u,\"approvers\":\"%s\",\"proxy_conn\":%llu,\"action\":\"%s\",\"resolved\":\"",
+            g_run_id, h->prop, su->line, timeout, su->su_approvers, (unsigned long long)conn, action_kind_name(a->kind));
+    json_escape(f, a->resolved);
+    fputs("\",\"proposal\":\"", f);
+    json_escape(f, g_prop[k].text);
+    fprintf(f, "\",\"held\":%zu,\"timestamp_ns\":%lld}\n", g_nheld, gr_now_ns());
+    rec_end(NULL);
+    return true;
+}
+
 static int held_find(const char *prop) {
     for (size_t i = 0; i < g_nheld; i++) if (!strcmp(g_held[i].prop, prop)) return (int)i;
     return -1;
@@ -515,14 +597,36 @@ static int held_find(const char *prop) {
 
 static void held_drop(size_t i) {
     free(g_held[i].act);
+    free(g_held[i].msg);
     memmove(&g_held[i], &g_held[i + 1], (g_nheld - i - 1) * sizeof g_held[0]);
     g_nheld--;
 }
 
 /* A held call refused (denied, or past its timeout): answered EACCES and
  * recorded now, its record naming its proposal */
+static struct px_open *px_open_of(uint64_t id) {
+    for (size_t k = 0; k < g_px_nopen; k++) if (g_px_open[k].id == id) return &g_px_open[k];
+    return NULL;
+}
+
+/* v1.42 step 3b: a request or MCP call held at the proxy, decided (hold:
+ * PXH_AGAIN after its approval, PXH_REFUSE when refused) */
+static void px_held_decide(struct held_call *h, int hold) {
+    struct px_open *o = px_open_of(h->conn);
+    if (!o || !g_gr_p) return;                          /* its connection has gone */
+    if (h->what == PXH_HTTP) (void)px_httpreq_decide(g_gr_p, o, h->msg, h->f1, h->f2, hold);
+    else (void)px_mcpreq_decide(g_gr_p, o, h->msg, hold);
+}
+
 static void held_refuse(size_t i) {
     struct held_call *h = &g_held[i];
+    if (h->what) {                                      /* v1.42 step 3b: at the proxy */
+        g_held_end = h->prop;
+        px_held_decide(h, PXH_REFUSE);
+        g_held_end = NULL;
+        held_drop(i);
+        return;
+    }
     bool answer = g_grant_notify_fd >= 0 && notif_id_valid(g_grant_notify_fd, h->req.id);
     if (answer || g_grant_notify_fd < 0) {
         struct timespec t1;
@@ -543,7 +647,9 @@ static void step_up_end_record(const struct proposal *pp, const char *ending, co
                                long long uid, const char *who, const char *reason);
 static void held_check(void) {
     for (size_t i = g_nheld; i-- > 0;) {
-        if (g_grant_notify_fd < 0 || notif_id_valid(g_grant_notify_fd, g_held[i].req.id)) continue;
+        if (g_held[i].what ? px_open_of(g_held[i].conn) != NULL                /* v1.42 step 3b */
+                           : (g_grant_notify_fd < 0 || notif_id_valid(g_grant_notify_fd, g_held[i].req.id)))
+            continue;
         int pi = prop_find(g_held[i].prop);
         if (pi >= 0) {
             step_up_end_record(&g_prop[pi], "abandoned", NULL, -1, NULL, NULL);
@@ -789,6 +895,13 @@ static const char *apv_answer(const struct ucred *cr, bool approve, const char *
     rec_end(NULL);
     step_up_end_record(pp, "approved", g->id, (long long)cr->uid, who, reason);
     int hi = held_find(pp->id);                         /* a held call is decided again, now */
+    if (hi >= 0 && g_held[hi].what) {                   /* v1.42 step 3b: at the proxy, at once */
+        g_replaying = true;
+        px_held_decide(&g_held[hi], PXH_AGAIN);
+        g_replaying = false;
+        held_drop((size_t)hi);
+        hi = -1;
+    }
     if (hi >= 0) {
         if (g_nreplay < sizeof g_replay_q / sizeof g_replay_q[0]) g_replay_q[g_nreplay++] = g_held[hi].req;
         else held_refuse((size_t)hi), hi = -1;
