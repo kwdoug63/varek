@@ -702,6 +702,10 @@ static bool df_marker(const vdp_rule_t *r, char sha[65], char *why, size_t wn) {
     if (no) { snprintf(why, wn, "%s", no); return false; }
     buf[n] = '\0';
     if (memchr(buf, '\0', (size_t)n)) { snprintf(why, wn, "the marker holds a NUL byte"); return false; }
+    /* the digest of exactly what is checked below (one read: never a second
+     * read the file may have changed between) */
+    unsigned char h[32];
+    if (vfips_sha256(buf, (size_t)n, h) != 0) { snprintf(why, wn, "no digest"); return false; }
     bool first = true, named = false;
     for (char *save = NULL, *ln = strtok_r(buf, "\n", &save); ln; ln = strtok_r(NULL, "\n", &save)) {
         size_t l = strlen(ln);
@@ -725,12 +729,6 @@ static bool df_marker(const vdp_rule_t *r, char sha[65], char *why, size_t wn) {
         if (time(NULL) >= t) { snprintf(why, wn, "the marker's until has passed"); return false; }
     }
     if (!named) { snprintf(why, wn, "the marker names no run"); return false; }
-    unsigned char h[32];
-    /* the digest of what was read (re-read: strtok_r cut it) */
-    fd = open(r->df_until, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
-    n = fd >= 0 ? read(fd, buf, sizeof buf - 1) : -1;
-    if (fd >= 0) close(fd);
-    if (n < 0 || vfips_sha256(buf, (size_t)n, h) != 0) { snprintf(why, wn, "no digest"); return false; }
     for (int i = 0; i < 32; i++) snprintf(sha + 2 * i, 3, "%02x", h[i]);
     return true;
 }
