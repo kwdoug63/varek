@@ -91,6 +91,7 @@ static int oci_rec_rule_add(scmp_filter_ctx ctx, uint32_t action, int nr, unsign
 #define install_baseline_user_notif_filter oci_unused_install
 #define install_baseline_user_notif_filter_ex oci_unused_install_ex
 #define wd_filter_waitkill_built oci_unused_waitkill_built   /* v1.42 */
+#define wd_filter_waitkill_kernel oci_unused_waitkill_kernel /* v1.42 step 4 */
 #include "warden_baseline_filter.c"
 #undef seccomp_init
 #undef seccomp_rule_add

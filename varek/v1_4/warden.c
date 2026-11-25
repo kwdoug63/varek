@@ -2272,6 +2272,10 @@ static int g_obo_on_expiry;                         /* v1.28.1 step 4: 0 revoke 
 /* v1.28.1 step 3: sub-agents (warden_subagent.inc.c) */
 static bool g_sub_on;                               /* the policy names a sub-agent */
 static char g_cg_self[PATH_MAX];                    /* the run's group as /proc/<pid>/cgroup shows it */
+static bool g_frz_want;                 /* v1.42 step 4: the policy holds calls with scope=run */
+static bool g_frz_ok;                   /* ... and the run can be frozen */
+static char g_frz_why[200];             /* ... or why it cannot */
+static bool g_waitkill;                 /* the kernel ends a held call's wait on a fatal signal only */
 static void sub_obo(FILE *f, int s);
 static bool sub_cgroup_write(int fd, int flags);
 static char       g_cred_ph[WS_MAX_CREDS][WP_PH_MAX]; /* v1.28: each credential's placeholder (not a secret) */
@@ -2613,6 +2617,11 @@ static int relay_agent_stderr(int fd, bool drain_all) {
 /* v1.28.1: run_start's on_behalf_of and operator */
 static void emit_on_behalf_of(FILE *f, const struct policy *p) {
     const struct ws_identity *id = &g_identity;
+    if (g_frz_want) {                                /* v1.42 step 4: can the run be frozen (scope=run)? */
+        fprintf(f, "\"scope_run\":{\"freeze\":%s,\"%s\":\"", g_frz_ok ? "true" : "false", g_frz_ok ? "cgroup" : "why");
+        json_escape(f, g_frz_ok ? g_cg_self : g_frz_why);
+        fputs("\"},", f);
+    }
     fputs("\"on_behalf_of\":{", f);
     if (id->has_user) {
         /* v1.31: the issuer is the policy's, or found through a trusted MCP resource */
@@ -7021,6 +7030,7 @@ int main(int argc, char **argv) {
     if (g_nr.on) node_as_agent();                                         /* v1.34 step 2 (review) */
     /* v1.28.1 step 3: sub-agents need cgroup v2 (a check makes no group) */
     if (g_check_only && sub_setup(&p, true, !ra.drop) < 0) return 1;
+    if (g_check_only) frz_setup(&p, true, !ra.drop);                     /* v1.42 step 4 */
     if (g_check_only) {
         /* v1.24: resolve each allowed name and report the ones that fail (a
          * name that does not resolve does not stop the Warden). */
@@ -7069,7 +7079,8 @@ int main(int argc, char **argv) {
     }
     /* v1.28.1 step 3: the run's control group, named after the run */
     if (sub_setup(&p, false, !ra.drop) < 0) return 1;
-    if (g_sub_on) atexit(sub_finish);
+    frz_setup(&p, false, !ra.drop);                                       /* v1.42 step 4: scope=run */
+    if (g_sub_on || g_frz_own) atexit(sub_finish);
     /* v1.12.1: if stdout and stderr are the same file (2>&1), the agent's
      * stdout lands in the verdict stream unprefixed. Records stay
      * authenticated by run id and seq, and the exporter refuses a stream
