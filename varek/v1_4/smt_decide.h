@@ -106,7 +106,11 @@ typedef enum { VDP_KIND_PATH = 0, VDP_KIND_HOST = 1, VDP_KIND_EXEC = 2,
  * calls a person must approve. Decided alone it refuses (UNSATISFIED, like
  * VDP_DENY); a call it decides is allowed only by a grant under it
  * (vdp_decide_grant). */
-typedef enum { VDP_ALLOW = 0, VDP_DENY = 1, VDP_STEP_UP = 2 } vdp_verb_t;
+/* v1.42 step 5: VDP_DEFER, a conditional allow: `defer ... until=FILE`.
+ * Decided alone it refuses (UNSATISFIED); the Warden allows a call it
+ * decides while its marker passes, and defers (holds) it otherwise. With
+ * `escalate`, a grant under it may allow the call, as under a step_up rule. */
+typedef enum { VDP_ALLOW = 0, VDP_DENY = 1, VDP_STEP_UP = 2, VDP_DEFER = 3 } vdp_verb_t;
 typedef enum {
     VDP_STR_PREFIX = 0, VDP_STR_EQ = 1, VDP_STR_HOST = 2,          /* v1.13 */
     VDP_STR_SUFFIX = 3, VDP_STR_CONTAINS = 4, VDP_STR_GLOB = 5,    /* v1.14 */
@@ -152,6 +156,7 @@ enum { VDP_SCOPE_THREAD = 0, VDP_SCOPE_RUN = 1 };    /* su_scope */
 #define VDP_SU_TIMEOUT_DEFAULT 300                   /* seconds */
 #define VDP_SU_TIMEOUT_MAX     3600
 #define VDP_SU_NOTIFY_MAX      512                   /* notify= URL, bytes */
+#define VDP_DF_UNTIL_MAX       255                   /* until= path, bytes (v1.42 step 5) */
 
 typedef struct {
     vdp_verb_t     verb;
@@ -206,6 +211,12 @@ typedef struct {
     uint32_t       su_timeout;
     char           su_approvers[33];
     char           su_notify[VDP_SU_NOTIFY_MAX + 1];
+    /* v1.42 step 5: a defer rule's `until=FILE` (its marker, an absolute
+     * path) and `escalate`; its approvers=, timeout= and scope= are the su_
+     * fields (scope default run; su_mode is hold: a deferral is held). Not
+     * part of any decision. */
+    bool           su_escalate;
+    char           df_until[VDP_DF_UNTIL_MAX + 1];
 } vdp_rule_t;
 
 #define VDP_PROXY_MAX_PORTS 16
@@ -334,6 +345,15 @@ typedef struct {
      * 0: not given. Not part of any decision. */
     uint32_t     max_held;
     uint32_t     max_pending;
+    /* v1.42 step 5: `on unknown defer escalate [timeout=N] [scope=thread|run]
+     * [approvers=GROUP]` (unk_line its line; 0: `on unknown deny`, the
+     * default): a call no rule holds is held as a STEP_UP after every rule
+     * of the policy (a grant's `step_up line` may name this line). Not part
+     * of any decision. */
+    int          unk_line;
+    uint32_t     unk_timeout;
+    uint8_t      unk_scope;
+    char         unk_approvers[33];
     /* v1.31: the confined subjects (subject k is subjects[k - 1]) and the
      * MCP resources trusted for the user's token */
     vdp_subject_t subjects[VDP_MAX_SUBJECTS];
@@ -607,8 +627,9 @@ int vdp_certificate(const vdp_policy_t *p, int rule_index, const char *s, vdp_ce
 typedef struct {
     vdp_rule_t rules[VDP_GRANT_MAX_RULES];
     size_t     n;
-    int        su_rule;         /* the step_up rule's index in the policy */
+    int        su_rule;         /* the step_up rule's index in the policy (-1: su_unknown) */
     int        su_line;         /* and its line */
+    bool       su_unknown;      /* v1.42 step 5: under the `on unknown defer escalate` line */
     int        lines[VDP_GRANT_MAX_RULES];   /* each rule's line in the grant's text */
     char       user[256];       /* for user=, "" : any */
     char       subagent[33];    /* for subagent=, "" : any (the agent's own calls included) */
@@ -632,6 +653,10 @@ void vdp_grant_free(vdp_grant_t *g);
  * (-1 when several of its rules agree on symbolic flags). Otherwise *grant
  * is -1 and the verdict is the policy's. With symbolic flags a grant is
  * consulted only when one step_up rule decides every flags value. */
+/* v1.42 step 5: may a grant be under rule r (a step_up rule, or a defer
+ * rule with escalate)? */
+bool vdp_rule_grantable(const vdp_rule_t *r);
+
 vdp_verdict_t vdp_decide_grant(const vdp_policy_t *p, const vdp_grant_t *const *gs, size_t ng,
                                int subj, vdp_kind_t kind, const char *s,
                                uint32_t flags, bool has_flags,

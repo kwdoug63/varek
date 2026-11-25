@@ -43,7 +43,8 @@ struct live_grant {
 struct proposal {
     char        id[17];
     char       *text;
-    int         su_rule;
+    int         su_rule;            /* the step_up (or defer) rule; -1: the `on unknown` line */
+    int         su_kind;            /* v1.42 step 5: under the `on unknown` line, the call's kind */
     long long   expires_ms;         /* realtime: when it ends `timeout` */
     int64_t     until;              /* the proposed grant's until (s) */
     uint32_t    count;
@@ -58,6 +59,30 @@ static const struct policy *g_gr_p;          /* the run's policy */
 static uid_t g_agent_uid = (uid_t)-1;        /* the agent's own user: never an approver */
 static int  g_apv_listen = -1;               /* the approvers' socket */
 static char g_apv_path[100];
+static vdp_rule_t g_unk_rule;                /* v1.42 step 5: `on unknown defer escalate`, as a step_up rule */
+
+/* v1.42 step 5: the step_up rule a proposal (or a held call) falls under:
+ * a rule of the policy, or the `on unknown` line for a call's kind */
+static const vdp_rule_t *unk_rule_of(int kind) {
+    static vdp_rule_t r;
+    r = g_unk_rule;
+    r.kind = (vdp_kind_t)kind;
+    return &r;
+}
+static int act_vkind(const struct action *a) {
+    switch (a->kind) {
+        case ACT_NET_CONNECT: case ACT_NET_PROXY: return VDP_KIND_HOST;
+        case ACT_PROCESS_EXEC: return VDP_KIND_EXEC;
+        case ACT_NET_REQUEST: return VDP_KIND_REQUEST;
+        case ACT_NET_MCP: return VDP_KIND_MCP;
+        default: return VDP_KIND_PATH;
+    }
+}
+static const vdp_rule_t *act_su(const struct action *a) {
+    return a->unk ? unk_rule_of(act_vkind(a)) : &g_gr_p->v.rules[a->rule_index];
+}
+struct proposal;
+static const vdp_rule_t *prop_su(const struct proposal *pp);
 
 static long long gr_now_ms(void) {
     struct timespec ts;
@@ -85,6 +110,25 @@ static int grant_policy_check(const struct policy *p, const char *path) {
             return -1;
         }
     }
+    /* v1.42 step 5: a marker the agent could write would let it release
+     * its own deferred calls */
+    for (size_t i = 0; i < p->v.n; i++) {
+        const vdp_rule_t *r = &p->v.rules[i];
+        if (r->verb == VDP_DEFER && vdpc_path_writable(&p->c, r->df_until, strlen(r->df_until))) {
+            fprintf(stderr, "[warden] policy %s:%d: the agent could write the defer rule's marker %s; refusing to start\n",
+                    path, r->line, r->df_until);
+            return -1;
+        }
+    }
+    if (p->v.unk_line) {
+        memset(&g_unk_rule, 0, sizeof g_unk_rule);
+        g_unk_rule.verb = VDP_STEP_UP;
+        g_unk_rule.su_mode = VDP_SU_HOLD;
+        g_unk_rule.su_scope = p->v.unk_scope;
+        g_unk_rule.su_timeout = p->v.unk_timeout;
+        g_unk_rule.line = p->v.unk_line;
+        memcpy(g_unk_rule.su_approvers, p->v.unk_approvers, sizeof g_unk_rule.su_approvers);
+    }
     g_gr_p = p;
     /* v1.42 step 4: asked of the kernel itself (a child tries it), since
      * the filter is loaded with the flag whatever libseccomp's version */
@@ -99,8 +143,10 @@ static int grant_policy_check(const struct policy *p, const char *path) {
 /* v1.42 step 3: does the policy hold calls (a step_up rule with mode=hold)? */
 static bool grant_holds(const struct policy *p) {
     for (size_t i = 0; i < p->v.n; i++)
-        if (p->v.rules[i].verb == VDP_STEP_UP && p->v.rules[i].su_mode == VDP_SU_HOLD) return true;
-    return false;
+        if ((p->v.rules[i].verb == VDP_STEP_UP && p->v.rules[i].su_mode == VDP_SU_HOLD) ||
+            p->v.rules[i].verb == VDP_DEFER)                   /* v1.42 step 5: a deferral is held */
+            return true;
+    return p->v.unk_line != 0;
 }
 
 /* Does live grant g apply to call a (its scope, count and time)? */
@@ -267,6 +313,10 @@ static char *proposal_text(const struct action *a, const vdp_rule_t *su, uint32_
 
 static size_t prop_open_count(void) { return g_nprop; }
 
+static const vdp_rule_t *prop_su(const struct proposal *pp) {
+    return pp->su_rule >= 0 ? &g_gr_p->v.rules[pp->su_rule] : unk_rule_of(pp->su_kind);
+}
+
 static void prop_free(size_t i) {
     free(g_prop[i].text);
     memmove(&g_prop[i], &g_prop[i + 1], (g_nprop - i - 1) * sizeof g_prop[0]);
@@ -291,7 +341,7 @@ static int prop_same(const char *text) {
  * index in g_prop, or -1 with why (with dedupe, an open proposal of the
  * same text is named instead: *same its index). */
 static int prop_make(const struct action *a, bool dedupe, const char **why, int *same) {
-    const vdp_rule_t *su = &g_gr_p->v.rules[a->rule_index];
+    const vdp_rule_t *su = act_su(a);                 /* v1.42 step 5: or the `on unknown` line */
     uint32_t timeout = su->su_timeout ? su->su_timeout : VDP_SU_TIMEOUT_DEFAULT;
     int64_t until = 0;
     *why = NULL;
@@ -338,7 +388,8 @@ static int prop_make(const struct action *a, bool dedupe, const char **why, int 
     memset(pp, 0, sizeof *pp);
     for (int i = 0; i < 8; i++) snprintf(pp->id + 2 * i, 3, "%02x", rnd[i]);
     pp->text = t;
-    pp->su_rule = a->rule_index;
+    pp->su_rule = a->unk ? -1 : a->rule_index;
+    pp->su_kind = su->kind;
     pp->expires_ms = gr_now_ms() + (long long)timeout * 1000;
     pp->until = until;
     pp->count = 1;
@@ -364,10 +415,45 @@ static bool g_replaying;                     /* deciding a held call again, afte
 static const char *g_unheld;                 /* v1.42 step 4: why the call being decided was not held (scope=run) */
 static bool su_scope_run(const vdp_rule_t *su) { return su->su_scope == VDP_SCOPE_RUN; }
 
+/* v1.42 step 5: a deferral's fields on a record: its refusal (held), or
+ * the call decided again once its marker passed (g_defer_note); why a call
+ * a defer rule (or `on unknown`) decided was not deferred (g_defer_unheld) */
+static const char *g_defer_note;
+static char g_defer_note_buf[200];
+static const char *g_defer_unheld;
+static char g_replay_cur_did[17];            /* the deferral whose call is decided again now */
+
+/* a JSON string's content: printable bytes, '"' and '\\' dropped */
+static void gr_plain(char *out, size_t on, const char *w) {
+    size_t l = 0;
+    for (const char *c = w; *c && l + 1 < on; c++)
+        if (*c != '"' && *c != '\\' && (unsigned char)*c >= 0x20) out[l++] = *c;
+    out[l] = '\0';
+}
+
 static void step_up_note(const struct action *a, decision_t d_raw, decision_t d_final, char *buf, size_t n) {
     buf[0] = '\0';
     g_new_prop = -1;
+    if (g_defer_note) { snprintf(buf, n, "%s", g_defer_note); return; }
+    if (g_replaying && g_replay_cur_did[0]) {          /* v1.42 step 5 */
+        snprintf(buf, n, "\"defer\":\"%s\",%s", g_replay_cur_did,
+                 d_final == DEC_ALLOW ? "" : "\"defer_why\":\"its marker passed, then decided again: refused\",");
+        return;
+    }
     if (g_held_end) { snprintf(buf, n, "\"step_up\":\"%s\",\"held\":true,", g_held_end); return; }
+    /* v1.42 step 5: a call a defer rule refused (its marker not passing),
+     * or one `on unknown defer escalate` would hold, not held: why */
+    bool df = g_gr_p && d_final != DEC_ALLOW && d_raw == DEC_DENY && !a->dry && a->rule_index >= 0 &&
+              (size_t)a->rule_index < g_gr_p->v.n && g_gr_p->v.rules[a->rule_index].verb == VDP_DEFER;
+    bool uk = g_gr_p && d_final != DEC_ALLOW && d_raw == DEC_UNKNOWN && !a->dry && g_gr_p->v.unk_line &&
+              a->why && !strcmp(a->why, "no_rule") && g_defer_unheld;
+    if (df || uk) {
+        char w[160];
+        gr_plain(w, sizeof w, g_defer_unheld ? g_defer_unheld : "its marker does not pass");
+        g_defer_unheld = NULL;
+        snprintf(buf, n, "\"defer\":\"none\",\"defer_why\":\"%s\",", w);
+        return;
+    }
     if (!g_gr_p || d_final == DEC_ALLOW || d_raw != DEC_DENY || a->dry || a->rule_index < 0 ||
         (size_t)a->rule_index >= g_gr_p->v.n || g_gr_p->v.rules[a->rule_index].verb != VDP_STEP_UP ||
         (a->why && !strcmp(a->why, "revoked")))
@@ -433,12 +519,19 @@ struct held_call {
     char                 prop[17];
     struct timespec      t0;
     bool                 frz;        /* v1.42 step 4: held with scope=run: the run is frozen */
+    /* v1.42 step 5: a deferral (dkind 1) waits on its marker, its proposal
+     * none until it is escalated (then dkind 0, as any held call) */
+    int                  dkind;
+    char                 did[17];
+    int                  df_rule;
+    long long            df_deadline_ms;
 };
 
 static struct held_call *g_held;
 static size_t g_held_cap;
 static struct seccomp_notif g_replay_q[VDP_MAX_HELD_LIMIT];  /* approved held calls, to decide again */
 static bool g_replay_frz[VDP_MAX_HELD_LIMIT];                /* v1.42 step 4: ... held with scope=run */
+static char g_replay_did[VDP_MAX_HELD_LIMIT][17];            /* v1.42 step 5: ... a deferral's, released by its marker */
 static size_t g_nreplay;
 static bool g_cur_set;                       /* g_cur_req is the notification being decided */
 static struct seccomp_notif g_cur_req;
@@ -531,6 +624,8 @@ static void hold_round(int notify_fd) {
     g_replaying = false;
     g_hold_swallow = 0;
     g_unheld = NULL;
+    g_defer_unheld = NULL;                           /* v1.42 step 5 */
+    g_replay_cur_did[0] = '\0';
     frz_update();                                    /* v1.42 step 4 */
 }
 
@@ -546,6 +641,8 @@ static bool hold_replay_pop(struct seccomp_notif *req) {
     *req = g_replay_q[0];
     memmove(&g_replay_q[0], &g_replay_q[1], (g_nreplay - 1) * sizeof g_replay_q[0]);
     memmove(&g_replay_frz[0], &g_replay_frz[1], (g_nreplay - 1) * sizeof g_replay_frz[0]);
+    memcpy(g_replay_cur_did, g_replay_did[0], sizeof g_replay_cur_did);
+    memmove(&g_replay_did[0], &g_replay_did[1], (g_nreplay - 1) * sizeof g_replay_did[0]);
     g_nreplay--;
     g_replaying = true;
     return true;
@@ -558,14 +655,295 @@ static bool hold_swallow(uint64_t id, bool refusal) {
     return true;
 }
 
+
+/* ---- v1.42 step 5: DEFER ----
+ *
+ * A call a defer rule decides is allowed while its marker (until=FILE)
+ * passes (policy_decide, df_marker), and deferred otherwise: held, at the
+ * kernel or at the proxy as a held step_up call is, under the rule's scope
+ * (run by default: the run is frozen), counted by max_held. Each second its
+ * marker is checked again; when it passes, the call is decided again
+ * (defer_end `resolved`). At its timeout it is refused (`timeout`), or with
+ * escalate it becomes a step_up hold under the defer rule (`escalated`, a
+ * proposal), approved, denied or timed out as any. `on unknown defer
+ * escalate`: a ground call no rule holds is escalated at once, its proposal
+ * under the `on unknown` line. A call that cannot be deferred is refused at
+ * once, its record saying why. Records: `defer` (held), `defer_end`. */
+
+/* Does rule r's marker pass? sha: its contents' SHA-256. It must be a
+ * regular file (not a link), owned by root or by the rule's approvers=
+ * group, writable by its owner alone, not the agent's own; at most 4 KiB;
+ * its first line this run's id or `*`; an `until` line, if any, not past. */
+static bool df_marker(const vdp_rule_t *r, char sha[65], char *why, size_t wn) {
+    sha[0] = '\0';
+    if (!r->df_until[0]) { snprintf(why, wn, "no marker"); return false; }
+    int fd = open(r->df_until, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) { snprintf(why, wn, "no marker (%s)", strerror(errno)); return false; }
+    struct stat st;
+    char buf[4097];
+    ssize_t n = -1;
+    const char *no = NULL;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) no = "the marker is not a regular file";
+    else if (st.st_mode & 022) no = "the marker is writable by others than its owner";
+    else if (g_agent_uid != (uid_t)-1 && st.st_uid == g_agent_uid) no = "the marker is the agent's";
+    else if (st.st_size > 4096) no = "the marker is over 4 KiB";
+    else {
+        bool owner_ok = st.st_uid == 0;
+        if (!owner_ok && r->su_approvers[0]) {
+            struct group gr, *grp = NULL;
+            char gb[16384];
+            if (getgrnam_r(r->su_approvers, &gr, gb, sizeof gb, &grp) == 0 && grp && st.st_gid == grp->gr_gid)
+                owner_ok = true;
+        }
+        if (!owner_ok) no = "the marker is owned by neither root nor the approvers' group";
+        else if ((n = read(fd, buf, sizeof buf - 1)) < 0) no = "the marker cannot be read";
+    }
+    close(fd);
+    if (no) { snprintf(why, wn, "%s", no); return false; }
+    buf[n] = '\0';
+    if (memchr(buf, '\0', (size_t)n)) { snprintf(why, wn, "the marker holds a NUL byte"); return false; }
+    /* the digest of exactly what is checked below (one read: never a second
+     * read the file may have changed between) */
+    unsigned char h[32];
+    if (vfips_sha256(buf, (size_t)n, h) != 0) { snprintf(why, wn, "no digest"); return false; }
+    bool first = true, named = false;
+    for (char *save = NULL, *ln = strtok_r(buf, "\n", &save); ln; ln = strtok_r(NULL, "\n", &save)) {
+        size_t l = strlen(ln);
+        while (l && (ln[l - 1] == '\r' || ln[l - 1] == ' ' || ln[l - 1] == '\t')) ln[--l] = '\0';
+        while (*ln == ' ' || *ln == '\t') ln++;
+        if (!*ln || *ln == '#') continue;
+        if (first) {
+            first = false;
+            named = !strcmp(ln, "*") || !strcmp(ln, g_run_id);
+            if (!named) { snprintf(why, wn, "the marker names another run"); return false; }
+            continue;
+        }
+        struct tm tm;
+        memset(&tm, 0, sizeof tm);
+        const char *e = !strncmp(ln, "until ", 6) ? strptime(ln + 6, "%Y-%m-%dT%H:%M:%SZ", &tm) : NULL;
+        if (!e || *e) { snprintf(why, wn, "the marker has a line other than until YYYY-MM-DDTHH:MM:SSZ"); return false; }
+        time_t t = timegm(&tm);
+        char back[21];
+        gr_utc((int64_t)t, back);
+        if (strcmp(back, ln + 6)) { snprintf(why, wn, "the marker's until is not a time"); return false; }
+        if (time(NULL) >= t) { snprintf(why, wn, "the marker's until has passed"); return false; }
+    }
+    if (!named) { snprintf(why, wn, "the marker names no run"); return false; }
+    for (int i = 0; i < 32; i++) snprintf(sha + 2 * i, 3, "%02x", h[i]);
+    return true;
+}
+
+static bool held_room(void) {
+    if (g_nheld < g_held_cap) return true;
+    size_t nc = g_held_cap ? g_held_cap * 2 : 8;
+    struct held_call *nh = realloc(g_held, nc * sizeof *nh);
+    if (!nh) return false;
+    g_held = nh;
+    g_held_cap = nc;
+    return true;
+}
+
+/* a new held entry (kernel: what 0, the current notification; proxy: its
+ * report), the call as decided kept; NULL when it cannot be made */
+static struct held_call *held_new(int what, const struct action *a, decision_t d_raw, const char *rule_id,
+                                  uint64_t latency_ns, uint64_t conn, const void *msg, size_t len, bool f1, bool f2) {
+    if (!held_room()) return NULL;
+    struct action *copy = malloc(sizeof *copy);
+    void *mcopy = what ? malloc(len) : NULL;
+    if (!copy || (what && !mcopy)) { free(copy); free(mcopy); return NULL; }
+    *copy = *a;
+    if (what) memcpy(mcopy, msg, len);
+    struct held_call *h = &g_held[g_nheld++];
+    memset(h, 0, sizeof *h);
+    h->what = what;
+    h->msg = mcopy;
+    h->conn = conn;
+    h->f1 = f1;
+    h->f2 = f2;
+    if (!what) h->req = g_cur_req;
+    h->act = copy;
+    h->d_raw = d_raw;
+    snprintf(h->rule_id, sizeof h->rule_id, "%s", rule_id ? rule_id : "none");
+    h->df_rule = -1;
+    clock_gettime(CLOCK_MONOTONIC, &h->t0);
+    long long t0ns = (long long)h->t0.tv_sec * 1000000000LL + h->t0.tv_nsec - (long long)latency_ns;
+    h->t0.tv_sec = (time_t)(t0ns / 1000000000LL);
+    h->t0.tv_nsec = (long)(t0ns % 1000000000LL);
+    return h;
+}
+
+static void defer_held_record(const struct held_call *h, const vdp_rule_t *su, bool unknown) {
+    uint32_t timeout = su->su_timeout ? su->su_timeout : VDP_SU_TIMEOUT_DEFAULT;
+    FILE *f = rec_begin();
+    fprintf(f, "{\"event\":\"defer\",\"run\":\"%s\",\"id\":\"%s\",\"state\":\"held\",%s\"rule_line\":%d,\"until\":\"",
+            g_run_id, h->did, unknown ? "\"unknown\":true," : "", su->line);
+    json_escape(f, unknown ? "" : su->df_until);
+    fprintf(f, "\",\"timeout\":%u,\"scope\":\"%s\",\"escalate\":%s,", timeout, su_scope_run(su) ? "run" : "thread",
+            unknown || su->su_escalate ? "true" : "false");
+    if (h->what) fprintf(f, "\"proxy_conn\":%llu,", (unsigned long long)h->conn);
+    else fprintf(f, "\"agent_pid\":%d,", (int)h->req.pid);
+    fprintf(f, "\"action\":\"%s\",\"resolved\":\"", action_kind_name(h->act->kind));
+    json_escape(f, h->act->resolved);
+    fprintf(f, "\",\"held\":%zu,\"timestamp_ns\":%lld}\n", g_nheld, gr_now_ns());
+    rec_end(NULL);
+}
+
+static void defer_end_record(const char *did, const char *ending, const char *sha, const char *prop, const char *why) {
+    FILE *f = rec_begin();
+    fprintf(f, "{\"event\":\"defer_end\",\"run\":\"%s\",\"id\":\"%s\",\"ending\":\"%s\",", g_run_id, did, ending);
+    if (sha && *sha) fprintf(f, "\"marker_sha256\":\"%s\",", sha);
+    if (prop && *prop) fprintf(f, "\"step_up\":\"%s\",", prop);
+    if (why && *why) { fputs("\"why\":\"", f); json_escape(f, why); fputs("\",", f); }
+    fprintf(f, "\"timestamp_ns\":%lld}\n", gr_now_ns());
+    rec_end(NULL);
+}
+
+/* a held call's step_up record (an escalated deferral's, or `on unknown`'s) */
+static void stepup_held_record(const struct held_call *h, const vdp_rule_t *su) {
+    int pi = prop_find(h->prop);
+    FILE *f = rec_begin();
+    fprintf(f, "{\"event\":\"step_up\",\"run\":\"%s\",\"id\":\"%s\",\"mode\":\"hold\",\"state\":\"held\","
+            "\"rule_line\":%d,\"timeout\":%u,\"approvers\":\"%s\",", g_run_id, h->prop, su->line,
+            su->su_timeout ? su->su_timeout : VDP_SU_TIMEOUT_DEFAULT, su->su_approvers);
+    if (h->what) fprintf(f, "\"proxy_conn\":%llu,", (unsigned long long)h->conn);
+    else fprintf(f, "\"agent_pid\":%d,", (int)h->req.pid);
+    fprintf(f, "\"action\":\"%s\",\"resolved\":\"", action_kind_name(h->act->kind));
+    json_escape(f, h->act->resolved);
+    fputs("\",\"proposal\":\"", f);
+    json_escape(f, pi >= 0 ? g_prop[pi].text : "");
+    fprintf(f, "\",\"held\":%zu,\"scope\":\"%s\",\"defer\":\"%s\",\"timestamp_ns\":%lld}\n", g_nheld,
+            h->frz ? "run" : "thread", h->did, gr_now_ns());
+    rec_end(NULL);
+}
+
+static bool did_make(char out[17]) {
+    unsigned char rnd[8];
+    if (vfips_rand(rnd, sizeof rnd) != 0) return false;
+    for (int i = 0; i < 8; i++) snprintf(out + 2 * i, 3, "%02x", rnd[i]);
+    return true;
+}
+
+/* A call defer rule su refused (its marker not passing): deferred? True
+ * when held (kernel: what 0; proxy: its report). False with g_defer_unheld. */
+static bool defer_take(const struct action *a, const vdp_rule_t *su, decision_t d_raw, const char *rule_id,
+                       uint64_t latency_ns, int what, uint64_t conn, const void *msg, size_t len, bool f1, bool f2) {
+    if (!hold_kind(a)) { g_defer_unheld = "not a call that can be held"; return false; }
+    if (!what && (g_grant_notify_fd < 0 || !notif_id_valid(g_grant_notify_fd, g_cur_req.id))) return false;
+    if (what && g_proxy.ctl < 0) return false;
+    uint32_t maxh = g_gr_p->v.max_held ? g_gr_p->v.max_held : VDP_MAX_HELD_DEFAULT;
+    if (g_nheld >= maxh) { g_defer_unheld = "max_held"; return false; }
+    char did[17];
+    if (!did_make(did)) { g_defer_unheld = "no random id"; return false; }
+    bool was_frozen = g_frozen;
+    if (su_scope_run(su) && !frz_hold()) {
+        snprintf(g_defer_note_buf, sizeof g_defer_note_buf, "scope=run: %s", g_unheld ? g_unheld : "cannot freeze");
+        g_defer_unheld = g_defer_note_buf;
+        g_unheld = NULL;
+        return false;
+    }
+    struct held_call *h = held_new(what, a, d_raw, rule_id, latency_ns, conn, msg, len, f1, f2);
+    if (!h) { if (!was_frozen) (void)frz_set(false); g_defer_unheld = "out of memory"; return false; }
+    uint32_t timeout = su->su_timeout ? su->su_timeout : VDP_SU_TIMEOUT_DEFAULT;
+    h->dkind = 1;
+    memcpy(h->did, did, sizeof h->did);
+    h->df_rule = a->rule_index;
+    h->df_deadline_ms = gr_now_ms() + (long long)timeout * 1000;
+    h->frz = su_scope_run(su);
+    if (!what) g_hold_swallow = g_cur_req.id;
+    else {
+        /* the proxy waits the deferral, and an escalation's hold after it */
+        struct wp_heldnote hn = { .type = WP_MSG_HELDNOTE, .ms = timeout * 1000u * (su->su_escalate ? 2u : 1u), .id = conn };
+        (void)send(g_proxy.ctl, &hn, sizeof hn, MSG_DONTWAIT | MSG_NOSIGNAL);
+    }
+    defer_held_record(h, su, false);
+    if (su_scope_run(su) && !was_frozen) frz_record(true, h->did, 0);
+    return true;
+}
+
+/* `on unknown defer escalate`: a ground call no rule holds, escalated at
+ * once (its proposal under the `on unknown` line). True when held. */
+static bool unk_take(const struct action *a, decision_t d_raw, const char *rule_id, uint64_t latency_ns,
+                     int what, uint64_t conn, const void *msg, size_t len, bool f1, bool f2) {
+    if (!g_gr_p || !g_gr_p->v.unk_line || !a->why || strcmp(a->why, "no_rule")) return false;
+    if (!hold_kind(a) || a->kind == ACT_PROCESS_EXEC) {
+        /* a launch no rule names is outside the launch set: no grant could run it */
+        g_defer_unheld = "not a call that can be held";
+        return false;
+    }
+    if (g_apv_listen < 0) { g_defer_unheld = "no approvers' socket"; return false; }
+    if (!what && (g_grant_notify_fd < 0 || !notif_id_valid(g_grant_notify_fd, g_cur_req.id))) return false;
+    if (what && g_proxy.ctl < 0) return false;
+    uint32_t maxh = g_gr_p->v.max_held ? g_gr_p->v.max_held : VDP_MAX_HELD_DEFAULT;
+    if (g_nheld >= maxh) { g_defer_unheld = "max_held"; return false; }
+    char did[17];
+    if (!did_make(did)) { g_defer_unheld = "no random id"; return false; }
+    struct action ua = *a;
+    ua.unk = true;
+    const vdp_rule_t *su = act_su(&ua);
+    vdp_rule_t sus = *su;                            /* unk_rule_of's buffer is shared */
+    bool was_frozen = g_frozen;
+    if (su_scope_run(&sus) && !frz_hold()) {
+        snprintf(g_defer_note_buf, sizeof g_defer_note_buf, "scope=run: %s", g_unheld ? g_unheld : "cannot freeze");
+        g_defer_unheld = g_defer_note_buf;
+        g_unheld = NULL;
+        return false;
+    }
+    const char *why;
+    int same;
+    int k = prop_make(&ua, false, &why, &same);
+    if (k < 0) {
+        if (!was_frozen) (void)frz_set(false);
+        g_defer_unheld = why ? why : "no proposal";
+        return false;
+    }
+    struct held_call *h = held_new(what, &ua, d_raw, rule_id, latency_ns, conn, msg, len, f1, f2);
+    if (!h) {
+        if (!was_frozen) (void)frz_set(false);
+        prop_free((size_t)k);
+        g_defer_unheld = "out of memory";
+        return false;
+    }
+    memcpy(h->did, did, sizeof h->did);
+    memcpy(h->prop, g_prop[k].id, sizeof h->prop);
+    h->frz = su_scope_run(&sus);
+    if (!what) g_hold_swallow = g_cur_req.id;
+    else {
+        uint32_t timeout = sus.su_timeout ? sus.su_timeout : VDP_SU_TIMEOUT_DEFAULT;
+        struct wp_heldnote hn = { .type = WP_MSG_HELDNOTE, .ms = timeout * 1000u, .id = conn };
+        (void)send(g_proxy.ctl, &hn, sizeof hn, MSG_DONTWAIT | MSG_NOSIGNAL);
+    }
+    defer_held_record(h, &sus, true);
+    if (h->frz && !was_frozen) frz_record(true, h->did, 0);
+    defer_end_record(h->did, "escalated", NULL, h->prop, NULL);
+    stepup_held_record(h, &sus);
+    return true;
+}
+
+/* A deferral past its timeout, with escalate: its call held on as a
+ * step_up call under the defer rule. False when no proposal can be made. */
+static bool defer_escalate(struct held_call *h, const char **why) {
+    int same;
+    int k = prop_make(h->act, false, why, &same);
+    if (k < 0) return false;
+    h->dkind = 0;
+    memcpy(h->prop, g_prop[k].id, sizeof h->prop);
+    defer_end_record(h->did, "escalated", NULL, h->prop, NULL);
+    stepup_held_record(h, &g_gr_p->v.rules[h->df_rule]);
+    return true;
+}
+
 /* emit_pathology, first: hold this call instead of recording its refusal?
  * True when it is held (its record is written when it ends). */
 static bool hold_take(pid_t pid, const struct action *a, decision_t d_raw, decision_t d_final,
                       const char *rule_id, uint64_t latency_ns) {
-    if (!g_gr_p || !g_cur_set || g_replaying || g_held_end || d_final == DEC_ALLOW || d_raw != DEC_DENY || a->dry ||
-        a->rule_index < 0 || (size_t)a->rule_index >= g_gr_p->v.n || pid != (pid_t)g_cur_req.pid)
+    if (!g_gr_p || !g_cur_set || g_replaying || g_held_end || g_defer_note || d_final == DEC_ALLOW || a->dry ||
+        pid != (pid_t)g_cur_req.pid || (a->why && !strcmp(a->why, "revoked")))
         return false;
+    /* v1.42 step 5: `on unknown defer escalate` */
+    if (d_raw == DEC_UNKNOWN) return unk_take(a, d_raw, rule_id, latency_ns, 0, 0, NULL, 0, false, false);
+    if (d_raw != DEC_DENY || a->rule_index < 0 || (size_t)a->rule_index >= g_gr_p->v.n) return false;
     const vdp_rule_t *su = &g_gr_p->v.rules[a->rule_index];
+    if (su->verb == VDP_DEFER) return defer_take(a, su, d_raw, rule_id, latency_ns, 0, 0, NULL, 0, false, false);
     if (su->verb != VDP_STEP_UP || su->su_mode != VDP_SU_HOLD || g_apv_listen < 0 || !hold_kind(a) ||
         (a->why && !strcmp(a->why, "revoked")))
         return false;
@@ -623,9 +1001,15 @@ static bool hold_take(pid_t pid, const struct action *a, decision_t d_raw, decis
  * held: no verdict and no decision record now. */
 static bool px_hold_take(const struct action *a, decision_t d_raw, int what, uint64_t conn, const void *msg,
                          size_t len, bool f1, bool f2) {
-    if (!g_gr_p || g_replaying || g_held_end || d_raw != DEC_DENY || a->dry || a->rule_index < 0 ||
-        (size_t)a->rule_index >= g_gr_p->v.n || g_apv_listen < 0 || g_proxy.ctl < 0)
+    if (!g_gr_p || g_replaying || g_held_end || g_defer_note || a->dry || g_proxy.ctl < 0 ||
+        (a->why && !strcmp(a->why, "revoked")))
         return false;
+    /* v1.42 step 5: `on unknown defer escalate`, and a defer rule's deferral */
+    if (d_raw == DEC_UNKNOWN) return unk_take(a, d_raw, NULL, 0, what, conn, msg, len, f1, f2);
+    if (d_raw != DEC_DENY || a->rule_index < 0 || (size_t)a->rule_index >= g_gr_p->v.n) return false;
+    if (g_gr_p->v.rules[a->rule_index].verb == VDP_DEFER)
+        return defer_take(a, &g_gr_p->v.rules[a->rule_index], d_raw, NULL, 0, what, conn, msg, len, f1, f2);
+    if (g_apv_listen < 0) return false;
     const vdp_rule_t *su = &g_gr_p->v.rules[a->rule_index];
     if (su->verb != VDP_STEP_UP || su->su_mode != VDP_SU_HOLD || (a->why && !strcmp(a->why, "revoked"))) return false;
     uint32_t maxh = g_gr_p->v.max_held ? g_gr_p->v.max_held : VDP_MAX_HELD_DEFAULT;
@@ -703,10 +1087,18 @@ static void px_held_decide(struct held_call *h, int hold) {
 
 static void held_refuse(size_t i) {
     struct held_call *h = &g_held[i];
+    /* v1.42 step 5: a deferral's refusal names it */
+    const char *he = h->prop;
+    if (h->dkind == 1) {
+        snprintf(g_defer_note_buf, sizeof g_defer_note_buf, "\"defer\":\"%s\",\"held\":true,", h->did);
+        g_defer_note = g_defer_note_buf;
+        he = NULL;
+    }
     if (h->what) {                                      /* v1.42 step 3b: at the proxy */
-        g_held_end = h->prop;
+        g_held_end = he;
         px_held_decide(h, PXH_REFUSE);
         g_held_end = NULL;
+        g_defer_note = NULL;
         held_drop(i);
         return;
     }
@@ -714,12 +1106,13 @@ static void held_refuse(size_t i) {
     if (answer || g_grant_notify_fd < 0) {
         struct timespec t1;
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        g_held_end = h->prop;
+        g_held_end = he;
         emit_pathology(g_report_seq++, (pid_t)h->req.pid, h->act, h->d_raw, DEC_DENY, h->rule_id,
                        (uint64_t)(t1.tv_sec - h->t0.tv_sec) * 1000000000ULL + (uint64_t)(t1.tv_nsec - h->t0.tv_nsec),
                        EACCES);
         g_held_end = NULL;
     }
+    g_defer_note = NULL;
     if (answer) send_errno(g_grant_notify_fd, h->req.id, EACCES);
     held_drop(i);
 }
@@ -733,7 +1126,8 @@ static void held_check(void) {
         if (g_held[i].what ? px_open_of(g_held[i].conn) != NULL                /* v1.42 step 3b */
                            : (g_grant_notify_fd < 0 || notif_id_valid(g_grant_notify_fd, g_held[i].req.id)))
             continue;
-        int pi = prop_find(g_held[i].prop);
+        if (g_held[i].dkind == 1) defer_end_record(g_held[i].did, "abandoned", NULL, NULL, NULL);   /* v1.42 step 5 */
+        int pi = g_held[i].dkind == 1 ? -1 : prop_find(g_held[i].prop);
         if (pi >= 0) {
             step_up_end_record(&g_prop[pi], "abandoned", NULL, -1, NULL, NULL);
             prop_free((size_t)pi);
@@ -746,7 +1140,7 @@ static void held_check(void) {
 static void step_up_after(uint64_t seq) {
     if (g_new_prop < 0) return;
     const struct proposal *pp = &g_prop[g_new_prop];
-    const vdp_rule_t *su = &g_gr_p->v.rules[pp->su_rule];
+    const vdp_rule_t *su = prop_su(pp);
     g_new_prop = -1;
     FILE *f = rec_begin();
     fprintf(f, "{\"event\":\"step_up\",\"run\":\"%s\",\"id\":\"%s\",\"decision_seq\":%" PRIu64 ",\"mode\":\"grant\","
@@ -775,13 +1169,21 @@ static void step_up_end_record(const struct proposal *pp, const char *ending, co
 
 /* The main loop's timeout: the next proposal to end, in ms (-1: none) */
 static int grant_timeout_ms(void) {
-    if (!g_nprop) return -1;
     long long now = gr_now_ms(), best = -1;
     for (size_t i = 0; i < g_nprop; i++) {
         long long d = g_prop[i].expires_ms - now;
         if (d < 0) d = 0;
         if (best < 0 || d < best) best = d;
     }
+    /* v1.42 step 5: a deferral's marker is checked each second, and its timeout kept */
+    for (size_t i = 0; i < g_nheld; i++) {
+        if (g_held[i].dkind != 1) continue;
+        long long d = g_held[i].df_deadline_ms - now;
+        if (d > 1000) d = 1000;
+        if (d < 0) d = 0;
+        if (best < 0 || d < best) best = d;
+    }
+    if (best < 0) return -1;
     return best > 3600000 ? 3600000 : (int)best;
 }
 
@@ -795,10 +1197,45 @@ static void grant_expire(void) {
             step_up_end_record(&g_prop[i], "timeout", NULL, -1, NULL, NULL);
             prop_free(i);
         }
+    /* v1.42 step 5: each deferral: its marker passing (decided again), or
+     * its timeout (refused, or escalated) */
+    for (size_t i = g_nheld; i-- > 0;) {
+        struct held_call *h = &g_held[i];
+        if (h->dkind != 1 || h->df_rule < 0) continue;
+        const vdp_rule_t *su = &g_gr_p->v.rules[h->df_rule];
+        char sha[65], mw[160];
+        if (df_marker(su, sha, mw, sizeof mw)) {
+            defer_end_record(h->did, "resolved", sha, NULL, NULL);
+            if (h->what) {                              /* at the proxy: decided again now */
+                memcpy(g_replay_cur_did, h->did, sizeof g_replay_cur_did);
+                g_replaying = true;
+                px_held_decide(h, PXH_AGAIN);
+                g_replaying = false;
+                g_replay_cur_did[0] = '\0';
+                held_drop(i);
+            } else if (g_nreplay < sizeof g_replay_q / sizeof g_replay_q[0]) {
+                g_replay_frz[g_nreplay] = h->frz;
+                memcpy(g_replay_did[g_nreplay], h->did, sizeof g_replay_did[0]);
+                g_replay_q[g_nreplay++] = h->req;
+                held_drop(i);
+            } else held_refuse(i);
+            continue;
+        }
+        if (h->df_deadline_ms > now) continue;
+        const char *ew = NULL;
+        char did[17];
+        memcpy(did, h->did, sizeof did);
+        if (su->su_escalate && g_apv_listen >= 0 && defer_escalate(h, &ew)) continue;
+        if (su->su_escalate && !ew) ew = g_apv_listen < 0 ? "no approvers' socket" : "no proposal";
+        held_refuse(i);
+        defer_end_record(did, "timeout", NULL, NULL, su->su_escalate ? ew : NULL);
+    }
 }
 
 /* At the run's end: each open proposal ends `abandoned` */
 static void grant_end_all(void) {
+    for (size_t i = 0; i < g_nheld; i++)            /* v1.42 step 5: open deferrals end abandoned */
+        if (g_held[i].dkind == 1) defer_end_record(g_held[i].did, "abandoned", NULL, NULL, NULL);
     while (g_nheld) held_drop(g_nheld - 1);        /* the run is ending: its callers are gone */
     g_nreplay = 0;
     while (g_nprop) {
@@ -815,7 +1252,8 @@ static void grant_end_all(void) {
 static void apv_open(void) {
     if (!g_gr_p || geteuid() != 0) return;
     bool any = false;
-    for (size_t i = 0; i < g_gr_p->v.n; i++) any = any || g_gr_p->v.rules[i].verb == VDP_STEP_UP;
+    for (size_t i = 0; i < g_gr_p->v.n; i++) any = any || vdp_rule_grantable(&g_gr_p->v.rules[i]);
+    any = any || g_gr_p->v.unk_line;               /* v1.42 step 5: escalations are answered there */
     if (!any) return;
     if (mkdir("/run/varek-approve", 0711) < 0 && errno != EEXIST) goto fail;
     struct stat st;
@@ -889,7 +1327,7 @@ static void apv_pending(int c, const struct ucred *cr) {
     long long now = gr_now_ms();
     for (size_t i = 0; i < g_nprop; i++) {
         const struct proposal *pp = &g_prop[i];
-        const vdp_rule_t *su = &g_gr_p->v.rules[pp->su_rule];
+        const vdp_rule_t *su = prop_su(pp);
         char who[64];
         if (apv_may(cr->uid, cr->gid, su, who)) continue;
         int k = snprintf(line, sizeof line, "{\"id\":\"%s\",\"rule_line\":%d,\"approvers\":\"%s\",\"expires_in\":%lld,\"proposal\":\"",
@@ -914,7 +1352,7 @@ static const char *apv_answer(const struct ucred *cr, bool approve, const char *
     if (pi < 0) return "refused: no open proposal of that id";
     struct proposal *pp = &g_prop[pi];
     if (pp->expires_ms <= gr_now_ms()) return "refused: the proposal has ended";
-    const vdp_rule_t *su = &g_gr_p->v.rules[pp->su_rule];
+    const vdp_rule_t *su = prop_su(pp);
     char who[64];
     const char *no = apv_may(cr->uid, cr->gid, su, who);
     if (no) { snprintf(ans, an, "refused: %s", no); return ans; }
@@ -989,7 +1427,8 @@ static const char *apv_answer(const struct ucred *cr, bool approve, const char *
     }
     if (hi >= 0) {
         if (g_nreplay < sizeof g_replay_q / sizeof g_replay_q[0])
-            g_replay_frz[g_nreplay] = g_held[hi].frz, g_replay_q[g_nreplay++] = g_held[hi].req;
+            g_replay_frz[g_nreplay] = g_held[hi].frz, g_replay_did[g_nreplay][0] = '\0',
+            g_replay_q[g_nreplay++] = g_held[hi].req;
         else held_refuse((size_t)hi), hi = -1;
         if (hi >= 0) held_drop((size_t)hi);
     }
@@ -1016,7 +1455,11 @@ static void apv_service(void) {
     bool approver = false;
     for (size_t i = 0; !ans && !approver && i < g_gr_p->v.n; i++) {
         char who[64];
-        approver = g_gr_p->v.rules[i].verb == VDP_STEP_UP && !apv_may(cr.uid, cr.gid, &g_gr_p->v.rules[i], who);
+        approver = vdp_rule_grantable(&g_gr_p->v.rules[i]) && !apv_may(cr.uid, cr.gid, &g_gr_p->v.rules[i], who);
+    }
+    if (!ans && !approver && g_gr_p->v.unk_line) {       /* v1.42 step 5: or under the `on unknown` line */
+        char who[64];
+        approver = !apv_may(cr.uid, cr.gid, &g_unk_rule, who);
     }
     if (!ans && !approver) ans = "refused: not an approver in this run";
     long long deadline = gr_now_ms() + 500;

@@ -424,6 +424,13 @@ def host_name_form(c):
     return 1
 
 
+def until_ok(v):
+    """v1.42 step 5: a defer rule's until= path, as both parsers read it"""
+    if not (2 <= len(v) <= 255) or v[0] != "/" or v[-1] == "/" or any(not 0x21 <= ord(ch) <= 0x7e for ch in v):
+        return False
+    return all(c not in ("", ".", "..") for c in v[1:].split("/"))
+
+
 def atom_rx(rx, r):
     """The language of a rule's string atom."""
     c, op = r["c"], r["op"]
@@ -673,6 +680,7 @@ def parse_lines(raw_lines, path):
     issuers, spiffe, require_obo = [], [], False   # v1.28.1
     require_plan = False                           # v1.35 step 4
     max_seen = set()                               # v1.42: max_held, max_pending
+    unknown_seen = [False]                         # v1.42 step 5: an `on unknown` line
     if True:
         for lineno, raw in enumerate(raw_lines, 1):
             if b"\0" in raw:
@@ -700,6 +708,29 @@ def parse_lines(raw_lines, path):
                 if len(toks) != 2 or req < (1, 35) or require_plan:
                     raise PolicyError(f"{path}:{lineno}: bad require plan")
                 require_plan = True
+                continue
+            if toks[0] == "on" and len(toks) >= 2 and toks[1] == "unknown":
+                # v1.42 step 5: on unknown deny | on unknown defer escalate [timeout=] [scope=] [approvers=]
+                if req < (1, 42) or unknown_seen[0]:
+                    raise PolicyError(f"{path}:{lineno}: bad on unknown")
+                unknown_seen[0] = True
+                if toks[2:] == ["deny"]:
+                    continue
+                if len(toks) < 3 or toks[2] != "defer":
+                    raise PolicyError(f"{path}:{lineno}: bad on unknown")
+                seen_o = set()
+                for o in toks[3:]:
+                    k = o.split("=", 1)[0] if "=" in o else o
+                    v_ = o.split("=", 1)[1] if "=" in o else ""
+                    ok = k not in seen_o and ((k == "escalate" and o == k) or
+                         (k == "scope" and v_ in ("thread", "run")) or
+                         (k == "timeout" and re.fullmatch(r"[1-9][0-9]{0,3}", v_) is not None and int(v_) <= 3600) or
+                         (k == "approvers" and re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}|[a-z_][a-z0-9_-]{0,30}\$", v_) is not None))
+                    if not ok:
+                        raise PolicyError(f"{path}:{lineno}: bad on unknown option")
+                    seen_o.add(k)
+                if "escalate" not in seen_o:
+                    raise PolicyError(f"{path}:{lineno}: on unknown defer without escalate")
                 continue
             if toks[0] in ("max_held", "max_pending"):
                 # v1.42: max_held N, max_pending N (1 to 1024, each once)
@@ -819,22 +850,29 @@ def parse_lines(raw_lines, path):
                 subj_register(len(rules) - 1, True, f"{path}:{lineno}")
                 continue
             verb, kind = toks[0], toks[1]
-            if verb not in ("allow", "deny", "step_up"):
+            if verb not in ("allow", "deny", "step_up", "defer"):
                 raise PolicyError(f"{path}:{lineno}: verb")
             su_opts = {}
-            if verb == "step_up":
-                # v1.42: its options come last: mode= approvers= timeout= scope= notify=
+            if verb in ("step_up", "defer"):
+                # v1.42: its options come last: mode= approvers= timeout= scope= notify=;
+                # v1.42 step 5, a defer rule's: until= (required) approvers= timeout= scope= escalate
                 if req < (1, 42):
-                    raise PolicyError(f"{path}:{lineno}: step_up before 1.42")
+                    raise PolicyError(f"{path}:{lineno}: {verb} before 1.42")
                 while len(toks) > 3:
                     o = toks[-1]
-                    k = o.split("=", 1)[0] if "=" in o else ""
-                    if k not in ("mode", "approvers", "timeout", "scope", "notify"):
+                    # escalate is a bare word: `escalate=...` is no option (the rule's own token)
+                    k = o.split("=", 1)[0] if "=" in o else ("escalate" if o == "escalate" else "")
+                    if k == "escalate" and o != "escalate":
+                        k = ""
+                    if k not in ("mode", "approvers", "timeout", "scope", "notify", "until", "escalate"):
                         break
+                    if (verb == "step_up") != (k not in ("until", "escalate")) and k not in ("approvers", "timeout", "scope"):
+                        raise PolicyError(f"{path}:{lineno}: an option of the other verb")
                     if k in su_opts:
                         raise PolicyError(f"{path}:{lineno}: step_up option twice")
-                    v_ = o.split("=", 1)[1]
-                    ok = (k == "mode" and v_ in ("grant", "hold")) or \
+                    v_ = o.split("=", 1)[1] if "=" in o else ""
+                    ok = (k == "escalate") or (k == "until" and until_ok(v_)) or \
+                         (k == "mode" and v_ in ("grant", "hold")) or \
                          (k == "scope" and v_ in ("thread", "run")) or \
                          (k == "timeout" and re.fullmatch(r"[1-9][0-9]{0,3}", v_) is not None and int(v_) <= 3600) or \
                          (k == "approvers" and re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}|[a-z_][a-z0-9_-]{0,30}\$", v_) is not None) or \
@@ -844,6 +882,8 @@ def parse_lines(raw_lines, path):
                         raise PolicyError(f"{path}:{lineno}: bad step_up option")
                     su_opts[k] = v_
                     toks = toks[:-1]
+                if verb == "defer" and "until" not in su_opts:
+                    raise PolicyError(f"{path}:{lineno}: defer without until=")
             if kind == "request":
                 # v1.26.1: <verb> request METHOD URL [max_body=N]
                 if req < (1, 26) or len(toks) < 4:
@@ -1307,11 +1347,16 @@ def oracle_symbolic(rx, rules, sval, kind="path"):
     # of deny and step_up over the flags is UNKNOWN, as the procedure has it
     step_first = smt.Or([fires_first(rx, rules, i, s, f) for i in idx
                         if rules[i]["verb"] == "step_up"] or [smt.BoolVal(False, ctx=CTX)])
+    # v1.42 step 5: and a defer rule, another
+    defer_first = smt.Or([fires_first(rx, rules, i, s, f) for i in idx
+                         if rules[i]["verb"] == "defer"] or [smt.BoolVal(False, ctx=CTX)])
     if not sat(domain(s, f), pin, smt.Not(allow_first)):
         return "SATISFIED"
     if not sat(domain(s, f), pin, smt.Not(deny_first)):
         return "UNSATISFIED"
     if not sat(domain(s, f), pin, smt.Not(step_first)):
+        return "UNSATISFIED"
+    if not sat(domain(s, f), pin, smt.Not(defer_first)):
         return "UNSATISFIED"
     return "UNKNOWN"
 
@@ -1629,6 +1674,8 @@ def fuzz_line(rng, prior, strings, wide):
     verb = rng.choice(["allow", "deny"])
     if FUZZ["v142"] and rng.random() < 0.3:
         verb = "step_up"                                # v1.42
+        if rng.random() < 0.35:
+            verb = "defer"                              # v1.42 step 5
     clauses = []
     if kind == "path":
         if wide:
@@ -1655,6 +1702,15 @@ def fuzz_line(rng, prior, strings, wide):
         bad = ["mode=x", "timeout=0", "timeout=3601", "timeout=01", "approvers=Ops", "approvers=",
                "scope=all", "notify=http://h.example/x", "notify=https:///x", "mode=hold"]
         clauses += rng.sample(opts, rng.randint(1, 3))
+        if rng.random() < 0.15:
+            clauses.append(rng.choice(bad))
+    if verb == "defer":
+        # v1.42 step 5: a defer rule's options, valid and not (until= required)
+        opts = ["approvers=varek-approvers", "timeout=60", "scope=thread", "scope=run", "escalate"]
+        bad = ["until=rel", "until=/a/../b", "until=/a/", "mode=hold", "notify=https://h.example/x", "escalate=1"]
+        if rng.random() < 0.9:
+            clauses.append(rng.choice(["until=/etc/varek/ok", "until=/run/m/" + "x" * rng.randint(1, 260)]))
+        clauses += rng.sample(opts, rng.randint(0, 3))
         if rng.random() < 0.15:
             clauses.append(rng.choice(bad))
     line = " ".join([verb, kind] + ([matcher] if matcher else []) + [c] + clauses)
@@ -1999,6 +2055,13 @@ def fuzz_policy(rng, path, v142=False):
             lines.append(rng.choice(["max_held 8", "max_pending 16", "max_held 1024"] +
                                     ([] if valid else ["max_held 0", "max_held 1025", "max_pending x",
                                                        "max_held 8\nmax_held 8"])))
+        if rng.random() < 0.2:
+            # v1.42 step 5: the `on unknown` line, valid and not
+            lines.append(rng.choice(["on unknown deny", "on unknown defer escalate",
+                                     "on unknown defer escalate timeout=30 scope=thread approvers=ops"] +
+                                    ([] if valid else ["on unknown defer", "on unknown allow",
+                                                       "on unknown defer escalate until=/m",
+                                                       "on unknown deny\non unknown deny"])))
     elif rng.random() < 0.3:
         lines.append(rng.choice(["require warden 1.14", "require warden 1.13", "require warden 01.14",
                                  "require warden 1.15", "require warden 1.16", "require warden 1.21",

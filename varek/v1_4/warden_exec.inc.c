@@ -339,9 +339,10 @@ static int exec_consider(const struct policy *p, const char *cand, size_t *admit
     int ri = -1;
     vdp_why_t why;
     vdp_verdict_t cv = vdp_decide_subj(&p->v, g_exec_subj, VDP_KIND_EXEC, cand, 0, false, &ri, &why);
-    /* v1.42: a program a step_up rule decides is in the set too: Landlock
+    /* v1.42: a program a step_up (v1.42 step 5: or defer) rule decides is in the set too: Landlock
      * lets it run, and the Warden decides each launch (a grant may allow it) */
-    bool su = cv == VDP_UNSATISFIED && ri >= 0 && p->v.rules[ri].verb == VDP_STEP_UP;
+    bool su = cv == VDP_UNSATISFIED && ri >= 0 &&
+              (p->v.rules[ri].verb == VDP_STEP_UP || p->v.rules[ri].verb == VDP_DEFER);   /* v1.42 step 5: a marker may allow it */
     if ((cv != VDP_SATISFIED && !su) || ri < 0)
         return 0;
     /* v1.27 review: a deny exec rule on the file's own path keeps it out,

@@ -35,6 +35,13 @@
 /* v1.42 step 3b: holding at the proxy (warden_grant.inc.c) */
 enum { PXH_DECIDE = 0, PXH_AGAIN = 1, PXH_REFUSE = 2 };     /* the decide functions' hold */
 enum { PXH_HTTP = 1, PXH_MCP = 2 };                         /* what is held */
+/* v1.42 step 5: the deciding rule of an allowed call, or (a grant under the
+ * `on unknown` line: no rule decided it) a rule with no body limit and no
+ * credential */
+static const vdp_rule_t *px_rl(const struct policy *p, const struct action *a) {
+    static const vdp_rule_t none;
+    return a->rule_index >= 0 && (size_t)a->rule_index < p->v.n ? &p->v.rules[a->rule_index] : &none;
+}
 static bool px_hold_take(const struct action *a, decision_t d_raw, int what, uint64_t conn, const void *msg,
                          size_t len, bool f1, bool f2);
 
@@ -860,14 +867,14 @@ static int px_httpreq_decide(const struct policy *p, struct px_open *o, const st
         fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n", g_records, a->check_why);
     }
     if (d_final == DEC_ALLOW) {
-        maxb = p->v.rules[a->rule_index].max_body;
+        maxb = px_rl(p, a)->max_body;
         if (maxb && m->body == WP_BODY_LENGTH && m->body_len > maxb) {
             d_final = DEC_DENY;
             rule = "max_body";
         }
     }
     /* v1.35 step 4: a credential no step of the run's plan names */
-    if (d_final == DEC_ALLOW && hold_refuses_cred(p, a, p->v.rules[a->rule_index].cred)) {
+    if (d_final == DEC_ALLOW && hold_refuses_cred(p, a, px_rl(p, a)->cred)) {
         d_final = DEC_DENY;
         rule = "outside_plan";
     }
@@ -1087,7 +1094,7 @@ static int px_mcpreq_decide(const struct policy *p, struct px_open *o, struct wp
             fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n", g_records, a->check_why);
         }
         if (d_final == DEC_ALLOW) {
-            maxb = p->v.rules[a->rule_index].max_body ? p->v.rules[a->rule_index].max_body : MCP_BODY_DEFAULT;
+            maxb = px_rl(p, a)->max_body ? px_rl(p, a)->max_body : MCP_BODY_DEFAULT;
             if (m->body_len > maxb) {
                 d_final = DEC_DENY;
                 rule = "max_body";
@@ -1095,7 +1102,7 @@ static int px_mcpreq_decide(const struct policy *p, struct px_open *o, struct wp
         }
         /* v1.31 step 5: an MCP token past its expiry is not released (the
          * store is to hold a current one; VAREK does not refresh it, D8) */
-        int ce = d_final == DEC_ALLOW ? p->v.rules[a->rule_index].cred : 0;
+        int ce = d_final == DEC_ALLOW ? px_rl(p, a)->cred : 0;
         if (ce > 0 && p->v.creds[ce - 1].audience[0] && g_cred_meta[ce - 1].exp > 0 &&
             g_cred_meta[ce - 1].exp <= (int64_t)time(NULL)) {
             d_final = DEC_DENY;
@@ -1106,7 +1113,7 @@ static int px_mcpreq_decide(const struct policy *p, struct px_open *o, struct wp
             d_final = DEC_DENY;
             rule = "outside_plan";
             snprintf(why, sizeof why, "no step of the run's plan names this call");
-        } else if (d_final == DEC_ALLOW && hold_refuses_cred(p, a, p->v.rules[a->rule_index].cred)) {
+        } else if (d_final == DEC_ALLOW && hold_refuses_cred(p, a, px_rl(p, a)->cred)) {
             d_final = DEC_DENY;
             rule = "outside_plan";
             snprintf(why, sizeof why, "it carries a credential no step of the run's plan names");

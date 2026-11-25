@@ -72,6 +72,27 @@
 #      proposal, its record saying why it was not held (unheld), the counter
 #      going on; the audit passes. A startup check says which.
 #
+# Step 5, DEFER (sections 1, 4 and 9):
+#   1, 4. defer rules and the `on unknown` line read the same by both
+#      parsers, each malformed form refused; a defer rule's call refused
+#      alone, allowed within a grant under it with escalate; a ground call no
+#      rule holds within a grant under the `on unknown` line; the checker
+#      accepts a defer rule's certificate, and each such grant's, and refuses
+#      the forged.
+#   9. A read a defer rule decides is deferred; a root-owned marker naming
+#      the run releases it, allowed under the marker; a marker present
+#      before the call allows it at once; a marker that is the agent's,
+#      group-writable, names another run or is a link is not accepted
+#      (refused at the timeout); escalate turns the timeout into a proposal,
+#      approved; on unknown defer escalate proposes at once for a read no
+#      rule names, approved under the `on unknown` line; a policy whose
+#      marker the agent could write is refused at start; with the default
+#      scope the run is frozen while deferred (where it can be); the
+#      records, the audit, and its refusal of each forgery (an ending
+#      dropped, the marker not named or not the one that resolved it, the
+#      allow before its ending, a timed-out refusal dropped, an
+#      escalation's proposal dropped).
+#
 # Usage: sudo ./test_v1420.sh   (from varek/v1_4, after `make warden tools/vdp_check tools/vdp_cert_check`;
 #        sections 1 to 4 need no root, and run without it)
 set -u
@@ -122,6 +143,23 @@ refused "an option before a flag clause"   'require warden 1.42\nstep_up path /s
 refused "a step_up option on an allow rule" 'require warden 1.42\nallow path /s/ mode=hold\n'
 refused "credential= on a step_up rule"    'require warden 1.42\nproxy inspect\ncredential k from file:/k\nstep_up request POST https://a.example.com/x credential=k header=Authorization\nallow host a.example.com:443\n'
 refused "a wildcard budget on a step_up rule" 'require warden 1.42\nstep_up host *.example.com names=4\n'
+# v1.42 step 5: defer rules and the `on unknown` line
+accepted "a defer rule of each kind, and every option" 'require warden 1.42\nproxy inspect\ndefer path /srv/prod/ until=/etc/varek/ok\ndefer host api.example.com:443 until=/etc/varek/net escalate scope=thread timeout=60 approvers=ops\ndefer exec /usr/bin/deploy until=/etc/varek/dep\ndefer request POST https://api.example.com/pay until=/etc/varek/pay\n'
+accepted "on unknown deny" 'require warden 1.42\non unknown deny\nallow path /tmp/\n'
+accepted "on unknown defer escalate, with its options" 'require warden 1.42\non unknown defer escalate timeout=30 scope=thread approvers=ops\nallow path /tmp/\n'
+refused "defer before 1.42"                 'require warden 1.35\ndefer path /s/ until=/m\n'            "needs \`require warden 1.42\`"
+refused "a defer rule without until="       'require warden 1.42\ndefer path /s/ escalate\n'            "needs until=FILE"
+refused "until= a relative path"            'require warden 1.42\ndefer path /s/ until=m\n'             "until= is an absolute path"
+refused "until= with a .. part"             'require warden 1.42\ndefer path /s/ until=/a/../m\n'       "until= is an absolute path"
+refused "until= ending in /"                'require warden 1.42\ndefer path /s/ until=/a/\n'           "until= is an absolute path"
+refused "a step_up option on a defer rule"  'require warden 1.42\ndefer path /s/ until=/m mode=hold\n'  "are a step_up rule's"
+refused "a defer option on a step_up rule"  'require warden 1.42\nstep_up path /s/ until=/m\n'         "are a defer rule's"
+refused "escalate twice"                    'require warden 1.42\ndefer path /s/ until=/m escalate escalate\n' "given twice"
+refused "on unknown defer without escalate" 'require warden 1.42\non unknown defer timeout=30\n'         "needs escalate"
+refused "on unknown allow"                  'require warden 1.42\non unknown allow\n'
+refused "on unknown twice"                  'require warden 1.42\non unknown deny\non unknown deny\n'  "given twice"
+refused "on unknown before 1.42"            'require warden 1.35\non unknown deny\n'                     "needs \`require warden 1.42\`"
+refused "until= on the on unknown line"     'require warden 1.42\non unknown defer escalate until=/m\n'
 printf 'require warden 1.42\nallow path /tmp/\nstep_up path /srv/data/ mode=hold timeout=60 approvers=ops notify=https://h.example/x\nstep_up path /srv/data/x\n' > "$T/w.txt"
 o="$("$WARDEN" "$T/w.txt" --check-startup 2>&1)"
 grep -q "read this rule differently" <<<"$o" && flunk "the Warden's two parsers disagree on a step_up rule: $o" \
@@ -243,6 +281,40 @@ rej "a grant rule that does not exist"         "path 0 $R 2 - grant=0:1:-"
 rej "symbolic flags the read-only grant does not cover" "path - $R 2 - grant=0:0:-"
 o="$(chk x "path 0 $R 2 - grant=7:0:-")"
 grep -q '"check":"error"' <<<"$o" && pass "checker: a grant not given is an error" || flunk "unknown grant: $o"
+
+# v1.42 step 5: a defer rule (its marker), a grant under one with escalate, and under the `on unknown` line
+printf 'require warden 1.42\nallow path /tmp/\ndefer path /srv/prod/ until=/etc/varek/ok\ndefer path /srv/esc/ until=/etc/varek/ok escalate\non unknown defer escalate\n' > "$T/p5.txt"
+printf 'grant\nstep_up line 4\nallow path exact /srv/esc/a readonly\ncount 1\n' > "$T/g5a.txt"
+printf 'grant\nstep_up line 5\nallow path exact /opt/x readonly\ncount 1\n' > "$T/g5b.txt"
+printf 'grant\nstep_up line 3\nallow path exact /srv/prod/a readonly\ncount 1\n' > "$T/g5c.txt"
+o="$("$VDP" "$T/p5.txt" grant "$T/g5a.txt")"; grep -q '"ok":true,"step_up_line":4' <<<"$o" && pass "grant: under a defer rule with escalate" || flunk "grant under defer: $o"
+o="$("$VDP" "$T/p5.txt" grant "$T/g5b.txt")"; grep -q '"ok":true,"step_up_line":5' <<<"$o" && pass "grant: under the on unknown line" || flunk "grant under on unknown: $o"
+o="$("$VDP" "$T/p5.txt" grant "$T/g5c.txt" 2>&1)"; c="$("$CERT" "$T/p5.txt" batch "$T/g5c.txt" < /dev/null 2>&1)"
+grep -q "is not a step_up rule" <<<"$o" && grep -q -i "no step_up" <<<"$c" && pass "grant refused: under a defer rule without escalate (both parsers)" || flunk "grant under plain defer: $o / $c"
+dq() { printf '%s %s %s\n' "$1" "$2" "$(hx "$3")" | "$VDP" "$T/p5.txt" batch "$T/g5a.txt" "$T/g5b.txt"; }
+o="$(dq path 0 /srv/prod/a)"
+grep -q '"verdict":"UNSATISFIED","rule":1,"line":3.*"verb":"defer"' <<<"$o" && ! grep -q '"grant"' <<<"$o" && pass "a defer rule's call alone: UNSATISFIED, the defer rule deciding (the Warden checks its marker)" || flunk "defer decision: $o"
+o="$(dq path 0 /srv/esc/a)"
+grep -q '"verdict":"SATISFIED","rule":2,"line":4.*"verb":"defer".*"grant":0' <<<"$o" && pass "a call under a defer rule with escalate, within its grant" || flunk "defer grant: $o"
+o="$(dq path 0 /opt/x)"
+grep -q '"verdict":"SATISFIED","rule":-1,.*"why":"no_rule".*"grant":1' <<<"$o" && pass "a call no rule holds, within a grant under the on unknown line" || flunk "unknown grant: $o"
+o="$(dq path - /opt/x)"
+grep -q '"verdict":"UNKNOWN"' <<<"$o" && ! grep -q '"grant"' <<<"$o" && pass "... but not with symbolic flags (a grant under on unknown is for a ground call)" || flunk "unknown grant, symbolic: $o"
+o="$(dq path 0 /tmp/x)"
+grep -q '"verdict":"SATISFIED","rule":0' <<<"$o" && ! grep -q '"grant"' <<<"$o" && pass "... nor a call a rule decides" || flunk "unknown grant, ruled call: $o"
+P5="$(hx /srv/prod/a)"; E5="$(hx /srv/esc/a)"; X5="$(hx /opt/x)"
+chk5() { printf '%s\n' "$2" | "$CERT" "$T/p5.txt" batch "$T/g5a.txt" "$T/g5b.txt"; }
+ok5()  { o="$(chk5 "$1" "$2")"; grep -q '"check":"ok"' <<<"$o" && pass "checker accepts: $1" || flunk "checker accepts: $1: $o"; }
+rej5() { o="$(chk5 "$1" "$2")"; grep -q '"check":"reject"' <<<"$o" && pass "checker refuses: $1 ($(sed 's/.*"why":"\(.*\)"}/\1/' <<<"$o"))" || flunk "checker refuses: $1: $o"; }
+ok5  "a defer rule's certificate (its marker passed)"      "path 0 $P5 1 - defer"
+ok5  "a grant under a defer rule with escalate"            "path 0 $E5 2 - grant=0:0:-"
+ok5  "a grant under the on unknown line"                   "path 0 $X5 -1 - grant=1:0:-"
+rej5 "an allow rule's certificate as a defer rule's"       "path 0 $(hx /tmp/a) 0 - defer"
+rej5 "a defer rule's certificate as an allow"              "path 0 $P5 1 -"
+rej5 "another file under the defer rule"                   "path 0 $(hx /srv/other) 1 - defer"
+rej5 "a grant under on unknown for a call a rule holds"    "path 0 $(hx /tmp/x) -1 - grant=1:0:-"
+rej5 "a grant under on unknown naming a rule"              "path 0 $X5 0 - grant=1:0:-"
+rej5 "symbolic flags under the on unknown line"            "path - $X5 -1 - grant=1:0:-"
 
 echo "== 5. step 2: runtime grants, mode=grant (as root) =="
 if [ "$(id -u)" != 0 ] || ! command -v setpriv > /dev/null; then
@@ -634,6 +706,132 @@ grep -q "held: no" "$W/s3.out" && grep -q "counted: 40" "$W/s3.out" && pass "whe
 check "... run_start says why; the refusal names a proposal and why it was not held; nothing frozen" recs "$W/s3.log" \
   "[r for r in rs if r.get('event') == 'run_start' and r['scope_run'] == {'freeze': False, 'why': 'VAREK_WARDEN_TEST_NO_FREEZE is set'}] and [r for r in rs if r.get('resolved') == '$W/data/r.csv' and r.get('decision_final') == 'DENY' and len(r.get('step_up', '')) == 16 and r.get('unheld') == 'scope=run: VAREK_WARDEN_TEST_NO_FREEZE is set'] and not [r for r in rs if r.get('event') in ('run_frozen', 'run_thawed') or r.get('state') == 'held']"
 audit_ok "$W/s1.txt" "$W/s3.log" && pass "the audit passes it" || flunk "audit s3: $(grep PROBLEM "$W/s3.log.audit" | head -2)"
+
+echo "== 9. step 5: DEFER, a marker, a timeout, escalate, on unknown (as root) =="
+mkdir -p "$W/m"; chown 0:0 "$W/m"; chmod 755 "$W/m"; rm -f "$W/m/ok"
+dstart() {   # dstart POLICY OUT SCRIPT ARGS...: the Warden in the background; RUN once run_start is written
+    local pol="$1" out="$2" scr="$3"; shift 3
+    "$WARDEN" "$pol" -- /bin/bash "$W/bin/$scr" "$@" > "$out.out" 2> "$out.log" &
+    WPID=$!
+    RUN=""; local k
+    for k in $(seq 1 40); do
+        RUN="$(grep -o '"event":"run_start","run":"[0-9a-f]*"' "$out.log" 2>/dev/null | head -1 | sed 's/.*"run":"//; s/"$//')"
+        [ -n "$RUN" ] && break
+        sleep 0.25
+    done
+    SOCK="$(grep -o '/run/varek-approve/[0-9a-f]*\.sock' "$out.log" 2>/dev/null | head -1)"
+}
+wait_ev() {  # wait_ev LOG EVENT: up to 10 s for a record of the event
+    local k; for k in $(seq 1 40); do grep -q "\"event\":\"$2\"" "$1" 2>/dev/null && return 0; sleep 0.25; done; return 1
+}
+marker() { rm -f "$W/m/ok"; printf '%s\n' "$1" > "$W/m/ok"; chown "${2:-0:0}" "$W/m/ok"; chmod "${3:-644}" "$W/m/ok"; }
+printf "${BASE}defer path $W/data/ until=$W/m/ok timeout=20 scope=thread\n" > "$W/d1.txt"
+dstart "$W/d1.txt" "$W/d1" one.sh "$W/data/r.csv"
+wait_ev "$W/d1.log" defer && sleep 0.5
+[ ! -s "$W/d1.out" ] && grep -q '"event":"defer"' "$W/d1.log" && pass "a read a defer rule decides, with no marker, is deferred: held, a defer record" || flunk "no deferral: $(cat "$W/d1.out") / $(tail -3 "$W/d1.log")"
+marker "$RUN"
+wait "$WPID"
+grep -q "r.csv: ok a,b" "$W/d1.out" && pass "a root-owned marker naming the run releases it: allowed" || flunk "after the marker: $(cat "$W/d1.out")"
+check "... the records in order: defer, defer_end resolved (its SHA-256), the read allowed under the marker (cert_defer, checked)" recs "$W/d1.log" \
+  "(lambda i: i[0] < i[1] < i[2])([next(k for k, r in enumerate(rs) if c(r)) for c in (lambda r: r.get('event') == 'defer' and r.get('state') == 'held' and r.get('scope') == 'thread', lambda r: r.get('event') == 'defer_end' and r.get('ending') == 'resolved' and len(r.get('marker_sha256', '')) == 64, lambda r: r.get('resolved') == '$W/data/r.csv' and r.get('decision_final') == 'ALLOW' and r.get('cert_defer') is True and r.get('check') == 'ok' and r.get('defer_marker', {}).get('path') == '$W/m/ok' and len(r.get('defer', '')) == 16)])"
+audit_ok "$W/d1.txt" "$W/d1.log" && pass "the audit passes a deferral its marker resolved" || flunk "audit d1: $(grep PROBLEM "$W/d1.log.audit" | head -2)"
+cp "$W/d1.log" "$W/r1.log"; cp "$W/d1.txt" "$W/p1.txt"
+qforge "a deferral's ending dropped" "recs.remove([r for r in recs if isinstance(r, dict) and r.get('event') == 'defer_end'][0])" "which has not ended resolved"
+qforge "an allow under a marker, its marker not named" "[r.pop('defer_marker') for r in recs if isinstance(r, dict) and r.get('cert_defer')]" "which it does not name"
+qforge "the allow before its deferral's resolved ending" "X = [r for r in recs if isinstance(r, dict) and r.get('cert_defer')][0]; recs.remove(X); recs.insert([i for i, r in enumerate(recs) if isinstance(r, dict) and r.get('event') == 'defer_end'][0], X)" "which has not ended resolved"
+qforge "a marker other than the one that resolved it" "[r['defer_marker'].__setitem__('sha256', '0' * 64) for r in recs if isinstance(r, dict) and r.get('cert_defer')]" "under a marker other than"
+
+marker '*'
+dstart "$W/d1.txt" "$W/d2" one.sh "$W/data/r.csv"
+wait "$WPID"
+grep -q "r.csv: ok a,b" "$W/d2.out" && pass "the marker present before the call: allowed at once" || flunk "marker first: $(cat "$W/d2.out")"
+check "... under the marker, with no deferral" recs "$W/d2.log" \
+  "[r for r in rs if r.get('resolved') == '$W/data/r.csv' and r.get('decision_final') == 'ALLOW' and r.get('cert_defer') is True and 'defer' not in r] and not [r for r in rs if r.get('event') == 'defer']"
+audit_ok "$W/d1.txt" "$W/d2.log" && pass "the audit passes it" || flunk "audit d2: $(grep PROBLEM "$W/d2.log.audit" | head -2)"
+
+printf "${BASE}defer path $W/data/ until=$W/m/ok timeout=2 scope=thread\n" > "$W/d3.txt"
+for v in "the agent's:RUN:65534:65534:644" "group-writable:*:0:0:664" "naming another run:0123456789abcdef0123456789abcdef:0:0:644" "a link:link"; do
+    nm="${v%%:*}"; rest="${v#*:}"
+    rm -f "$W/m/ok" "$W/m/real"
+    if [ "$rest" = link ]; then printf '*\n' > "$W/m/real"; chmod 644 "$W/m/real"; ln -s "$W/m/real" "$W/m/ok"; fi
+    dstart "$W/d3.txt" "$W/d3" one.sh "$W/data/r.csv"
+    if [ "$rest" != link ]; then
+        IFS=: read -r mrun mu mg mm <<<"$rest"
+        [ "$mrun" = RUN ] && mrun="$RUN"
+        marker "$mrun" "$mu:$mg" "$mm"
+    fi
+    wait "$WPID"
+    grep -q "r.csv: no" "$W/d3.out" && recs "$W/d3.log" "[r for r in rs if r.get('event') == 'defer_end' and r.get('ending') == 'timeout']" \
+      && pass "a marker $nm is not accepted: the read stays deferred, refused at the timeout" || flunk "marker $nm: $(cat "$W/d3.out")"
+done
+rm -f "$W/m/ok" "$W/m/real"
+check "... the refusal names the deferral (held), before its ending timeout" recs "$W/d3.log" \
+  "(lambda d, e: d < e)(*[next(i for i, r in enumerate(rs) if c(r)) for c in (lambda r: r.get('held') is True and len(r.get('defer', '')) == 16 and r.get('decision_final') == 'DENY', lambda r: r.get('event') == 'defer_end' and r.get('ending') == 'timeout')])"
+audit_ok "$W/d3.txt" "$W/d3.log" && pass "the audit passes a deferral timed out" || flunk "audit d3: $(grep PROBLEM "$W/d3.log.audit" | head -2)"
+cp "$W/d3.log" "$W/r1.log"; cp "$W/d3.txt" "$W/p1.txt"
+qforge "a timed-out deferral's refusal dropped" "X = [r for r in recs if isinstance(r, dict) and r.get('held') is True][0]; recs.remove(X)
+for r in recs:
+    if isinstance(r, dict) and r.get('seq', -1) > X['seq']: r['seq'] -= 1
+[r for r in recs if isinstance(r, dict) and r.get('event') == 'run_end'][0]['records'] -= 1" "with no record of its call's refusal before"
+
+DL="$(printf "${BASE}" | wc -l)"; DL=$((DL + 1))
+printf "${BASE}defer path $W/data/ until=$W/m/ok timeout=2 scope=thread escalate\n" > "$W/d4.txt"
+hstart "$W/d4.txt" "$W/d4" one.sh "$W/data/r.csv"
+D4="$(wait_prop)"
+o="$(apv 0 0 pending)"
+grep -q "step_up line $DL\\\\nallow path exact $W/data/r.csv" <<<"$o" && pass "escalate: at its timeout the deferral becomes a proposal under the defer rule" || flunk "escalation: $D4 / $o"
+apv 0 0 "approve $D4" > /dev/null; wait "$WPID"
+grep -q "r.csv: ok a,b" "$W/d4.out" && pass "... approved, the read is allowed under the grant" || flunk "escalated approval: $(cat "$W/d4.out")"
+check "... the records: defer, defer_end escalated naming the proposal, its step_up record, the read under the grant" recs "$W/d4.log" \
+  "(lambda i: i[0] < i[1] < i[2] < i[3])([next(k for k, r in enumerate(rs) if c(r)) for c in (lambda r: r.get('event') == 'defer' and r.get('escalate') is True, lambda r: r.get('event') == 'defer_end' and r.get('ending') == 'escalated' and r.get('step_up') == '$D4', lambda r: r.get('event') == 'step_up' and r.get('id') == '$D4' and r.get('state') == 'held', lambda r: r.get('resolved') == '$W/data/r.csv' and r.get('decision_final') == 'ALLOW' and r.get('cert_grant'))])"
+audit_ok "$W/d4.txt" "$W/d4.log" && pass "the audit passes an escalated deferral" || flunk "audit d4: $(grep PROBLEM "$W/d4.log.audit" | head -2)"
+cp "$W/d4.log" "$W/r1.log"; cp "$W/d4.txt" "$W/p1.txt"
+qforge "an escalation's proposal record dropped" "recs.remove([r for r in recs if isinstance(r, dict) and r.get('event') == 'step_up'][0])" "whose step_up record does not follow"
+
+UL="$(printf "${BASE}" | wc -l)"; UL=$((UL + 1))
+printf "${BASE}on unknown defer escalate timeout=20 scope=thread\n" > "$W/u1.txt"
+hstart "$W/u1.txt" "$W/u1" one.sh "$W/data/r.csv"
+# the read no rule holds: its proposal at once. bash's own such calls (a tty, its directories) are denied
+U1=""; UT=""
+for k in $(seq 1 40); do
+    o="$(apv 0 0 pending)"
+    while read -r ln; do
+        case "$ln" in "{"*) ;; *) continue ;; esac
+        id="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["id"])' "$ln")"
+        if grep -q "allow path exact $W/data/r.csv" <<<"$ln"; then U1="$id"; UT="$ln"; else apv 0 0 "deny $id" > /dev/null; fi
+    done <<<"$o"
+    [ -n "$U1" ] && break
+    sleep 0.25
+done
+grep -q "step_up line $UL\\\\n" <<<"$UT" && pass "on unknown defer escalate: a read no rule names is held, its proposal at once under the on unknown line" || flunk "on unknown: ${UT:-none} / $(tail -3 "$W/u1.log")"
+apv 0 0 "approve $U1" > /dev/null; wait "$WPID"
+grep -q "r.csv: ok a,b" "$W/u1.out" && pass "... approved, the read is allowed" || flunk "on unknown approval: $(cat "$W/u1.out")"
+check "... a defer record (unknown), escalated at once, the read under the grant with no policy rule (cert_rule -1, checked)" recs "$W/u1.log" \
+  "[r for r in rs if r.get('event') == 'defer' and r.get('unknown') is True and r.get('resolved') == '$W/data/r.csv'] and [r for r in rs if r.get('event') == 'defer_end' and r.get('ending') == 'escalated' and r.get('step_up') == '$U1'] and [r for r in rs if r.get('resolved') == '$W/data/r.csv' and r.get('decision_final') == 'ALLOW' and r.get('cert_rule') == -1 and r.get('cert_grant') and r.get('check') == 'ok']"
+audit_ok "$W/u1.txt" "$W/u1.log" && pass "the audit passes it (the grant re-checked under the on unknown line)" || flunk "audit u1: $(grep PROBLEM "$W/u1.log.audit" | head -2)"
+
+printf "${BASE}allow path $W/m/\ndefer path $W/data/ until=$W/m/ok\n" > "$W/d5.txt"
+o="$("$WARDEN" "$W/d5.txt" --check-startup 2>&1)"
+grep -q "could write the defer rule's marker" <<<"$o" && pass "a policy whose marker the agent could write is refused at start" || flunk "writable marker: $o"
+
+# the default scope (run): the run frozen while the call is deferred, where it can be
+printf "${FB}defer path $W/data/ until=$W/m/ok timeout=20\n" > "$W/d6.txt"
+rm -f "$W/out/n" "$W/m/ok"
+dstart "$W/d6.txt" "$W/d6" tick.sh "$W/data/r.csv" "$W/out"
+if grep -q "freeze the run's control group" "$W/d6.log"; then
+    wait_ev "$W/d6.log" defer
+    a="$(cnt)"; sleep 1.2; b="$(cnt)"
+    [ "$a" -gt 0 ] && [ "$a" = "$b" ] && pass "a deferral with the default scope (run) freezes the run ($a)" || flunk "deferral freeze: $a -> $b"
+    marker "$RUN"; wait "$WPID"
+    grep -q "held: ok a,b" "$W/d6.out" && grep -q "counted: 40" "$W/d6.out" && pass "... the marker releases it, then the run is thawed" || flunk "deferral thaw: $(cat "$W/d6.out")"
+    check "... records: defer (scope run), run_frozen, defer_end resolved, the read allowed, run_thawed" recs "$W/d6.log" \
+      "(lambda i: i[0] < i[1] < i[2] < i[3] < i[4])([next(k for k, r in enumerate(rs) if c(r)) for c in (lambda r: r.get('event') == 'defer' and r.get('scope') == 'run', lambda r: r.get('event') == 'run_frozen', lambda r: r.get('event') == 'defer_end' and r.get('ending') == 'resolved', lambda r: r.get('resolved') == '$W/data/r.csv' and r.get('cert_defer') is True, lambda r: r.get('event') == 'run_thawed')])"
+    audit_ok "$W/d6.txt" "$W/d6.log" && pass "the audit passes it" || flunk "audit d6: $(grep PROBLEM "$W/d6.log.audit" | head -2)"
+else
+    printf '  %-6s %s\n' SKIP "a deferral freezing the run: this host cannot ($(grep -o 'cannot freeze the run: [^;]*' "$W/d6.log" | head -1))"
+    wait "$WPID"
+fi
+rm -f "$W/m/ok"
 
 fi
 

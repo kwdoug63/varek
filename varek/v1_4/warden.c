@@ -293,6 +293,9 @@ struct action {
     int           grant;                /* v1.42: 1 + the live grant that allowed it, 0: none */
     int           grant_rule;           /* v1.42: the deciding rule in that grant */
     char          gcert[600];           /* v1.42: the certificate's second half, as record fields */
+    bool          defer_ok;             /* v1.42 step 5: allowed under a defer rule, its marker passing */
+    char          df_sha[65];           /* ... the marker's SHA-256 */
+    bool          unk;                  /* v1.42 step 5: held under `on unknown defer escalate` */
     int           connect_family;
     int           connect_port;
     /* v1.21: decided connections and relayed sends */
@@ -571,11 +574,20 @@ static int policy_load(const char *path, struct policy *p) {
             /* v1.42: a step_up rule and its options */
             ci.step_up != (r->verb == VDP_STEP_UP) || ci.su_mode != r->su_mode || ci.su_scope != r->su_scope ||
             ci.su_timeout != r->su_timeout || strcmp(ci.su_approvers, r->su_approvers) ||
-            strcmp(ci.su_notify, r->su_notify)) {
+            strcmp(ci.su_notify, r->su_notify) ||
+            /* v1.42 step 5: a defer rule, its marker and escalate */
+            ci.defer != (r->verb == VDP_DEFER) || ci.su_escalate != r->su_escalate || strcmp(ci.df_until, r->df_until)) {
             fprintf(stderr, "[warden] policy %s:%d: the decision procedure and the certificate "
                     "checker read this rule differently; refusing to start\n", path, r->line);
             return -1;
         }
+    }
+    /* v1.42 step 5: and the `on unknown` line */
+    if (p->v.unk_line != p->c.unk_line || p->v.unk_timeout != p->c.unk_timeout ||
+        p->v.unk_scope != (uint8_t)p->c.unk_scope || strcmp(p->v.unk_approvers, p->c.unk_approvers)) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read the "
+                "`on unknown` line differently; refusing to start\n", path);
+        return -1;
     }
     /* v1.26: and the proxy directives */
     bool proxy_same = p->v.proxy == (p->c.proxy != 0) && p->v.proxy_nports == p->c.proxy_nports;
@@ -1313,6 +1325,7 @@ static void hold_round(int notify_fd);
 static void hold_cur(const struct seccomp_notif *req);
 static bool hold_replay_pop(struct seccomp_notif *req);
 static void held_check(void);
+static bool df_marker(const vdp_rule_t *r, char sha[65], char *why, size_t wn);   /* v1.42 step 5 */
 
 static decision_t policy_decide(const struct policy *p, struct action *a)
 {
@@ -1328,6 +1341,8 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
     a->why = NULL;
     a->grant = 0;                        /* v1.42 */
     a->grant_rule = -1;
+    a->defer_ok = false;                 /* v1.42 step 5 */
+    a->df_sha[0] = '\0';
     /* v1.28 step 4: after `varek revoke`, nothing more is allowed */
     if (g_revoked) { a->why = "revoked"; return DEC_DENY; }
     vdp_kind_t kind;
@@ -1373,6 +1388,12 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
     a->why = vdp_why_name(why);
     a->rule_index = ri;
     if (ri >= 0) a->policy_line = p->v.rules[ri].line;
+    /* v1.42 step 5: a defer rule allows the call while its marker passes
+     * (certify then has the checker confirm the defer rule decides it) */
+    if (v == VDP_UNSATISFIED && ri >= 0 && p->v.rules[ri].verb == VDP_DEFER) {
+        char mw[160];
+        if (df_marker(&p->v.rules[ri], a->df_sha, mw, sizeof mw)) { a->defer_ok = true; return DEC_ALLOW; }
+    }
     switch (v) {
         case VDP_SATISFIED:   return DEC_ALLOW;
         case VDP_UNSATISFIED: return DEC_DENY;
@@ -1462,8 +1483,21 @@ static bool certify(const struct policy *p, struct action *a) {
      * attribution (not the procedure's), recorded when it is not the agent */
     int subj = act_policy_subject(a);
     if (subj && (size_t)n < sizeof a->cert) snprintf(a->cert + n, sizeof a->cert - (size_t)n, ",\"cert_subject\":%d", subj);
+    /* v1.42 step 5: an ALLOW under a defer rule, its marker passing: the
+     * checker confirms the defer rule decides the call; the marker is named */
+    if (a->defer_ok) {
+        const char *mp = a->rule_index >= 0 ? p->v.rules[a->rule_index].df_until : "";
+        size_t gn = (size_t)snprintf(a->gcert, sizeof a->gcert, ",\"cert_defer\":true,\"defer_marker\":{\"path\":\"");
+        for (const char *q = mp; *q && gn + 8 < sizeof a->gcert; q++) {
+            if (*q == '"' || *q == '\\') a->gcert[gn++] = '\\';
+            a->gcert[gn++] = *q;
+        }
+        snprintf(a->gcert + gn, sizeof a->gcert - gn, "\",\"sha256\":\"%s\"}", a->df_sha);
+    }
     /* v1.42: an ALLOW under a grant: the checker verifies both halves */
-    if (a->grant > 0 ? !grant_certify(p, a, subj, kind, s, has_flags, &cc) :
+    if (a->defer_ok ? !vdpc_check_defer(&p->c, subj, kind, s, strlen(s), vdp_oflags_from_native((uint32_t)a->open_flags),
+                                        has_flags, &cc, a->check_why, sizeof a->check_why) :
+        a->grant > 0 ? !grant_certify(p, a, subj, kind, s, has_flags, &cc) :
         !vdpc_check_subj(&p->c, subj, kind, s, strlen(s), vdp_oflags_from_native((uint32_t)a->open_flags), has_flags, &cc,
                          a->check_why, sizeof a->check_why)) {
         for (char *q = a->check_why; *q; q++)          /* recorded inside a JSON string */
@@ -3151,7 +3185,7 @@ static void emit_pathology(uint64_t seq,
     if (checkpoints_on() && g_since_ckpt >= g_ckpt_every) emit_checkpoint();
     if (a->dry) d_final = DEC_DENY;      /* v1.29: a call a dry run let through was refused by the policy */
     /* v1.42: a refusal by a step_up rule proposes a grant, which the record names */
-    char su_json[200];
+    char su_json[480];
     step_up_note(a, d_raw, d_final, su_json, sizeof su_json);
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

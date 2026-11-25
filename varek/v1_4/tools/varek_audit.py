@@ -405,7 +405,7 @@ def policy_rules(checker, policy):
         f = ln.split()
         if len(f) != 11:
             raise ValueError(f"unexpected checker output {ln!r}")
-        out.append({"kind": f[0], "allow": f[1] == "a", "step_up": f[1] == "s", "name": f[2] == "n", "mask": f[3],
+        out.append({"kind": f[0], "allow": f[1] == "a", "step_up": f[1] == "s", "defer": f[1] == "f", "name": f[2] == "n", "mask": f[3],
                      "value": f[4], "wild": f[5] == "w", "line": int(f[6]), "names": int(f[7]),
                      "rate": int(f[8]), "max_body": int(f[9]),
                      "c": "" if f[10] == "=" else bytes.fromhex(f[10]).decode("latin-1")})
@@ -619,7 +619,18 @@ class GrantsCheck:
     (run_frozen) right after the hold that began it, and the thaw
     (run_thawed) only once no call held with scope=run is open, and after
     an approved one is decided again; the run does not end frozen. A call
-    refused at once because the run cannot be frozen says why (unheld)."""
+    refused at once because the run cannot be frozen says why (unheld).
+
+    v1.42 step 5 (DEFER): a deferral (`defer`, held) has a unique id and
+    ends once (`defer_end`: resolved, with its marker's SHA-256; timeout;
+    escalated, naming the step_up proposal whose record comes next;
+    abandoned). A held deferral timed out was refused (its record naming it,
+    held) before its ending; one resolved is decided again after its ending,
+    allowed only under its marker (cert_defer, defer_marker, the same
+    SHA-256). An ALLOW under a marker with no deferral names the marker
+    too, and its certificate is re-checked as a defer rule's (MainLoop's row
+    ends in `defer`). A deferral with scope=run freezes the run as a held
+    step_up call does."""
 
     def __init__(self, run, problems, rs=None):
         self.run, self.problems = run, problems
@@ -629,6 +640,9 @@ class GrantsCheck:
         self.await_frz = None                # a hold with scope=run whose run_frozen comes next
         self.runheld = set()                 # held with scope=run, not yet thawed after
         self.replays = set()                 # approved, held with scope=run: decided again before the thaw
+        self.defers = {}                     # v1.42 step 5: deferral id -> its state
+        self.await_prop = None               # an escalated deferral's proposal, whose step_up record comes next
+        self.ndefer = 0
         self.props = {}                      # id -> {"seq", "ended", "text"}
         self.named = {}                      # proposal id named by a decision -> its seq
         self.grants = {}                     # id -> {"index", "count", "until", "run", "used", "text"}
@@ -659,9 +673,21 @@ class GrantsCheck:
             self.problems.append(f"step_up {self.await_frz}: held with scope=run, but no run_frozen follows it")
         self.await_frz = None
 
+    def _prop_due(self):
+        if self.await_prop is not None:
+            self.problems.append(f"a deferral escalated to proposal {self.await_prop}, whose step_up record does not "
+                                 f"follow its ending")
+        self.await_prop = None
+
+    def _ended(self, sid):
+        x = self.props.get(sid) or self.defers.get(sid)
+        return x is None or x["ended"]
+
     def rec(self, r):
         p = self.problems
         self._freeze_due()
+        self._prop_due()
+        self._defer_rec(r)
         if "unheld" in r and (not isinstance(r.get("unheld"), str) or r.get("decision_final") == "ALLOW" or
                               "step_up" not in r):
             p.append(f"seq {r.get('seq')}: an unheld note on a call not refused by a step_up rule")
@@ -672,7 +698,7 @@ class GrantsCheck:
             elif str(r.get("step_up_why", "")).startswith("held and approved"):
                 self.replays.pop()
         if "step_up" in r:
-            if r.get("decision_final") == "ALLOW" or r.get("decision_raw") != "DENY":
+            if r.get("decision_final") == "ALLOW" or r.get("decision_raw") not in ("DENY", "UNKNOWN"):
                 p.append(f"seq {r.get('seq')}: a step_up proposal on a call not refused by a step_up rule")
             sid = r.get("step_up")
             if sid != "none":
@@ -711,12 +737,105 @@ class GrantsCheck:
         if g["run"] and g["run"] != self.run:
             p.append(f"seq {r.get('seq')}: grant {cg[:16]} is for run {g['run']!r}, not this one")
 
+    def _defer_rec(self, r):
+        """v1.42 step 5: a decision record's deferral fields"""
+        p, d = self.problems, r.get("defer")
+        seq = r.get("seq")
+        if r.get("cert_defer") is True:
+            m = r.get("defer_marker")
+            if r.get("decision_final") != "ALLOW":
+                pass
+            elif not isinstance(m, dict) or not isinstance(m.get("path"), str) or \
+                    not re.fullmatch(r"[0-9a-f]{64}", str(m.get("sha256", ""))):
+                p.append(f"seq {seq}: allowed under a defer rule's marker, which it does not name")
+        elif r.get("decision_final") == "ALLOW" and d is not None and d != "none":
+            p.append(f"seq {seq}: allowed after deferral {d!r}, but not under its marker")
+        if d is None:
+            return
+        if d == "none":
+            if not isinstance(r.get("defer_why"), str) or r.get("decision_final") == "ALLOW":
+                p.append(f"seq {seq}: a defer note on a call not refused")
+            return
+        df = self.defers.get(d)
+        if r.get("held") is True:
+            if df is None or df["ended"] or df["refused"] or r.get("decision_final") == "ALLOW":
+                p.append(f"seq {seq}: a deferred call's refusal naming {d!r}, which is not a deferral open and not yet "
+                         f"refused")
+            else:
+                df["refused"] = True
+            return
+        if df is None or df["ending"] != "resolved" or df["decided"]:
+            p.append(f"seq {seq}: decided again after deferral {d!r}, which has not ended resolved (or was decided "
+                     f"again already)")
+            return
+        df["decided"] = True
+        self.replays.discard(d)
+        if r.get("decision_final") == "ALLOW":
+            m = r.get("defer_marker")
+            if not isinstance(m, dict) or m.get("sha256") != df["sha"]:
+                p.append(f"seq {seq}: allowed after deferral {d}, under a marker other than the one that resolved it")
+
     def ev(self, e):
         p = self.problems
         ev = e.get("event")
         if ev != "run_frozen":
             self._freeze_due()
+        if not (ev == "step_up" and self.await_prop is not None and e.get("id") == self.await_prop):
+            self._prop_due()
+        else:
+            self.await_prop = None
+        if ev == "defer":                     # v1.42 step 5
+            did = e.get("id")
+            if not isinstance(did, str) or did in self.defers or did in self.props:
+                p.append(f"a defer record with a malformed or repeated id {did!r}")
+                return
+            if e.get("state") != "held":
+                p.append(f"defer {did}: a state the Warden does not write")
+            sc = e.get("scope")
+            self.defers[did] = {"ended": False, "ending": None, "refused": False, "decided": False, "sha": None,
+                                "unknown": e.get("unknown") is True, "escalate": e.get("escalate") is True}
+            self.ndefer += 1
+            if sc not in ("run", "thread"):
+                p.append(f"defer {did}: held with a scope the Warden does not write ({sc!r})")
+            elif sc == "run":
+                if not self.can_freeze:
+                    p.append(f"defer {did}: held with scope=run, where run_start says the run cannot be frozen")
+                self.runheld.add(did)
+                if not self.frozen:
+                    self.await_frz = did
+            return
+        if ev == "defer_end":
+            did, end = e.get("id"), e.get("ending")
+            df = self.defers.get(did)
+            if df is None or df["ended"]:
+                p.append(f"defer_end for {did!r}, which is not an open deferral")
+                return
+            df["ended"], df["ending"] = True, end
+            if end == "resolved":
+                if df["unknown"]:
+                    p.append(f"defer_end for {did}: resolved, but nothing resolves a call deferred as UNKNOWN")
+                sha = e.get("marker_sha256")
+                if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+                    p.append(f"defer_end for {did}: resolved, with no marker's SHA-256")
+                df["sha"] = sha
+                if did in self.runheld:
+                    self.replays.add(did)
+            elif end == "timeout":
+                if not df["refused"]:
+                    p.append(f"defer_end for {did}: timed out, with no record of its call's refusal before")
+            elif end == "escalated":
+                sid = e.get("step_up")
+                if not df["escalate"]:
+                    p.append(f"defer_end for {did}: escalated, but its rule does not escalate")
+                if not isinstance(sid, str):
+                    p.append(f"defer_end for {did}: escalated to no proposal")
+                else:
+                    self.await_prop = sid
+            elif end != "abandoned":
+                p.append(f"defer_end for {did}: an ending {end!r} the Warden does not write")
+            return
         if ev == "run_frozen":               # v1.42 step 4
+            self._prop_due()
             if self.frozen:
                 p.append("run_frozen while the run was frozen already")
             elif self.await_frz is None or e.get("step_up") != self.await_frz:
@@ -727,7 +846,7 @@ class GrantsCheck:
             if not self.frozen:
                 p.append("run_thawed while the run was not frozen")
             for sid in sorted(self.runheld):
-                if not self.props[sid]["ended"]:
+                if not self._ended(sid):
                     p.append(f"run_thawed while {sid}, held with scope=run, was still held")
             if self.replays:
                 p.append(f"run_thawed before {sorted(self.replays)[0]}, approved and held with scope=run, was "
@@ -811,6 +930,11 @@ class GrantsCheck:
 
     def finish(self, complete):
         self._freeze_due()
+        self._prop_due()
+        if complete:
+            for did, df in self.defers.items():
+                if not df["ended"]:
+                    self.problems.append(f"defer {did}: never ended")
         if complete and self.frozen:
             self.problems.append("the run ended frozen (no run_thawed after its last run_frozen)")
         for sid, seq in self.named.items():
@@ -822,6 +946,8 @@ class GrantsCheck:
 
     def row(self, rec):
         """MainLoop's certificate row's grant part, or None"""
+        if rec.get("cert_defer") is True:                  # v1.42 step 5: a defer rule's certificate
+            return " defer"
         cg = rec.get("cert_grant")
         if cg is None:
             return ""
@@ -1288,7 +1414,7 @@ def path_rule_writable(r):
     access mode of write or read-write, O_TRUNC or O_CREAT)? As the Warden
     reads it (warden_noexec.inc.c): the flags the rule requires, the rest
     free."""
-    if r["kind"] != "p" or not (r["allow"] or r.get("step_up")):    # v1.42: a step_up rule writes under a grant
+    if r["kind"] != "p" or not (r["allow"] or r.get("step_up") or r.get("defer")):    # v1.42: a step_up rule writes under a grant (step 5: a defer rule under its marker)
         return False
     mask, value = int(r["mask"], 16), int(r["value"], 16)      # the checker prints them in hex
     for c in (1, 2, O_TRUNC, O_CREAT, 1 | O_TRUNC, 2 | O_TRUNC, 1 | O_CREAT, 2 | O_CREAT,
@@ -4749,8 +4875,10 @@ class MainLoop:
             problems.append(f"seq {rec.get('seq')}: authorized open of {rec.get('resolved')!r} "
                             f"without an accepted certificate")
             return
-        if prules and (type(cr) is not int or not 0 <= cr < len(prules) or
-                       rec.get("policy_line") != prules[cr]["line"]):
+        # v1.42 step 5: a grant under the `on unknown` line has no policy rule (cert_rule -1, policy_line -1)
+        unk_grant = cr == -1 and rec.get("cert_grant") is not None and rec.get("policy_line") == -1
+        if prules and not unk_grant and (type(cr) is not int or not 0 <= cr < len(prules) or
+                                         rec.get("policy_line") != prules[cr]["line"]):
             # v1.31 review: the line a decision cites is its certificate's rule's
             self.cited.append(f"seq {rec.get('seq')}: a decision citing policy line {rec.get('policy_line')!r}, "
                             f"but its certificate's rule is "

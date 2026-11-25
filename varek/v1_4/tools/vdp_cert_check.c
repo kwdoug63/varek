@@ -323,7 +323,7 @@ args_ok:;
             vdpc_rule_info_t ri;
             vdpc_rule_info(&pol, i, &ri);
             printf("%c %c %c %x %x %c %d %u %u %u ", ri.kind == VDPC_PATH ? 'p' : ri.kind == VDPC_HOST ? 'h' : ri.kind == VDPC_REQUEST ? 'r' : ri.kind == VDPC_MCP ? 'm' : 'e',
-                   ri.allow ? 'a' : ri.step_up ? 's' : 'd', ri.name ? 'n' : '-', (unsigned)ri.mask, (unsigned)ri.value,
+                   ri.allow ? 'a' : ri.step_up ? 's' : ri.defer ? 'f' : 'd', ri.name ? 'n' : '-', (unsigned)ri.mask, (unsigned)ri.value,
                    ri.wild ? 'w' : '-', ri.line, (unsigned)ri.names, (unsigned)ri.rate,
                    (unsigned)ri.max_body);
             for (size_t k = 0; k < ri.clen; k++) printf("%02x", (unsigned char)ri.c[k]);
@@ -440,10 +440,13 @@ args_ok:;
         char *sj = strtok_r(NULL, " ", &save);          /* v1.31: @N, the calling subject (default @0) */
         /* v1.42: grant=G:RULE:WITNESS, an ALLOW under grant G (its index on
          * the command line): RULE and WITNESS are the grant's half */
+        /* v1.42 step 5: `defer`, an ALLOW under a defer rule whose marker passed */
         char *gs = NULL;
-        if (sj && !strncmp(sj, "grant=", 6)) { gs = sj; sj = NULL; }
+        if (sj && (!strncmp(sj, "grant=", 6) || !strcmp(sj, "defer"))) { gs = sj; sj = NULL; }
         else gs = strtok_r(NULL, " ", &save);
-        if (gs && strncmp(gs, "grant=", 6)) { printf("{\"check\":\"error\",\"why\":\"bad input line\"}\n"); continue; }
+        if (gs && strncmp(gs, "grant=", 6) && strcmp(gs, "defer")) { printf("{\"check\":\"error\",\"why\":\"bad input line\"}\n"); continue; }
+        bool dfr = gs && !strcmp(gs, "defer");
+        if (dfr) gs = NULL;
         if (hx && !strcmp(hx, "=")) hx = (char *)"";   /* empty string */
         int kind = !k ? -1 : !strcmp(k, "path") ? VDPC_PATH : !strcmp(k, "host") ? VDPC_HOST
                  : !strcmp(k, "exec") ? VDPC_EXEC : !strcmp(k, "request") ? VDPC_REQUEST
@@ -501,7 +504,9 @@ args_ok:;
             } else gc.r = (int)gr;
             if (parse_witness(e2 + 1, &gc) < 0) { printf("{\"check\":\"error\",\"why\":\"bad grant witness\"}\n"); continue; }
             ok = vdpc_check_grant(&pol, &grants[gi], (int)subj, kind, s, sl, flags, has_flags, &c, &gc, why, sizeof why);
-        } else
+        } else if (dfr)
+            ok = vdpc_check_defer(&pol, (int)subj, kind, s, sl, flags, has_flags, &c, why, sizeof why);
+        else
             ok = vdpc_check_subj(&pol, (int)subj, kind, s, sl, flags, has_flags, &c, why, sizeof why);
         if (ok) {
             printf("{\"check\":\"ok\"}\n");
