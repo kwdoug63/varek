@@ -165,6 +165,7 @@ const char *vdp_verb_name(vdp_verb_t v) {
         case VDP_ALLOW:   return "allow";
         case VDP_DENY:    return "deny";
         case VDP_STEP_UP: return "step_up";
+        case VDP_DEFER:   return "defer";
     }
     return "?";
 }
@@ -1034,6 +1035,87 @@ static bool https_url_ok(const char *u, size_t max) {
     return true;
 }
 
+/* v1.42: a step_up or defer rule's option (and the `on unknown` line's):
+ * its kind, or -1 when tok is none (a rule's own token) */
+enum { SUO_MODE, SUO_APPROVERS, SUO_TIMEOUT, SUO_SCOPE, SUO_NOTIFY, SUO_UNTIL, SUO_ESCALATE, SUO_N };
+static int su_option_kind(const char *o) {
+    return !strncmp(o, "mode=", 5) ? SUO_MODE : !strncmp(o, "approvers=", 10) ? SUO_APPROVERS :
+           !strncmp(o, "timeout=", 8) ? SUO_TIMEOUT : !strncmp(o, "scope=", 6) ? SUO_SCOPE :
+           !strncmp(o, "notify=", 7) ? SUO_NOTIFY : !strncmp(o, "until=", 6) ? SUO_UNTIL :
+           !strcmp(o, "escalate") ? SUO_ESCALATE : -1;
+}
+
+/* v1.42 step 5: a marker's path: absolute, 2 to VDP_DF_UNTIL_MAX bytes of
+ * 0x21 to 0x7e, no empty, `.` or `..` component, not ending in '/' */
+static bool until_path_ok(const char *v) {
+    size_t l = strlen(v);
+    if (l < 2 || l > VDP_DF_UNTIL_MAX || v[0] != '/' || v[l - 1] == '/') return false;
+    for (size_t i = 0; i < l; i++) if ((unsigned char)v[i] < 0x21 || (unsigned char)v[i] > 0x7e) return false;
+    for (const char *c = v; c; c = strchr(c + 1, '/')) {
+        const char *e = strchr(c + 1, '/');
+        size_t cl = e ? (size_t)(e - c - 1) : strlen(c + 1);
+        if (cl == 0 || (cl == 1 && c[1] == '.') || (cl == 2 && c[1] == '.' && c[2] == '.')) return false;
+    }
+    return true;
+}
+
+/* v1.42: read the options tok[0..n) of a step_up rule (verb VDP_STEP_UP:
+ * mode=, approvers=, timeout=, scope=, notify=), a defer rule (VDP_DEFER:
+ * until=, approvers=, timeout=, scope=, escalate) or the `on unknown defer`
+ * line (unknown: approvers=, timeout=, scope=, escalate) into r. NULL, or
+ * why not. */
+static const char *su_options(char *const *tok, int n, vdp_verb_t verb, vdp_rule_t *r, bool unknown) {
+    bool seen[SUO_N] = { false };
+    for (int i = 0; i < n; i++) {
+        const char *o = tok[i];
+        int k = su_option_kind(o);
+        if (k < 0) return "an option the line does not take";
+        bool ok = verb == VDP_STEP_UP ? k <= SUO_NOTIFY
+                : unknown ? (k == SUO_APPROVERS || k == SUO_TIMEOUT || k == SUO_SCOPE || k == SUO_ESCALATE)
+                          : (k == SUO_APPROVERS || k == SUO_TIMEOUT || k == SUO_SCOPE || k == SUO_UNTIL ||
+                             k == SUO_ESCALATE);
+        if (!ok) return verb == VDP_STEP_UP ? "until= and escalate are a defer rule's"
+                                            : "mode= and notify= are a step_up rule's";
+        if (seen[k]) return "an option given twice";
+        seen[k] = true;
+        const char *v = k == SUO_ESCALATE ? "" : strchr(o, '=') + 1;
+        if (k == SUO_MODE) {
+            if (!strcmp(v, "grant")) r->su_mode = VDP_SU_GRANT;
+            else if (!strcmp(v, "hold")) r->su_mode = VDP_SU_HOLD;
+            else return "mode= is grant or hold";
+        } else if (k == SUO_APPROVERS) {
+            /* a Unix group name, as useradd(8) allows */
+            size_t vl = strlen(v);
+            bool g = vl >= 1 && vl <= 32 && ((v[0] >= 'a' && v[0] <= 'z') || v[0] == '_');
+            for (size_t j = 1; g && j < vl; j++)
+                g = (v[j] >= 'a' && v[j] <= 'z') || (v[j] >= '0' && v[j] <= '9') ||
+                    v[j] == '_' || v[j] == '-' || (v[j] == '$' && j == vl - 1);
+            if (!g) return "approvers= is a Unix group name ([a-z_][a-z0-9_-]{0,31})";
+            memcpy(r->su_approvers, v, vl + 1);
+        } else if (k == SUO_TIMEOUT) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long t = v[0] >= '1' && v[0] <= '9' ? strtoul(v, &end, 10) : 0;
+            if (!end || *end || errno || t < 1 || t > VDP_SU_TIMEOUT_MAX) return "timeout= is 1 to 3600 seconds";
+            r->su_timeout = (uint32_t)t;
+        } else if (k == SUO_SCOPE) {
+            if (!strcmp(v, "thread")) r->su_scope = VDP_SCOPE_THREAD;
+            else if (!strcmp(v, "run")) r->su_scope = VDP_SCOPE_RUN;
+            else return "scope= is thread or run";
+        } else if (k == SUO_NOTIFY) {
+            if (!https_url_ok(v, VDP_SU_NOTIFY_MAX)) return "notify= is an https:// URL of at most 512 bytes";
+            memcpy(r->su_notify, v, strlen(v) + 1);
+        } else if (k == SUO_UNTIL) {
+            if (!until_path_ok(v))
+                return "until= is an absolute path of at most 255 bytes of 0x21 to 0x7e, with no empty, . or .. part";
+            memcpy(r->df_until, v, strlen(v) + 1);
+        } else {
+            r->su_escalate = true;
+        }
+    }
+    return NULL;
+}
+
 /* v1.28.1: a SPIFFE trust domain, [a-z0-9._-]{1,255}, starting with a
  * letter or a digit. */
 static bool spiffe_domain_ok(const char *d) {
@@ -1240,6 +1322,7 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
     int lineno = 0;
     int rc = 0;
     int req_maj = 0, req_min = 0;       /* highest `require warden` seen so far */
+    bool seen_unknown = false;          /* v1.42 step 5: an `on unknown` line */
     int legacy_name_line = 0;           /* v1.24: a host name read before `require warden 1.24` */
     size_t glob_tokens = 0;
     while ((got = getline(&line, &cap, f)) >= 0) {
@@ -1281,6 +1364,33 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             }
             if (p->require_plan) { rc = perr(err, errlen, path, lineno, "`require plan` given twice"); break; }
             p->require_plan = true;
+            continue;
+        }
+        /* v1.42 step 5: on unknown deny | on unknown defer escalate [timeout=N] [scope=..] [approvers=G] */
+        if (!strcmp(tok[0], "on") && nt >= 2 && !strcmp(tok[1], "unknown")) {
+            if (!(req_maj > 1 || (req_maj == 1 && req_min >= 42))) {
+                rc = perr(err, errlen, path, lineno, "`on unknown` needs `require warden 1.42` before it");
+                break;
+            }
+            if (p->unk_line || seen_unknown) { rc = perr(err, errlen, path, lineno, "`on unknown` given twice"); break; }
+            seen_unknown = true;
+            if (nt == 3 && !strcmp(tok[2], "deny")) continue;
+            if (nt < 3 || strcmp(tok[2], "defer")) {
+                rc = perr(err, errlen, path, lineno, "need: on unknown deny, or on unknown defer escalate [timeout=N] "
+                          "[scope=thread|run] [approvers=GROUP]");
+                break;
+            }
+            vdp_rule_t o;
+            memset(&o, 0, sizeof o);
+            o.su_scope = VDP_SCOPE_RUN;
+            const char *why = su_options(tok + 3, nt - 3, VDP_DEFER, &o, true);
+            if (!why && !o.su_escalate)
+                why = "on unknown defer needs escalate: nothing but a person can resolve an UNKNOWN call";
+            if (why) { rc = perr(err, errlen, path, lineno, "%s", why); break; }
+            p->unk_line = lineno;
+            p->unk_timeout = o.su_timeout;
+            p->unk_scope = o.su_scope;
+            memcpy(p->unk_approvers, o.su_approvers, sizeof p->unk_approvers);
             continue;
         }
         /* v1.42: max_held N, max_pending N */
@@ -1637,56 +1747,24 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
         if      (!strcmp(tok[0], "allow")) r->verb = VDP_ALLOW;
         else if (!strcmp(tok[0], "deny"))  r->verb = VDP_DENY;
         else if (!strcmp(tok[0], "step_up")) r->verb = VDP_STEP_UP;     /* v1.42 */
+        else if (!strcmp(tok[0], "defer")) r->verb = VDP_DEFER;         /* v1.42 step 5 */
         else { rc = perr(err, errlen, path, lineno, "unknown verb %s", tok[0]); break; }
         /* v1.42: a step_up rule's options come last, after the rule's own:
-         * mode=, approvers=, timeout=, scope=, notify= */
-        if (r->verb == VDP_STEP_UP) {
+         * mode=, approvers=, timeout=, scope=, notify=. v1.42 step 5: a
+         * defer rule's: until= (required), approvers=, timeout=, scope=
+         * (default run), escalate; it is held (mode hold). */
+        if (r->verb == VDP_STEP_UP || r->verb == VDP_DEFER) {
             if (!(req_maj > 1 || (req_maj == 1 && req_min >= 42))) {
-                rc = perr(err, errlen, path, lineno, "a step_up rule needs `require warden 1.42` before it");
+                rc = perr(err, errlen, path, lineno, "a %s rule needs `require warden 1.42` before it", tok[0]);
                 break;
             }
-            const char *why = NULL;
-            bool seen[5] = { false };
-            while (nt > 3 && !why) {
-                const char *o = tok[nt - 1];
-                int k = !strncmp(o, "mode=", 5) ? 0 : !strncmp(o, "approvers=", 10) ? 1 :
-                        !strncmp(o, "timeout=", 8) ? 2 : !strncmp(o, "scope=", 6) ? 3 :
-                        !strncmp(o, "notify=", 7) ? 4 : -1;
-                if (k < 0) break;
-                if (seen[k]) { why = "an option given twice"; break; }
-                seen[k] = true;
-                const char *v = strchr(o, '=') + 1;
-                if (k == 0) {
-                    if (!strcmp(v, "grant")) r->su_mode = VDP_SU_GRANT;
-                    else if (!strcmp(v, "hold")) r->su_mode = VDP_SU_HOLD;
-                    else why = "mode= is grant or hold";
-                } else if (k == 1) {
-                    /* a Unix group name, as useradd(8) allows */
-                    size_t vl = strlen(v);
-                    bool ok = vl >= 1 && vl <= 32 && ((v[0] >= 'a' && v[0] <= 'z') || v[0] == '_');
-                    for (size_t i = 1; ok && i < vl; i++)
-                        ok = (v[i] >= 'a' && v[i] <= 'z') || (v[i] >= '0' && v[i] <= '9') ||
-                             v[i] == '_' || v[i] == '-' || (v[i] == '$' && i == vl - 1);
-                    if (!ok) why = "approvers= is a Unix group name ([a-z_][a-z0-9_-]{0,31})";
-                    else memcpy(r->su_approvers, v, vl + 1);
-                } else if (k == 2) {
-                    char *end = NULL;
-                    errno = 0;
-                    unsigned long s = v[0] >= '1' && v[0] <= '9' ? strtoul(v, &end, 10) : 0;
-                    if (!end || *end || errno || s < 1 || s > VDP_SU_TIMEOUT_MAX)
-                        why = "timeout= is 1 to 3600 seconds";
-                    else r->su_timeout = (uint32_t)s;
-                } else if (k == 3) {
-                    if (!strcmp(v, "thread")) r->su_scope = VDP_SCOPE_THREAD;
-                    else if (!strcmp(v, "run")) r->su_scope = VDP_SCOPE_RUN;
-                    else why = "scope= is thread or run";
-                } else {
-                    if (!https_url_ok(v, VDP_SU_NOTIFY_MAX)) why = "notify= is an https:// URL of at most 512 bytes";
-                    else memcpy(r->su_notify, v, strlen(v) + 1);
-                }
-                nt--;
-            }
+            if (r->verb == VDP_DEFER) { r->su_mode = VDP_SU_HOLD; r->su_scope = VDP_SCOPE_RUN; }
+            int k0 = 0;
+            while (nt - k0 > 3 && su_option_kind(tok[nt - 1 - k0]) >= 0) k0++;
+            const char *why = su_options(tok + nt - k0, k0, r->verb, r, false);
+            if (!why && r->verb == VDP_DEFER && !r->df_until[0]) why = "a defer rule needs until=FILE";
             if (why) { rc = perr(err, errlen, path, lineno, "%s", why); break; }
+            nt -= k0;
         }
 
         if      (!strcmp(tok[1], "path")) { r->kind = VDP_KIND_PATH; r->s.op = VDP_STR_PREFIX; }
@@ -2589,11 +2667,17 @@ int vdp_grant_parse(const vdp_policy_t *p, const char *text, size_t len, vdp_gra
             char *e = NULL;
             long n = nt == 3 && !strcmp(tok[1], "line") && tok[2][0] >= '1' && tok[2][0] <= '9'
                      ? strtol(tok[2], &e, 10) : 0;
-            if (g->su_rule >= 0) { rc = perr(err, errlen, "grant", ln, "`step_up line` given twice"); break; }
+            if (g->su_rule >= 0 || g->su_unknown) { rc = perr(err, errlen, "grant", ln, "`step_up line` given twice"); break; }
             if (!e || *e || n < 1 || n > INT32_MAX) { rc = perr(err, errlen, "grant", ln, "need: step_up line N"); break; }
             for (size_t i = 0; i < p->n; i++)
-                if (p->rules[i].line == (int)n && p->rules[i].verb == VDP_STEP_UP) { g->su_rule = (int)i; break; }
-            if (g->su_rule < 0) { rc = perr(err, errlen, "grant", ln, "line %ld of the policy is not a step_up rule", n); break; }
+                if (p->rules[i].line == (int)n && vdp_rule_grantable(&p->rules[i])) { g->su_rule = (int)i; break; }
+            /* v1.42 step 5: or the `on unknown defer escalate` line */
+            if (g->su_rule < 0 && p->unk_line && p->unk_line == (int)n) g->su_unknown = true;
+            if (g->su_rule < 0 && !g->su_unknown) {
+                rc = perr(err, errlen, "grant", ln, "line %ld of the policy is not a step_up rule (nor a defer rule "
+                          "with escalate, nor the `on unknown defer` line)", n);
+                break;
+            }
             g->su_line = (int)n;
         } else if (!strcmp(tok[0], "for")) {
             if (seen_for) { rc = perr(err, errlen, "grant", ln, "`for` given twice"); break; }
@@ -2631,7 +2715,7 @@ int vdp_grant_parse(const vdp_policy_t *p, const char *text, size_t len, vdp_gra
     }
 #undef MADD
     if (rc == 0 && !seen_grant) rc = perr(err, errlen, "grant", ln, "empty");
-    if (rc == 0 && g->su_rule < 0) rc = perr(err, errlen, "grant", ln, "no `step_up line N`");
+    if (rc == 0 && g->su_rule < 0 && !g->su_unknown) rc = perr(err, errlen, "grant", ln, "no `step_up line N`");
     if (rc == 0 && nallow == 0) rc = perr(err, errlen, "grant", ln, "no allow rule");
     if (rc == 0 && !seen_count && !seen_until) rc = perr(err, errlen, "grant", ln, "neither count nor until: a grant is limited");
     if (rc == 0 && !(tmp = calloc(1, sizeof *tmp))) rc = perr(err, errlen, "grant", 0, "out of memory");
@@ -2645,11 +2729,13 @@ int vdp_grant_parse(const vdp_policy_t *p, const char *text, size_t len, vdp_gra
                 rc = perr(err, errlen, "grant", 0, "%s", e2);
         }
     }
-    const vdp_rule_t *su = rc == 0 ? &p->rules[g->su_rule] : NULL;
+    const vdp_rule_t *su = rc == 0 && g->su_rule >= 0 ? &p->rules[g->su_rule] : NULL;
     for (size_t i = 0; rc == 0 && i < tmp->n; i++) {
         const vdp_rule_t *r = &tmp->rules[i];
         int gl = r->line - hdr;
-        if (r->verb != VDP_ALLOW || r->kind != su->kind)
+        if (r->verb != VDP_ALLOW)
+            rc = perr(err, errlen, "grant", gl, "a grant's rules are allow rules");
+        else if (su && r->kind != su->kind)        /* under the on unknown line: any kind */
             rc = perr(err, errlen, "grant", gl, "a %s rule under a step_up %s rule (line %d): a grant's rules are of its kind",
                       vdp_kind_name(r->kind), vdp_kind_name(su->kind), su->line);
         else if (r->subj || r->cred || r->cred_hdr[0] || r->subagent[0] || r->mcp_server || r->confined_subj)
@@ -2673,6 +2759,10 @@ int vdp_grant_parse(const vdp_policy_t *p, const char *text, size_t len, vdp_gra
     return rc;
 }
 
+bool vdp_rule_grantable(const vdp_rule_t *r) {
+    return r->verb == VDP_STEP_UP || (r->verb == VDP_DEFER && r->su_escalate);
+}
+
 vdp_verdict_t vdp_decide_grant(const vdp_policy_t *p, const vdp_grant_t *const *gs, size_t ng,
                                int subj, vdp_kind_t kind, const char *s,
                                uint32_t flags, bool has_flags,
@@ -2685,10 +2775,12 @@ vdp_verdict_t vdp_decide_grant(const vdp_policy_t *p, const vdp_grant_t *const *
     *grant = -1;
     *grant_rule = -1;
     vdp_verdict_t v = vdp_decide_subj(p, subj, kind, s, flags, has_flags, rule_index, why);
-    if (v != VDP_UNSATISFIED || *rule_index < 0 || p->rules[*rule_index].verb != VDP_STEP_UP) return v;
+    /* v1.42 step 5: or no rule holds (a ground call), under `on unknown defer escalate` */
+    bool unk = v == VDP_UNKNOWN && *why == VDP_WHY_NO_RULE && p->unk_line && (kind != VDP_KIND_PATH || has_flags);
+    if (!unk && (v != VDP_UNSATISFIED || *rule_index < 0 || !vdp_rule_grantable(&p->rules[*rule_index]))) return v;
     for (size_t k = 0; k < ng; k++) {
         const vdp_grant_t *g = gs[k];
-        if (!g || g->su_rule != *rule_index) continue;
+        if (!g || (unk ? !g->su_unknown : g->su_rule != *rule_index)) continue;
         int gr = -1;
         vdp_why_t gw;
         if (decide_rules(g->rules, g->n, 0, kind, s, flags, has_flags, &gr, &gw) == VDP_SATISFIED) {
@@ -3569,7 +3661,8 @@ size_t vdp_rule_advisory(const vdp_rule_t *r, char *buf, size_t n) {
 static bool host_may_be_allowed(const vdp_policy_t *p, int subj, const char *hp) {
     int ri = -1;
     vdp_verdict_t v = vdp_decide_subj(p, subj, VDP_KIND_HOST, hp, 0, true, &ri, NULL);
-    return v == VDP_SATISFIED || (v == VDP_UNSATISFIED && ri >= 0 && p->rules[ri].verb == VDP_STEP_UP);
+    return v == VDP_SATISFIED || (v == VDP_UNSATISFIED && ri >= 0 &&
+                                  (p->rules[ri].verb == VDP_STEP_UP || p->rules[ri].verb == VDP_DEFER));
 }
 
 static bool request_wild_reached(const vdp_policy_t *p, const vdp_rule_t *q) {

@@ -571,11 +571,20 @@ static int policy_load(const char *path, struct policy *p) {
             /* v1.42: a step_up rule and its options */
             ci.step_up != (r->verb == VDP_STEP_UP) || ci.su_mode != r->su_mode || ci.su_scope != r->su_scope ||
             ci.su_timeout != r->su_timeout || strcmp(ci.su_approvers, r->su_approvers) ||
-            strcmp(ci.su_notify, r->su_notify)) {
+            strcmp(ci.su_notify, r->su_notify) ||
+            /* v1.42 step 5: a defer rule, its marker and escalate */
+            ci.defer != (r->verb == VDP_DEFER) || ci.su_escalate != r->su_escalate || strcmp(ci.df_until, r->df_until)) {
             fprintf(stderr, "[warden] policy %s:%d: the decision procedure and the certificate "
                     "checker read this rule differently; refusing to start\n", path, r->line);
             return -1;
         }
+    }
+    /* v1.42 step 5: and the `on unknown` line */
+    if (p->v.unk_line != p->c.unk_line || p->v.unk_timeout != p->c.unk_timeout ||
+        p->v.unk_scope != (uint8_t)p->c.unk_scope || strcmp(p->v.unk_approvers, p->c.unk_approvers)) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read the "
+                "`on unknown` line differently; refusing to start\n", path);
+        return -1;
     }
     /* v1.26: and the proxy directives */
     bool proxy_same = p->v.proxy == (p->c.proxy != 0) && p->v.proxy_nports == p->c.proxy_nports;

@@ -154,6 +154,10 @@ typedef struct {
     int           require_obo;        /* v1.28.1: `require on-behalf-of` */
     int           require_plan;       /* v1.35 step 4 (D7): `require plan` */
     uint32_t      max_held, max_pending; /* v1.42: `max_held N`, `max_pending N`; 0: not given */
+    int           unk_line;           /* v1.42 step 5: `on unknown defer escalate`'s line, 0: none */
+    uint32_t      unk_timeout;        /* ... its timeout=, 0: not set */
+    int           unk_scope;          /* ... scope= (0 thread, 1 run; default run) */
+    char          unk_approvers[33];  /* ... approvers= */
     vdpc_subject_t subjects[32];      /* v1.31: subject k is subjects[k - 1] */
     size_t        nsubjects;
     vdpc_mcpres_t mcpres[8];          /* v1.31 */
@@ -200,6 +204,9 @@ typedef struct {
     uint32_t    su_timeout;           /* v1.42: timeout=, 0: not set */
     const char *su_approvers;         /* v1.42: approvers= ("" : none) */
     const char *su_notify;            /* v1.42: notify= ("" : none) */
+    bool        defer;                /* v1.42 step 5: a defer rule (allow and step_up then false) */
+    bool        su_escalate;          /* ... escalate */
+    const char *df_until;             /* ... until= ("" : none) */
     int         kind, match, line;
     const char *c;
     size_t      clen;
@@ -238,7 +245,8 @@ int vdpc_path_writable(const vdpc_policy_t *p, const char *s, size_t sl);
 typedef struct {
     vdpc_rule_t *rules;
     size_t       n;
-    int          su_rule;             /* the step_up rule's index in the policy */
+    int          su_rule;             /* the step_up rule's index in the policy (-1: su_unknown) */
+    bool         su_unknown;          /* v1.42 step 5: under the `on unknown defer escalate` line */
 } vdpc_grant_t;
 int  vdpc_grant_load(const vdpc_policy_t *p, const char *text, size_t len, vdpc_grant_t *g,
                      char *err, size_t errlen);
@@ -253,6 +261,18 @@ void vdpc_grant_free(vdpc_grant_t *g);
 int vdpc_check_grant(const vdpc_policy_t *p, const vdpc_grant_t *g, int subj, int kind,
                      const char *s, size_t sl, uint32_t flags, bool has_flags,
                      const vdpc_cert_t *su, const vdpc_cert_t *gc, char *why, size_t whylen);
+/* v1.42 step 5: a grant under a defer rule with escalate checks as one
+ * under a step_up rule; one under the `on unknown defer escalate` line has
+ * no rule of the policy holding on the call (a ground call; su names no
+ * rule) as its policy's half. */
+
+/* v1.42 step 5: check an ALLOW under a defer rule whose marker the Warden
+ * found passing: c names the defer rule deciding the call (as an allow
+ * rule's certificate, the first of the subject's rules to hold, or with
+ * symbolic flags the one rule every flags value reaches). The marker itself
+ * is the Warden's to check, and the record's to show. 1, or 0 with why. */
+int vdpc_check_defer(const vdpc_policy_t *p, int subj, int kind, const char *s, size_t sl,
+                     uint32_t flags, bool has_flags, const vdpc_cert_t *c, char *why, size_t whylen);
 
 /* Hex form of the policy digest (65 bytes with the NUL). */
 void vdpc_digest_hex(const vdpc_policy_t *p, char out[65]);
