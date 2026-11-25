@@ -528,7 +528,10 @@ one("MCP", ("POST /mcp HTTP/1.1\r\n" + H + "Content-Type: application/json\r\nAc
 PY
 chmod 644 "$W/a/px.py"
 printf "require warden 1.42\nproxy inspect\nproxy ports $HP\nallow host api.example.com\nstep_up request GET http://api.example.com:$HP/plain* mode=hold timeout=20\nstep_up mcp http://api.example.com:$HP/mcp tools/call * mode=hold timeout=20\nallow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ readonly\nallow path $W/a/\n" > "$W/x.txt"
-env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$W/x.txt" --dns-server "127.0.0.1:$DP" --trust-bundle /etc/ssl/certs/ca-certificates.crt \
+# the host's CA bundle (the requests are plain HTTP; the Warden only needs one to start): Debian and
+# Ubuntu name it ca-certificates.crt, RHEL, Rocky and Amazon Linux ca-bundle.crt
+TB=""; for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/certs/ca-bundle.crt; do [ -f "$f" ] && TB="$f" && break; done
+env -i PATH=/usr/bin:/bin timeout 120 "$WARDEN" "$W/x.txt" --dns-server "127.0.0.1:$DP" --trust-bundle "$TB" \
     -- /usr/bin/python3 "$W/a/px.py" "$HP" > "$W/x.out" 2> "$W/x.log" &
 WPID=$!
 SOCK=""; for _ in $(seq 40); do SOCK="$(grep -o '/run/varek-approve/[0-9a-f]*\.sock' "$W/x.log" 2>/dev/null | head -1)"; [ -n "$SOCK" ] && [ -S "$SOCK" ] && break; sleep 0.25; done
