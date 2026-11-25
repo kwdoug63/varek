@@ -426,7 +426,12 @@ check "... its refusal recorded then, naming the proposal (held), before step_up
   "(lambda d, e: d < e)(*[next(i for i, r in enumerate(rs) if c(r)) for c in (lambda r: r.get('step_up') == '$H2' and r.get('held') is True and r['decision_final'] == 'DENY', lambda r: r.get('event') == 'step_up_end' and r['id'] == '$H2' and r['ending'] == 'denied')])"
 audit_ok "$W/h1.txt" "$W/h2.log" && pass "the audit passes a held, denied call" || flunk "audit h2: $(grep PROBLEM "$W/h2.log.audit" | head -2)"
 cp "$W/h2.log" "$W/r1.log"; cp "$W/h1.txt" "$W/p1.txt"
-qforge "a held call's refusal dropped (run_end's count lowered to match)" "recs.remove([r for r in recs if isinstance(r, dict) and r.get('held') is True][0]); E = [r for r in recs if isinstance(r, dict) and r.get('event') == 'run_end'][0]; E['records'] -= 1" "with no record of its refusal before"
+# the records after it renumbered too (the agent may make calls after the refused read), so the
+# stream's seq and count still hold and only the missing refusal is left to find
+qforge "a held call's refusal dropped (run_end's count lowered, later records renumbered)" "X = [r for r in recs if isinstance(r, dict) and r.get('held') is True][0]; recs.remove(X)
+for r in recs:
+    if isinstance(r, dict) and r.get('seq', -1) > X['seq']: r['seq'] -= 1
+[r for r in recs if isinstance(r, dict) and r.get('event') == 'run_end'][0]['records'] -= 1" "with no record of its refusal before"
 
 printf "${BASE}step_up path $W/data/ mode=hold timeout=2\n" > "$W/h3.txt"
 hstart "$W/h3.txt" "$W/h3" one.sh "$W/data/r.csv"
