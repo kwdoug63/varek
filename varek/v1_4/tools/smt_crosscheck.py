@@ -1774,14 +1774,18 @@ def fuzz_v131(rng, lines, valid, cred_names):
         lines.append(line)
 
 
-def fuzz_policy(rng, path):
+def fuzz_policy(rng, path, v142=False):
     """A random policy. Seven in ten are kept valid (each line is regenerated
     until this file's parser accepts it; the C parser must agree, which the
     check verifies), so most policies reach the reachability and query checks;
-    the rest may carry any number of malformed lines, for the parsers."""
+    the rest may carry any number of malformed lines, for the parsers.
+    v1.42: with v142, a policy after `require warden 1.42`, with step_up
+    rules (written in a run of their own, from their own random stream, so
+    the policies without them are the ones earlier versions wrote)."""
+    FUZZ["v142"] = v142
     valid = rng.random() < 0.7
     lines = []
-    if rng.random() < 0.3:
+    if not v142 and rng.random() < 0.3:
         # v1.26.1: an inspecting-mode policy: host rules, request rules over
         # them (allow and deny, exact and wildcard hosts, globs in the path,
         # queries), passthrough hosts, max_body, and (when the policy may be
@@ -1988,10 +1992,8 @@ def fuzz_policy(rng, path):
         with open(path, "w", encoding="latin-1", newline="") as fh:
             fh.write("\n".join(lines) + "\n")
         return
-    FUZZ["v142"] = False
-    if rng.random() < 0.12:
+    if v142:
         # v1.42: step_up rules, max_held and max_pending
-        FUZZ["v142"] = True
         lines.append("require warden 1.42")
         if rng.random() < 0.3:
             lines.append(rng.choice(["max_held 8", "max_pending 16", "max_held 1024"] +
@@ -2474,6 +2476,9 @@ def main():
                     "certificate the procedure emits, and forged and mutated ones")
     ap.add_argument("--fuzz", type=int, default=0, help="random policies to generate")
     ap.add_argument("--seed", type=int, default=1010)
+    ap.add_argument("--fuzz-v142", type=int, default=None,
+                    help="v1.42: random policies with step_up rules, after the others, from a random "
+                         "stream of their own (default: a fifth of --fuzz)")
     ap.add_argument("--queries", type=int, default=60)
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("policies", nargs="*")
@@ -2499,6 +2504,20 @@ def main():
                     dst.write(src.read())
                 fails.append(f"(failing fuzz policy saved to {keep})")
                 break
+        # v1.42: policies with step_up rules, from their own stream
+        rng2 = random.Random(a.seed * 7919 + 142)
+        n142 = a.fuzz // 5 if a.fuzz_v142 is None else a.fuzz_v142
+        for k in range(n142 if not fails else 0):
+            p = os.path.join(td, f"fuzz142_{k}.txt")
+            fuzz_policy(rng2, p, v142=True)
+            fails += check_policy(a.vdp, p, rng2, a.queries, stats, a.verbose, a.cert)
+            if fails and not a.verbose:
+                keep = os.path.join(tempfile.gettempdir(), f"vdp_fail_142_{k}.txt")
+                with open(p, encoding="latin-1") as src, open(keep, "w", encoding="latin-1") as dst:
+                    dst.write(src.read())
+                fails.append(f"(failing fuzz policy saved to {keep})")
+                break
+            stats["v142_policies"] = stats.get("v142_policies", 0) + 1
     total = stats["reach"] + stats["reach_forced_checked"] + stats["ground"] + stats["symbolic"]
     print(f"smt_crosscheck: {stats['policies']} policies ({stats['string_policies']} with "
           f"suffix/contains/glob rules, {stats['request_policies']} with request rules, {stats['launch_policies']} with launches, {stats['open_as_agent_policies']} opening as the agent; "
