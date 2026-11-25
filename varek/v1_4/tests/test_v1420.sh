@@ -39,6 +39,18 @@
 #      a grant for no open proposal). With approvers=GROUP: outsiders and
 #      root alone refused, a member approves; a proposal times out.
 #
+# Step 3, mode=hold (section 6, as root):
+#   6. A read a hold rule decides waits in the kernel (a held step_up
+#      record, no decision yet); approved, the same read goes on, decided
+#      again within the grant; denied, or past the timeout, it is refused,
+#      its refusal recorded before the ending; max_held refuses one more at
+#      once; another process's calls go on while one is held; a symlink
+#      swapped while held is refused when decided again; a held launch,
+#      approved, runs (the step_up program is in the launch set); a step_up
+#      rule that writes gets its noexec mount; mode=hold on a request rule is
+#      refused at start; the audit passes each run and refuses a held call's
+#      refusal dropped.
+#
 # Usage: sudo ./test_v1420.sh   (from varek/v1_4, after `make warden tools/vdp_check tools/vdp_cert_check`;
 #        sections 1 to 4 need no root, and run without it)
 set -u
@@ -263,9 +275,9 @@ start() {   # start POLICY OUT N: the Warden on the agent, in the background; SO
 }
 recs() { python3 -c "import json,sys; rs=[json.loads(l) for l in open(sys.argv[1]) if l.startswith('{')]; sys.exit(0 if $2 else 1)" "$1"; }
 
-printf "${BASE}step_up path $W/data/ mode=hold\n" > "$W/hold.txt"
+printf "${BASE}step_up path $W/data/ scope=run\n" > "$W/hold.txt"
 o="$("$WARDEN" "$W/hold.txt" --check-startup 2>&1)"
-grep -q "mode=hold is not built yet" <<<"$o" && pass "a policy with mode=hold is refused at start (built in step 3)" || flunk "mode=hold at start: $o"
+grep -q "scope=run is not built yet" <<<"$o" && pass "a policy with scope=run is refused at start (built in step 4)" || flunk "scope=run at start: $o"
 
 printf "${BASE}step_up path $W/data/ timeout=30\nstep_up host api.example.test:443\n" > "$W/p1.txt"     # step_up on line 9, the host one 10
 start "$W/p1.txt" "$W/r1" 80
@@ -360,6 +372,112 @@ wait "$WPID"
 check "... recorded as timeout" recs "$W/r2.log" "[r for r in rs if r.get('event') == 'step_up_end' and r['id'] == '$ID4' and r['ending'] == 'timeout']"
 o="$(python3 "$HERE/tools/varek_audit.py" --policy "$W/p2.txt" --checker "$CERT" "$W/r2.log" 2>&1)"
 grep -q 'varek_audit: PASS' <<<"$o" && pass "the audit passes the second run" || flunk "audit 2: $(grep PROBLEM <<<"$o" | head -3)"
+
+echo "== 6. step 3: mode=hold, a call held at the kernel (as root) =="
+AU=0; AG=0
+cat > "$W/bin/one.sh" <<'AG'
+# one try at each file named; say what each got
+for f in "$@"; do if read -r l < "$f"; then echo "$f: ok $l"; else echo "$f: no"; fi; done
+AG
+cat > "$W/bin/two.sh" <<'AG'
+# the first file read in the background (held), the second read meanwhile
+( if read -r l < "$1"; then echo "first: ok"; else echo "first: no"; fi ) &
+sleep 0.5
+if read -r l < "$2"; then echo "second: ok"; else echo "second: no"; fi
+wait
+AG
+chmod 755 "$W/bin/one.sh" "$W/bin/two.sh"
+echo "b" > "$W/data/b.csv"; chmod 644 "$W/data/b.csv"; echo "free" > "$W/bin/free.txt"; chmod 644 "$W/bin/free.txt"
+hstart() {   # hstart POLICY OUT SCRIPT ARGS...: as start, with the script and its files
+    local pol="$1" out="$2" scr="$3"; shift 3
+    "$WARDEN" "$pol" -- /bin/bash "$W/bin/$scr" "$@" > "$out.out" 2> "$out.log" &
+    WPID=$!
+    SOCK=""; local k
+    for k in $(seq 1 40); do
+        SOCK="$(grep -o '/run/varek-approve/[0-9a-f]*\.sock' "$out.log" 2>/dev/null | head -1)"
+        [ -n "$SOCK" ] && [ -S "$SOCK" ] && break
+        sleep 0.25
+    done
+    RUN="$(basename "$SOCK" .sock)"
+}
+audit_ok() { python3 "$HERE/tools/varek_audit.py" --policy "$1" --checker "$CERT" "$2" > "$2.audit" 2>&1; }
+printf "${BASE}step_up path $W/data/ mode=hold timeout=20\nmax_held 1\n" > "$W/h1.txt"
+HB="$(printf '%b' "$BASE" | wc -l)"
+
+hstart "$W/h1.txt" "$W/h1" one.sh "$W/data/r.csv"
+H1="$(wait_prop)"
+sleep 1
+[ -n "$H1" ] && [ ! -s "$W/h1.out" ] && pass "a read the hold rule decides waits in the kernel, a grant proposed ($H1)" || flunk "no hold: $(cat "$W/h1.out")"
+check "... its step_up record says held, with the call (no decision record yet)" recs "$W/h1.log" \
+  "[r for r in rs if r.get('event') == 'step_up' and r['id'] == '$H1' and r['mode'] == 'hold' and r['state'] == 'held' and r['resolved'] == '$W/data/r.csv'] and not [r for r in rs if r.get('resolved') == '$W/data/r.csv' and 'decision_final' in r]"
+o="$(apv 0 0 "approve $H1")"
+wait "$WPID"
+grep -q "r.csv: ok a,b" "$W/h1.out" && pass "approved, the same read goes on: allowed, its one try" || flunk "after approval: $o / $(cat "$W/h1.out")"
+check "... decided again within the grant: ALLOW, cert_grant, checked" recs "$W/h1.log" \
+  "[r for r in rs if r.get('resolved') == '$W/data/r.csv' and r.get('decision_final') == 'ALLOW' and r.get('cert_grant') and r.get('check') == 'ok']"
+audit_ok "$W/h1.txt" "$W/h1.log" && pass "the audit passes a held, approved call" || flunk "audit h1: $(grep PROBLEM "$W/h1.log.audit" | head -2)"
+
+hstart "$W/h1.txt" "$W/h2" one.sh "$W/data/r.csv"
+H2="$(wait_prop)"
+o="$(apv 0 0 "deny $H2\nreason no")"
+wait "$WPID"
+grep -q "r.csv: no" "$W/h2.out" && [ "$o" = denied ] && pass "denied, the held read is refused (EACCES)" || flunk "deny a hold: $o / $(cat "$W/h2.out")"
+check "... its refusal recorded then, naming the proposal (held), before step_up_end denied" recs "$W/h2.log" \
+  "(lambda d, e: d < e)(*[next(i for i, r in enumerate(rs) if c(r)) for c in (lambda r: r.get('step_up') == '$H2' and r.get('held') is True and r['decision_final'] == 'DENY', lambda r: r.get('event') == 'step_up_end' and r['id'] == '$H2' and r['ending'] == 'denied')])"
+audit_ok "$W/h1.txt" "$W/h2.log" && pass "the audit passes a held, denied call" || flunk "audit h2: $(grep PROBLEM "$W/h2.log.audit" | head -2)"
+cp "$W/h2.log" "$W/r1.log"; cp "$W/h1.txt" "$W/p1.txt"
+qforge "a held call's refusal dropped (run_end's count lowered to match)" "recs.remove([r for r in recs if isinstance(r, dict) and r.get('held') is True][0]); E = [r for r in recs if isinstance(r, dict) and r.get('event') == 'run_end'][0]; E['records'] -= 1" "with no record of its refusal before"
+
+printf "${BASE}step_up path $W/data/ mode=hold timeout=2\n" > "$W/h3.txt"
+hstart "$W/h3.txt" "$W/h3" one.sh "$W/data/r.csv"
+wait "$WPID"
+grep -q "r.csv: no" "$W/h3.out" && pass "unanswered, the held read is refused at the rule's timeout" || flunk "timeout: $(cat "$W/h3.out")"
+check "... recorded as timeout" recs "$W/h3.log" "[r for r in rs if r.get('event') == 'step_up_end' and r['ending'] == 'timeout']"
+audit_ok "$W/h3.txt" "$W/h3.log" && pass "the audit passes a held call that timed out" || flunk "audit h3: $(grep PROBLEM "$W/h3.log.audit" | head -2)"
+
+hstart "$W/h1.txt" "$W/h4" two.sh "$W/data/r.csv" "$W/data/b.csv"
+H4="$(wait_prop)"
+sleep 1.5
+grep -q "second: no" "$W/h4.out" && pass "max_held 1: a second call to hold is refused at once" || flunk "max_held: $(cat "$W/h4.out")"
+check "... its record saying max_held" recs "$W/h4.log" "[r for r in rs if r.get('step_up') == 'none' and r.get('step_up_why') == 'max_held' and r['resolved'] == '$W/data/b.csv']"
+apv 0 0 "approve $H4" > /dev/null; wait "$WPID"
+grep -q "first: ok" "$W/h4.out" && pass "... and the held one, approved, goes on" || flunk "first after approval: $(cat "$W/h4.out")"
+
+printf "${BASE}step_up path $W/data/r.csv mode=hold timeout=20\n" > "$W/h5.txt"
+hstart "$W/h5.txt" "$W/h5" two.sh "$W/data/r.csv" "$W/bin/free.txt"
+H5="$(wait_prop)"
+sleep 1.5
+grep -q "second: ok" "$W/h5.out" && ! grep -q "first:" "$W/h5.out" && pass "while one call is held, another process's allowed read goes on" || flunk "other calls: $(cat "$W/h5.out")"
+apv 0 0 "approve $H5" > /dev/null; wait "$WPID"
+
+ln -sf "$W/data/r.csv" "$W/data/link"
+hstart "$W/h1.txt" "$W/h6" one.sh "$W/data/link"
+H6="$(wait_prop)"
+o="$(apv 0 0 pending)"
+grep -q "allow path exact $W/data/r.csv" <<<"$o" && pass "a read through a symlink: the proposal names the file it resolves to" || flunk "symlink proposal: $o"
+ln -sf "$W/data/b.csv" "$W/data/link"
+apv 0 0 "approve $H6" > /dev/null; wait "$WPID"
+grep -q "link: no" "$W/h6.out" && pass "the link swapped before approval: decided again, the grant's file is not the one reached: refused" || flunk "swapped link: $(cat "$W/h6.out")"
+check "... recorded as decided again, not within the grant" recs "$W/h6.log" "[r for r in rs if r.get('step_up_why', '').startswith('held and approved, then decided again') and r['resolved'] == '$W/data/b.csv']"
+audit_ok "$W/h1.txt" "$W/h6.log" && pass "the audit passes it" || flunk "audit h6: $(grep PROBLEM "$W/h6.log.audit" | head -2)"
+
+printf "${BASE}step_up exec /usr/bin/id mode=hold timeout=20\n" > "$W/h7.txt"
+cat > "$W/bin/launch.sh" <<'AG'
+/usr/bin/id -u && echo launched || echo "not launched"
+AG
+chmod 755 "$W/bin/launch.sh"
+hstart "$W/h7.txt" "$W/h7" launch.sh
+check "a step_up exec rule's program is in the launch set (Landlock lets it run once allowed)" recs "$W/h7.log" "[e for r in rs if r.get('event') == 'run_start' for e in r['exec_ruleset'] if e['path'] == '/usr/bin/id' and e['why'] == 'rule']"
+H7="$(wait_prop)"
+apv 0 0 "approve $H7" > /dev/null; wait "$WPID"
+grep -q "^launched" "$W/h7.out" && pass "a held launch, approved, runs" || flunk "held launch: $(cat "$W/h7.out")"
+
+printf "${BASE}step_up path $W/data/ access=rw mode=hold\n" > "$W/h8.txt"
+check "a step_up rule that may write: its directory is mounted noexec, as an allow rule's" sh -c "'$WARDEN' '$W/h8.txt' -- /bin/true 2>&1 | grep -q 'noexec: 1 writable director'"
+printf "require warden 1.42\nproxy inspect\nallow host api.example.test:443\nstep_up request POST https://api.example.test/x mode=hold\n" > "$W/h9.txt"
+o="$("$WARDEN" "$W/h9.txt" --check-startup 2>&1)"
+grep -q "mode=hold on a request or mcp rule" <<<"$o" && pass "mode=hold on a request rule is refused at start (held at the proxy: a later step)" || flunk "hold on a request rule: $o"
+
 fi
 
 echo

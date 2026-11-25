@@ -71,22 +71,36 @@ static long long gr_now_ns(void) {
     return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
+static bool grant_holds(const struct policy *p);
+
 /* At start: a policy that needs what this build does not carry out yet is
  * refused (fail closed). 0, or -1 with the reason on stderr. */
 static int grant_policy_check(const struct policy *p, const char *path) {
     for (size_t i = 0; i < p->v.n; i++) {
         const vdp_rule_t *r = &p->v.rules[i];
         if (r->verb != VDP_STEP_UP) continue;
-        const char *what = r->su_mode == VDP_SU_HOLD ? "mode=hold" : r->su_scope == VDP_SCOPE_RUN ? "scope=run"
-                         : r->su_notify[0] ? "notify=" : NULL;
+        const char *what = r->su_scope == VDP_SCOPE_RUN ? "scope=run" : r->su_notify[0] ? "notify=" :
+                           r->su_mode == VDP_SU_HOLD && (r->kind == VDP_KIND_REQUEST || r->kind == VDP_KIND_MCP)
+                           ? "mode=hold on a request or mcp rule (held at the egress proxy)" : NULL;
         if (what) {
             fprintf(stderr, "[warden] policy %s:%d: %s is not built yet (v1.42 is being built in steps; "
-                    "this one has mode=grant); refusing to start\n", path, r->line, what);
+                    "this one has mode=grant and mode=hold); refusing to start\n", path, r->line, what);
             return -1;
         }
     }
     g_gr_p = p;
+    if (grant_holds(p) && !wd_filter_waitkill_built())
+        fprintf(stderr, "[warden] note: calls are held (mode=hold); this build cannot ask the kernel to end a "
+                "held call's wait on a fatal signal only (libseccomp before 2.6), so a signal ends it: the "
+                "call ends `abandoned` and, notified again, is held again\n");
     return 0;
+}
+
+/* v1.42 step 3: does the policy hold calls (a step_up rule with mode=hold)? */
+static bool grant_holds(const struct policy *p) {
+    for (size_t i = 0; i < p->v.n; i++)
+        if (p->v.rules[i].verb == VDP_STEP_UP && p->v.rules[i].su_mode == VDP_SU_HOLD) return true;
+    return false;
 }
 
 /* Does live grant g apply to call a (its scope, count and time)? */
@@ -256,74 +270,287 @@ static int prop_same(const char *text) {
     return -1;
 }
 
+/* A new proposal for refused call a under step_up rule a->rule_index: its
+ * index in g_prop, or -1 with why (with dedupe, an open proposal of the
+ * same text is named instead: *same its index). */
+static int prop_make(const struct action *a, bool dedupe, const char **why, int *same) {
+    const vdp_rule_t *su = &g_gr_p->v.rules[a->rule_index];
+    uint32_t timeout = su->su_timeout ? su->su_timeout : VDP_SU_TIMEOUT_DEFAULT;
+    int64_t until = 0;
+    *why = NULL;
+    *same = -1;
+    char *t = proposal_text(a, su, timeout, &until, why);
+    if (!t) return -1;
+    /* both parsers must read it, as any grant */
+    vdp_grant_t *vg = calloc(1, sizeof *vg);
+    vdpc_grant_t cg;
+    char e[300];
+    if (!vg) *why = "out of memory";
+    else if (vdp_grant_parse(&g_gr_p->v, t, strlen(t), vg, e, sizeof e) < 0) *why = "the proposal does not parse";
+    else {
+        vdp_grant_free(vg);
+        if (vdpc_grant_load(&g_gr_p->c, t, strlen(t), &cg, e, sizeof e) < 0) *why = "the checker does not read the proposal";
+        else vdpc_grant_free(&cg);
+    }
+    free(vg);
+    if (*why) { free(t); return -1; }
+    if (dedupe && (*same = prop_same(t)) >= 0) { free(t); return -1; }
+    uint32_t maxp = g_gr_p->v.max_pending ? g_gr_p->v.max_pending : VDP_MAX_PENDING_DEFAULT;
+    unsigned char rnd[8];
+    if (prop_open_count() >= maxp) *why = "max_pending";
+    else if (vfips_rand(rnd, sizeof rnd) != 0) *why = "no random id";
+    else if (g_nprop == g_prop_cap) {
+        size_t nc = g_prop_cap ? g_prop_cap * 2 : 16;
+        struct proposal *np = realloc(g_prop, nc * sizeof *np);
+        if (!np) *why = "out of memory";
+        else { g_prop = np; g_prop_cap = nc; }
+    }
+    if (*why) { free(t); return -1; }
+    struct proposal *pp = &g_prop[g_nprop];
+    memset(pp, 0, sizeof *pp);
+    for (int i = 0; i < 8; i++) snprintf(pp->id + 2 * i, 3, "%02x", rnd[i]);
+    pp->text = t;
+    pp->su_rule = a->rule_index;
+    pp->expires_ms = gr_now_ms() + (long long)timeout * 1000;
+    pp->until = until;
+    pp->count = 1;
+    if (g_identity.has_user) snprintf(pp->user, sizeof pp->user, "%s", g_identity.sub);
+    if (g_sub_on && a->subject > 0 && (size_t)a->subject < g_nsub)
+        snprintf(pp->subagent, sizeof pp->subagent, "%s", g_sub[a->subject].name);
+    return (int)g_nprop++;
+}
+
 /* For a refused call's record: when a step_up rule refused it, propose a
  * grant (or name the one already open) and write the record's field into
- * buf ("step_up":ID, or why none was made). *newp: a new proposal (its
- * index), for step_up_after. Empty when no step_up rule decided. */
+ * buf ("step_up":ID, or why none was made); g_new_prop is a new
+ * proposal's index, for step_up_after. Empty when no step_up rule decided.
+ * v1.42 step 3: a held call's ending (g_held_end) names its proposal; a
+ * held call decided again after its approval (g_replaying) proposes
+ * nothing. */
 static int g_new_prop = -1;
+static bool hold_kind(const struct action *a);
+static size_t g_nheld;
+static const char *g_held_end;               /* a held call's proposal, on its refusal's record */
+static bool g_replaying;                     /* deciding a held call again, after its approval */
 
 static void step_up_note(const struct action *a, decision_t d_raw, decision_t d_final, char *buf, size_t n) {
     buf[0] = '\0';
     g_new_prop = -1;
+    if (g_held_end) { snprintf(buf, n, "\"step_up\":\"%s\",\"held\":true,", g_held_end); return; }
     if (!g_gr_p || d_final == DEC_ALLOW || d_raw != DEC_DENY || a->dry || a->rule_index < 0 ||
         (size_t)a->rule_index >= g_gr_p->v.n || g_gr_p->v.rules[a->rule_index].verb != VDP_STEP_UP ||
         (a->why && !strcmp(a->why, "revoked")))
         return;
+    if (g_replaying) {
+        snprintf(buf, n, "\"step_up\":\"none\",\"step_up_why\":\"held and approved, then decided again: "
+                 "not within the grant\",");
+        return;
+    }
+    /* a hold rule's call that would be held, but max_held are: refused at once */
     const vdp_rule_t *su = &g_gr_p->v.rules[a->rule_index];
-    uint32_t timeout = su->su_timeout ? su->su_timeout : VDP_SU_TIMEOUT_DEFAULT;
-    const char *why = NULL;
-    int64_t until = 0;
-    char *t = proposal_text(a, su, timeout, &until, &why);
-    if (t) {
-        /* both parsers must read it, as any grant */
-        vdp_grant_t *vg = calloc(1, sizeof *vg);
-        vdpc_grant_t cg;
-        char e[300];
-        if (!vg) why = "out of memory";
-        else if (vdp_grant_parse(&g_gr_p->v, t, strlen(t), vg, e, sizeof e) < 0) why = "the proposal does not parse";
-        else {
-            vdp_grant_free(vg);
-            if (vdpc_grant_load(&g_gr_p->c, t, strlen(t), &cg, e, sizeof e) < 0) why = "the checker does not read the proposal";
-            else vdpc_grant_free(&cg);
-        }
-        free(vg);
+    uint32_t maxh = g_gr_p->v.max_held ? g_gr_p->v.max_held : VDP_MAX_HELD_DEFAULT;
+    if (su->su_mode == VDP_SU_HOLD && hold_kind(a) && g_apv_listen >= 0 && g_nheld >= maxh) {
+        snprintf(buf, n, "\"step_up\":\"none\",\"step_up_why\":\"max_held\",");
+        return;
     }
-    if (t && !why) {
-        int same = prop_same(t);
-        if (same >= 0) {                       /* already proposed: name it */
-            snprintf(buf, n, "\"step_up\":\"%s\",", g_prop[same].id);
-            free(t);
-            return;
-        }
-        uint32_t maxp = g_gr_p->v.max_pending ? g_gr_p->v.max_pending : VDP_MAX_PENDING_DEFAULT;
-        unsigned char rnd[8];
-        if (prop_open_count() >= maxp) why = "max_pending";
-        else if (vfips_rand(rnd, sizeof rnd) != 0) why = "no random id";
-        else if (g_nprop == g_prop_cap) {
-            size_t nc = g_prop_cap ? g_prop_cap * 2 : 16;
-            struct proposal *np = realloc(g_prop, nc * sizeof *np);
-            if (!np) why = "out of memory";
-            else { g_prop = np; g_prop_cap = nc; }
-        }
-        if (!why) {
-            struct proposal *pp = &g_prop[g_nprop];
-            memset(pp, 0, sizeof *pp);
-            for (int i = 0; i < 8; i++) snprintf(pp->id + 2 * i, 3, "%02x", rnd[i]);
-            pp->text = t;
-            pp->su_rule = a->rule_index;
-            pp->expires_ms = gr_now_ms() + (long long)timeout * 1000;
-            pp->until = until;
-            pp->count = 1;
-            if (g_identity.has_user) snprintf(pp->user, sizeof pp->user, "%s", g_identity.sub);
-            if (g_sub_on && a->subject > 0 && (size_t)a->subject < g_nsub)
-                snprintf(pp->subagent, sizeof pp->subagent, "%s", g_sub[a->subject].name);
-            g_new_prop = (int)g_nprop++;
-            snprintf(buf, n, "\"step_up\":\"%s\",", pp->id);
-            return;
+    const char *why;
+    int same;
+    int k = prop_make(a, true, &why, &same);
+    if (same >= 0) { snprintf(buf, n, "\"step_up\":\"%s\",", g_prop[same].id); return; }
+    if (k < 0) { snprintf(buf, n, "\"step_up\":\"none\",\"step_up_why\":\"%s\",", why ? why : "?"); return; }
+    g_new_prop = k;
+    snprintf(buf, n, "\"step_up\":\"%s\",", g_prop[k].id);
+}
+
+/* ---- v1.42 step 3: mode=hold, a call held at the kernel ----
+ *
+ * A call a step_up rule with mode=hold refuses is not answered: its
+ * notification is kept, a grant is proposed, and the thread waits in the
+ * kernel. Approved, the call is decided again from its notification (the
+ * supervision loop's `decide`, as the node agent's first call is), now
+ * within the grant: the object the kernel resolves then must be the
+ * grant's. Denied or past its timeout, it is refused (EACCES) and recorded
+ * then. A notification that ends while held (the caller interrupted or
+ * gone) ends `abandoned`. At most max_held are held at once; one more is
+ * refused at once. Held: opens and lookups, connects and launches. Not
+ * held (refused at once with a proposal, as mode=grant): changes by name,
+ * which decide two names, and what the egress proxy decides. Only with
+ * the approvers' socket open: without it nobody could answer. */
+
+struct held_call {
+    struct seccomp_notif req;
+    struct action       *act;        /* the call as decided, for its refusal's record */
+    decision_t           d_raw;
+    char                 rule_id[40];
+    char                 prop[17];
+    struct timespec      t0;
+};
+
+static struct held_call *g_held;
+static size_t g_held_cap;
+static struct seccomp_notif g_replay_q[VDP_MAX_HELD_LIMIT];  /* approved held calls, to decide again */
+static size_t g_nreplay;
+static bool g_cur_set;                       /* g_cur_req is the notification being decided */
+static struct seccomp_notif g_cur_req;
+static uint64_t g_hold_swallow;              /* the refusal of this notification is not sent */
+static int g_grant_notify_fd = -1;
+
+static bool hold_kind(const struct action *a) {
+    return a->kind == ACT_FILE_OPEN || a->kind == ACT_FILE_STAT || a->kind == ACT_FILE_ACCESS ||
+           a->kind == ACT_FILE_READLINK || a->kind == ACT_NET_CONNECT || a->kind == ACT_PROCESS_EXEC;
+}
+
+static void held_refuse(size_t i);
+static int held_find_req(uint64_t id) {
+    for (size_t i = 0; i < g_nheld; i++) if (g_held[i].req.id == id) return (int)i;
+    return -1;
+}
+
+/* Each round, before a notification: nothing is held or replayed yet. A
+ * call held last round whose refusal was not withheld (it was answered
+ * some other way) is not held: its refusal is recorded now, and its
+ * proposal ends `abandoned`. */
+static void step_up_end_record(const struct proposal *pp, const char *ending, const char *grant_id,
+                               long long uid, const char *who, const char *reason);
+static void hold_round(int notify_fd) {
+    g_grant_notify_fd = notify_fd;
+    if (g_hold_swallow && !notif_id_valid(notify_fd, g_hold_swallow)) {
+        int hi = held_find_req(g_hold_swallow);
+        if (hi >= 0) {
+            char prop[17];
+            memcpy(prop, g_held[hi].prop, sizeof prop);
+            g_grant_notify_fd = -1;                   /* record it; it was answered already */
+            held_refuse((size_t)hi);
+            g_grant_notify_fd = notify_fd;
+            int pi = prop_find(prop);
+            if (pi >= 0) { step_up_end_record(&g_prop[pi], "abandoned", NULL, -1, NULL, NULL); prop_free((size_t)pi); }
         }
     }
-    free(t);
-    snprintf(buf, n, "\"step_up\":\"none\",\"step_up_why\":\"%s\",", why ? why : "?");
+    g_cur_set = false;
+    g_replaying = false;
+    g_hold_swallow = 0;
+}
+
+/* The notification about to be decided */
+static void hold_cur(const struct seccomp_notif *req) {
+    g_cur_req = *req;
+    g_cur_set = true;
+}
+
+/* An approved held call to decide again: true with *req */
+static bool hold_replay_pop(struct seccomp_notif *req) {
+    if (!g_nreplay) return false;
+    *req = g_replay_q[0];
+    memmove(&g_replay_q[0], &g_replay_q[1], (g_nreplay - 1) * sizeof g_replay_q[0]);
+    g_nreplay--;
+    g_replaying = true;
+    return true;
+}
+
+/* send_simple / send_errno: a held call's refusal is not sent */
+static bool hold_swallow(uint64_t id, bool refusal) {
+    if (!refusal || !g_hold_swallow || id != g_hold_swallow) return false;
+    g_hold_swallow = 0;
+    return true;
+}
+
+/* emit_pathology, first: hold this call instead of recording its refusal?
+ * True when it is held (its record is written when it ends). */
+static bool hold_take(pid_t pid, const struct action *a, decision_t d_raw, decision_t d_final,
+                      const char *rule_id, uint64_t latency_ns) {
+    if (!g_gr_p || !g_cur_set || g_replaying || g_held_end || d_final == DEC_ALLOW || d_raw != DEC_DENY || a->dry ||
+        a->rule_index < 0 || (size_t)a->rule_index >= g_gr_p->v.n || pid != (pid_t)g_cur_req.pid)
+        return false;
+    const vdp_rule_t *su = &g_gr_p->v.rules[a->rule_index];
+    if (su->verb != VDP_STEP_UP || su->su_mode != VDP_SU_HOLD || g_apv_listen < 0 || !hold_kind(a) ||
+        (a->why && !strcmp(a->why, "revoked")))
+        return false;
+    /* only a call not yet answered can be held */
+    if (g_grant_notify_fd < 0 || !notif_id_valid(g_grant_notify_fd, g_cur_req.id)) return false;
+    uint32_t maxh = g_gr_p->v.max_held ? g_gr_p->v.max_held : VDP_MAX_HELD_DEFAULT;
+    if (g_nheld >= maxh) return false;           /* refused at once, its record saying so (step_up_note) */
+    if (g_nheld == g_held_cap) {
+        size_t nc = g_held_cap ? g_held_cap * 2 : 8;
+        struct held_call *nh = realloc(g_held, nc * sizeof *nh);
+        if (!nh) return false;
+        g_held = nh;
+        g_held_cap = nc;
+    }
+    struct action *copy = malloc(sizeof *copy);
+    if (!copy) return false;
+    const char *why;
+    int same;
+    int k = prop_make(a, false, &why, &same);
+    if (k < 0) { free(copy); return false; }
+    *copy = *a;
+    struct held_call *h = &g_held[g_nheld++];
+    memset(h, 0, sizeof *h);
+    h->req = g_cur_req;
+    h->act = copy;
+    h->d_raw = d_raw;
+    snprintf(h->rule_id, sizeof h->rule_id, "%s", rule_id ? rule_id : "none");
+    memcpy(h->prop, g_prop[k].id, sizeof h->prop);
+    clock_gettime(CLOCK_MONOTONIC, &h->t0);           /* when it was decided: now less its latency */
+    long long t0ns = (long long)h->t0.tv_sec * 1000000000LL + h->t0.tv_nsec - (long long)latency_ns;
+    h->t0.tv_sec = (time_t)(t0ns / 1000000000LL);
+    h->t0.tv_nsec = (long)(t0ns % 1000000000LL);
+    g_hold_swallow = g_cur_req.id;
+    FILE *f = rec_begin();
+    fprintf(f, "{\"event\":\"step_up\",\"run\":\"%s\",\"id\":\"%s\",\"mode\":\"hold\",\"state\":\"held\","
+            "\"rule_line\":%d,\"timeout\":%u,\"approvers\":\"%s\",\"agent_pid\":%d,\"action\":\"%s\",\"resolved\":\"",
+            g_run_id, h->prop, su->line, su->su_timeout ? su->su_timeout : VDP_SU_TIMEOUT_DEFAULT, su->su_approvers,
+            (int)pid, action_kind_name(a->kind));
+    json_escape(f, a->resolved);
+    fputs("\",\"proposal\":\"", f);
+    json_escape(f, g_prop[k].text);
+    fprintf(f, "\",\"held\":%zu,\"timestamp_ns\":%lld}\n", g_nheld, gr_now_ns());
+    rec_end(NULL);
+    return true;
+}
+
+static int held_find(const char *prop) {
+    for (size_t i = 0; i < g_nheld; i++) if (!strcmp(g_held[i].prop, prop)) return (int)i;
+    return -1;
+}
+
+static void held_drop(size_t i) {
+    free(g_held[i].act);
+    memmove(&g_held[i], &g_held[i + 1], (g_nheld - i - 1) * sizeof g_held[0]);
+    g_nheld--;
+}
+
+/* A held call refused (denied, or past its timeout): answered EACCES and
+ * recorded now, its record naming its proposal */
+static void held_refuse(size_t i) {
+    struct held_call *h = &g_held[i];
+    bool answer = g_grant_notify_fd >= 0 && notif_id_valid(g_grant_notify_fd, h->req.id);
+    if (answer || g_grant_notify_fd < 0) {
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        g_held_end = h->prop;
+        emit_pathology(g_report_seq++, (pid_t)h->req.pid, h->act, h->d_raw, DEC_DENY, h->rule_id,
+                       (uint64_t)(t1.tv_sec - h->t0.tv_sec) * 1000000000ULL + (uint64_t)(t1.tv_nsec - h->t0.tv_nsec),
+                       EACCES);
+        g_held_end = NULL;
+    }
+    if (answer) send_errno(g_grant_notify_fd, h->req.id, EACCES);
+    held_drop(i);
+}
+
+/* Each round: a held call whose notification has ended (its caller
+ * interrupted, or gone) ends `abandoned` */
+static void step_up_end_record(const struct proposal *pp, const char *ending, const char *grant_id,
+                               long long uid, const char *who, const char *reason);
+static void held_check(void) {
+    for (size_t i = g_nheld; i-- > 0;) {
+        if (g_grant_notify_fd < 0 || notif_id_valid(g_grant_notify_fd, g_held[i].req.id)) continue;
+        int pi = prop_find(g_held[i].prop);
+        if (pi >= 0) {
+            step_up_end_record(&g_prop[pi], "abandoned", NULL, -1, NULL, NULL);
+            prop_free((size_t)pi);
+        }
+        held_drop(i);
+    }
 }
 
 /* After the decision record (seq): the new proposal's own record */
@@ -374,6 +601,8 @@ static void grant_expire(void) {
     long long now = gr_now_ms();
     for (size_t i = g_nprop; i-- > 0;)
         if (g_prop[i].expires_ms <= now) {
+            int hi = held_find(g_prop[i].id);           /* a held call is refused, then the proposal ends */
+            if (hi >= 0) held_refuse((size_t)hi);
             step_up_end_record(&g_prop[i], "timeout", NULL, -1, NULL, NULL);
             prop_free(i);
         }
@@ -381,6 +610,7 @@ static void grant_expire(void) {
 
 /* At the run's end: each open proposal ends `abandoned` */
 static void grant_end_all(void) {
+    while (g_nheld) held_drop(g_nheld - 1);        /* the run is ending: its callers are gone */
     while (g_nprop) {
         step_up_end_record(&g_prop[g_nprop - 1], "abandoned", NULL, -1, NULL, NULL);
         prop_free(g_nprop - 1);
@@ -498,6 +728,8 @@ static const char *apv_answer(const struct ucred *cr, bool approve, const char *
     const char *no = apv_may(cr->uid, cr->gid, su, who);
     if (no) { snprintf(ans, an, "refused: %s", no); return ans; }
     if (!approve) {
+        int hi = held_find(pp->id);                     /* a held call is refused first */
+        if (hi >= 0) held_refuse((size_t)hi);
         step_up_end_record(pp, "denied", NULL, (long long)cr->uid, who, reason);
         prop_free((size_t)pi);
         return "denied";
@@ -556,6 +788,12 @@ static const char *apv_answer(const struct ucred *cr, bool approve, const char *
     fprintf(f, "\",\"timestamp_ns\":%lld}\n", gr_now_ns());
     rec_end(NULL);
     step_up_end_record(pp, "approved", g->id, (long long)cr->uid, who, reason);
+    int hi = held_find(pp->id);                         /* a held call is decided again, now */
+    if (hi >= 0) {
+        if (g_nreplay < sizeof g_replay_q / sizeof g_replay_q[0]) g_replay_q[g_nreplay++] = g_held[hi].req;
+        else held_refuse((size_t)hi), hi = -1;
+        if (hi >= 0) held_drop((size_t)hi);
+    }
     prop_free((size_t)pi);
     snprintf(ans, an, "approved %s", g->id);
     return ans;

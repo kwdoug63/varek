@@ -1306,6 +1306,13 @@ static bool grant_certify(const struct policy *p, struct action *a, int subj, in
 static void step_up_note(const struct action *a, decision_t d_raw, decision_t d_final, char *buf, size_t n);
 static void step_up_after(uint64_t seq);
 static void grant_end_all(void);
+static bool hold_take(pid_t pid, const struct action *a, decision_t d_raw, decision_t d_final,
+                      const char *rule_id, uint64_t latency_ns);     /* v1.42 step 3 */
+static bool hold_swallow(uint64_t id, bool refusal);
+static void hold_round(int notify_fd);
+static void hold_cur(const struct seccomp_notif *req);
+static bool hold_replay_pop(struct seccomp_notif *req);
+static void held_check(void);
 
 static decision_t policy_decide(const struct policy *p, struct action *a)
 {
@@ -3123,6 +3130,9 @@ static void emit_pathology(uint64_t seq,
 {
     bool held = rule_id && !strcmp(rule_id, "outside_plan");   /* v1.35 step 4 */
     if (!g_log) return;
+    /* v1.42 step 3: a call a mode=hold rule refuses is held, not answered;
+     * its record is written when it ends */
+    if (hold_take(pid, a, d_raw, d_final, rule_id, latency_ns)) return;
     /* v1.31 (the shared soak): a checkpoint seals at most checkpoint_every
      * decision records. It is written between notifications
      * (maybe_checkpoint), but one notification or one pass over the proxy's
@@ -3232,6 +3242,7 @@ static void send_simple(int notify_fd, uint64_t id, decision_t d) {
         .flags = 0,
     };
     if (d == DEC_ALLOW) resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+    if (hold_swallow(id, d != DEC_ALLOW)) return;       /* v1.42 step 3: held */
     ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);
 }
 
@@ -3241,6 +3252,7 @@ static void send_errno(int notify_fd, uint64_t id, int err) {
     struct seccomp_notif_resp resp = {
         .id = id, .val = 0, .error = -err, .flags = 0,
     };
+    if (hold_swallow(id, err != 0)) return;             /* v1.42 step 3: held */
     ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);
 }
 
@@ -4217,6 +4229,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
     bool bootstrap_done = false;
     while (!g_stop && !g_log_broken) {
         struct seccomp_notif req;
+        hold_round(notify_fd);                      /* v1.42 step 3 */
         /* v1.36 step 12: the container's first call, received when it tied
          * the container to its listener (node_tie): its caller waits, and
          * nothing else comes from it until it is answered */
@@ -4225,6 +4238,8 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             g_nr.held = false;
             goto decide;
         }
+        /* v1.42 step 3: a held call approved: decided again, within its grant */
+        if (hold_replay_pop(&req)) goto decide;
         /* v1.9.3: wait on the listener AND the target's pidfd. Blocking in
          * NOTIF_RECV alone can hang forever if the target exits between the
          * g_stop check and the ioctl (the SIGCHLD is already spent).
@@ -4280,6 +4295,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         int pr = poll(pfds, (nfds_t)(rvi + 4), to);
         if (pr >= 0) obo_check(notify_fd);
         if (pr >= 0) grant_expire();
+        if (pr >= 0) held_check();                  /* v1.42 step 3: a held call's caller gone */
         if (pr > 0 && (pfds[rvi + 2].revents & POLLIN)) sub_cn_drain();
         if (pr < 0) {
             if (errno == EINTR) continue;
@@ -4331,6 +4347,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         }
 
     decide:;
+        hold_cur(&req);                             /* v1.42 step 3: the call being decided */
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -7245,7 +7262,8 @@ int main(int argc, char **argv) {
         int notify_fd =
             install_baseline_user_notif_filter_ex(getenv("VAREK_WARDEN_OBSERVE") != NULL,
                                                   (p.v.open_as_agent ? WD_FILTER_CHANGES : 0) |
-                                                  (g_dry ? WD_FILTER_DRY : 0));   /* v1.29 */
+                                                  (g_dry ? WD_FILTER_DRY : 0) |   /* v1.29 */
+                                                  (grant_holds(&p) ? WD_FILTER_WAITKILL : 0));   /* v1.42 */
         if (notify_fd < 0) { perror("seccomp"); _exit(1); }
         /* v1.12: hand the fd NUMBER to the supervisor and wait for it to pull
          * the fd via pidfd_getfd(). write()/read() are admitted; no sendmsg. */
