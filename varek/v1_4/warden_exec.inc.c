@@ -346,7 +346,7 @@ static int exec_consider(const struct policy *p, const char *cand, size_t *admit
     int dri = -1;
     if (realpath(cand, real) && strcmp(real, cand) != 0 &&
         vdp_decide_subj(&p->v, g_exec_subj, VDP_KIND_EXEC, real, 0, false, &dri, &why) == VDP_UNSATISFIED &&
-        dri >= 0 && p->v.rules[dri].verb == VDP_DENY) {
+        dri >= 0 && p->v.rules[dri].verb != VDP_ALLOW) {           /* v1.42: or step_up */
         fprintf(stderr, "[warden] note: launch set: %s (line %d) is %s, which line %d denies; it is not "
                 "in the launch set\n", cand, p->v.rules[ri].line, real, p->v.rules[dri].line);
         return 0;

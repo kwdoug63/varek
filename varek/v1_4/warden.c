@@ -564,7 +564,11 @@ static int policy_load(const char *path, struct policy *p) {
             strcmp(ci.subagent, r->subagent) ||
             /* v1.31: the subject a rule decides for, the confined subject it launches, an mcp server's pin */
             ci.subj != r->subj || ci.confined_subj != r->confined_subj || ci.mcp_server != r->mcp_server ||
-            strcmp(ci.sha256, r->sha256)) {
+            strcmp(ci.sha256, r->sha256) ||
+            /* v1.42: a step_up rule and its options */
+            ci.step_up != (r->verb == VDP_STEP_UP) || ci.su_mode != r->su_mode || ci.su_scope != r->su_scope ||
+            ci.su_timeout != r->su_timeout || strcmp(ci.su_approvers, r->su_approvers) ||
+            strcmp(ci.su_notify, r->su_notify)) {
             fprintf(stderr, "[warden] policy %s:%d: the decision procedure and the certificate "
                     "checker read this rule differently; refusing to start\n", path, r->line);
             return -1;
@@ -669,7 +673,7 @@ static int policy_load(const char *path, struct policy *p) {
             fprintf(stderr, "[warden] policy %s:%d: WARNING: %s %s rule can never "
                     "fire: every action it matches is decided by an earlier rule, "
                     "or it matches no string within the length bound\n",
-                    path, r->line, r->verb == VDP_ALLOW ? "allow" : "deny",
+                    path, r->line, vdp_verb_name(r->verb),
                     vdp_kind_name(r->kind));
         } else if (rr == VDP_REACH_UNKNOWN) {
             fprintf(stderr, "[warden] policy %s:%d: note: reachability not decided "
@@ -2830,7 +2834,7 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
             if (r->kind == VDP_KIND_HOST && r->s.name) g_any_name = true;
             if (r->kind == VDP_KIND_HOST && r->s.wild && r->verb == VDP_ALLOW) g_any_wild = true;
             if (r->kind != VDP_KIND_HOST || !r->s.name || r->s.wild) continue;
-            if (r->verb != (pass == 0 ? VDP_ALLOW : VDP_DENY)) continue;
+            if ((r->verb == VDP_ALLOW) != (pass == 0)) continue;   /* v1.42: step_up names with deny's */
             char name[WR_NAME_MAX + 1];
             const char *colon = memchr(r->s.c, ':', r->s.len);
             size_t nl = colon ? (size_t)(colon - r->s.c) : r->s.len;

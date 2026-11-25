@@ -168,17 +168,34 @@ static int canon_for_open(const char *p, char out[PATH_MAX], int depth) {
     return -1;
 }
 
+/* v1.42: a grant file, read by the checker's own parser against pol */
+static int load_grant_file(const vdpc_policy_t *pol, const char *path, vdpc_grant_t *g) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "%s: %s\n", path, strerror(errno)); return -1; }
+    static char gb[16386];
+    size_t n = fread(gb, 1, sizeof gb, f);
+    fclose(f);
+    char err[512];
+    if (vdpc_grant_load(pol, gb, n, g, err, sizeof err) < 0) { fprintf(stderr, "%s\n", err); return -1; }
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    /* v1.42: batch GRANT..., and grant GRANT */
+    bool gbatch = argc > 3 && argc <= 3 + 16 && !strcmp(argv[2], "batch");
+    bool gcheck = argc == 4 && !strcmp(argv[2], "grant");
+    if (gbatch || gcheck) goto args_ok;
     if (argc != 3 || (strcmp(argv[2], "digest") && strcmp(argv[2], "batch") &&
                       strcmp(argv[2], "holds") && strcmp(argv[2], "openable") &&
                       strcmp(argv[2], "kinds") && strcmp(argv[2], "rules") && strcmp(argv[2], "proxy") &&
                       strcmp(argv[2], "launches") && strcmp(argv[2], "matches") &&
                       strcmp(argv[2], "openas") &&
                       strcmp(argv[2], "credentials") && strcmp(argv[2], "identity"))) {
-        fprintf(stderr, "usage: %s <policy> digest|batch|holds|openable|kinds|rules|matches|proxy|launches|"
+        fprintf(stderr, "usage: %s <policy> digest|batch [GRANT...]|grant GRANT|holds|openable|kinds|rules|matches|proxy|launches|"
                 "openas|credentials|identity\n", argv[0]);
         return 2;
     }
+args_ok:;
     FILE *f = fopen(argv[1], "rb");
     if (!f) { fprintf(stderr, "%s: %s\n", argv[1], strerror(errno)); return 2; }
     char *buf = NULL;
@@ -306,7 +323,7 @@ int main(int argc, char **argv) {
             vdpc_rule_info_t ri;
             vdpc_rule_info(&pol, i, &ri);
             printf("%c %c %c %x %x %c %d %u %u %u ", ri.kind == VDPC_PATH ? 'p' : ri.kind == VDPC_HOST ? 'h' : ri.kind == VDPC_REQUEST ? 'r' : ri.kind == VDPC_MCP ? 'm' : 'e',
-                   ri.allow ? 'a' : 'd', ri.name ? 'n' : '-', (unsigned)ri.mask, (unsigned)ri.value,
+                   ri.allow ? 'a' : ri.step_up ? 's' : 'd', ri.name ? 'n' : '-', (unsigned)ri.mask, (unsigned)ri.value,
                    ri.wild ? 'w' : '-', ri.line, (unsigned)ri.names, (unsigned)ri.rate,
                    (unsigned)ri.max_body);
             for (size_t k = 0; k < ri.clen; k++) printf("%02x", (unsigned char)ri.c[k]);
@@ -401,6 +418,16 @@ int main(int argc, char **argv) {
         vdpc_free(&pol);
         return 0;
     }
+    /* v1.42: the grants the batch's certificates may name */
+    static vdpc_grant_t grants[16];
+    size_t ngrants = 0;
+    if (gcheck || gbatch) {
+        for (int i = 3; i < argc; i++) {
+            if (load_grant_file(&pol, argv[i], &grants[ngrants]) < 0) { vdpc_free(&pol); return 2; }
+            ngrants++;
+        }
+        if (gcheck) { printf("{\"grant\":\"ok\"}\n"); return 0; }
+    }
     while ((n = getline(&line, &lcap, stdin)) >= 0) {
         while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
         if (n == 0) continue;
@@ -411,6 +438,12 @@ int main(int argc, char **argv) {
         char *rs = strtok_r(NULL, " ", &save);
         char *ws = strtok_r(NULL, " ", &save);
         char *sj = strtok_r(NULL, " ", &save);          /* v1.31: @N, the calling subject (default @0) */
+        /* v1.42: grant=G:RULE:WITNESS, an ALLOW under grant G (its index on
+         * the command line): RULE and WITNESS are the grant's half */
+        char *gs = NULL;
+        if (sj && !strncmp(sj, "grant=", 6)) { gs = sj; sj = NULL; }
+        else gs = strtok_r(NULL, " ", &save);
+        if (gs && strncmp(gs, "grant=", 6)) { printf("{\"check\":\"error\",\"why\":\"bad input line\"}\n"); continue; }
         if (hx && !strcmp(hx, "=")) hx = (char *)"";   /* empty string */
         int kind = !k ? -1 : !strcmp(k, "path") ? VDPC_PATH : !strcmp(k, "host") ? VDPC_HOST
                  : !strcmp(k, "exec") ? VDPC_EXEC : !strcmp(k, "request") ? VDPC_REQUEST
@@ -449,8 +482,28 @@ int main(int argc, char **argv) {
             printf("{\"check\":\"error\",\"why\":\"bad flags\"}\n");
             continue;
         }
-        char why[160];
-        if (vdpc_check_subj(&pol, (int)subj, kind, s, sl, flags, has_flags, &c, why, sizeof why)) {
+        char why[240];
+        int ok;
+        if (gs) {
+            /* grant=G:RULE:WITNESS */
+            uint32_t gi = 0, gr = 0;
+            const char *e1, *e2;
+            vdpc_cert_t gc;
+            memset(&gc, 0, sizeof gc);
+            if (parse_u32(gs + 6, &e1, &gi) < 0 || *e1 != ':' || gi >= ngrants) {
+                printf("{\"check\":\"error\",\"why\":\"bad grant\"}\n");
+                continue;
+            }
+            if (!strncmp(e1 + 1, "-1:", 3)) { gc.r = -1; e2 = e1 + 3; }
+            else if (parse_u32(e1 + 1, &e2, &gr) < 0 || *e2 != ':' || gr > 1000) {
+                printf("{\"check\":\"error\",\"why\":\"bad grant\"}\n");
+                continue;
+            } else gc.r = (int)gr;
+            if (parse_witness(e2 + 1, &gc) < 0) { printf("{\"check\":\"error\",\"why\":\"bad grant witness\"}\n"); continue; }
+            ok = vdpc_check_grant(&pol, &grants[gi], (int)subj, kind, s, sl, flags, has_flags, &c, &gc, why, sizeof why);
+        } else
+            ok = vdpc_check_subj(&pol, (int)subj, kind, s, sl, flags, has_flags, &c, why, sizeof why);
+        if (ok) {
             printf("{\"check\":\"ok\"}\n");
         } else {
             printf("{\"check\":\"reject\",\"why\":\"");
