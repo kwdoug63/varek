@@ -611,10 +611,24 @@ class GrantsCheck:
     SHA-256 of its text; an ALLOW under a grant names it (cert_grant), within
     its count, its time and its run, and its certificate's two halves are
     re-checked by the checker (MainLoop's rows name the grant's file). The
-    checker reads each grant itself: one it refuses fails the batch."""
+    checker reads each grant itself: one it refuses fails the batch.
 
-    def __init__(self, run, problems):
+    v1.42 step 4 (scope=run): a call held with scope=run freezes the run.
+    run_start says whether it can be frozen (scope_run); a hold with
+    scope=run where it cannot is a problem. The freeze is recorded
+    (run_frozen) right after the hold that began it, and the thaw
+    (run_thawed) only once no call held with scope=run is open, and after
+    an approved one is decided again; the run does not end frozen. A call
+    refused at once because the run cannot be frozen says why (unheld)."""
+
+    def __init__(self, run, problems, rs=None):
         self.run, self.problems = run, problems
+        sr = (rs or {}).get("scope_run")
+        self.can_freeze = isinstance(sr, dict) and sr.get("freeze") is True
+        self.frozen = False
+        self.await_frz = None                # a hold with scope=run whose run_frozen comes next
+        self.runheld = set()                 # held with scope=run, not yet thawed after
+        self.replays = set()                 # approved, held with scope=run: decided again before the thaw
         self.props = {}                      # id -> {"seq", "ended", "text"}
         self.named = {}                      # proposal id named by a decision -> its seq
         self.grants = {}                     # id -> {"index", "count", "until", "run", "used", "text"}
@@ -640,8 +654,23 @@ class GrantsCheck:
                         g["run"] = x[4:]
         return g
 
+    def _freeze_due(self):
+        if self.await_frz is not None and not self.frozen:
+            self.problems.append(f"step_up {self.await_frz}: held with scope=run, but no run_frozen follows it")
+        self.await_frz = None
+
     def rec(self, r):
         p = self.problems
+        self._freeze_due()
+        if "unheld" in r and (not isinstance(r.get("unheld"), str) or r.get("decision_final") == "ALLOW" or
+                              "step_up" not in r):
+            p.append(f"seq {r.get('seq')}: an unheld note on a call not refused by a step_up rule")
+        if self.replays:                     # v1.42 step 4: an approved call held with scope=run, decided again
+            g = self.grants.get(r.get("cert_grant")) if r.get("cert_grant") else None
+            if g is not None and g.get("prop") in self.replays:
+                self.replays.discard(g["prop"])
+            elif str(r.get("step_up_why", "")).startswith("held and approved"):
+                self.replays.pop()
         if "step_up" in r:
             if r.get("decision_final") == "ALLOW" or r.get("decision_raw") != "DENY":
                 p.append(f"seq {r.get('seq')}: a step_up proposal on a call not refused by a step_up rule")
@@ -685,6 +714,26 @@ class GrantsCheck:
     def ev(self, e):
         p = self.problems
         ev = e.get("event")
+        if ev != "run_frozen":
+            self._freeze_due()
+        if ev == "run_frozen":               # v1.42 step 4
+            if self.frozen:
+                p.append("run_frozen while the run was frozen already")
+            elif self.await_frz is None or e.get("step_up") != self.await_frz:
+                p.append(f"run_frozen for {e.get('step_up')!r}, which is not the hold with scope=run just recorded")
+            self.frozen, self.await_frz = True, None
+            return
+        if ev == "run_thawed":
+            if not self.frozen:
+                p.append("run_thawed while the run was not frozen")
+            for sid in sorted(self.runheld):
+                if not self.props[sid]["ended"]:
+                    p.append(f"run_thawed while {sid}, held with scope=run, was still held")
+            if self.replays:
+                p.append(f"run_thawed before {sorted(self.replays)[0]}, approved and held with scope=run, was "
+                         f"decided again")
+            self.frozen, self.runheld, self.replays = False, set(), set()
+            return
         if ev == "step_up":
             sid = e.get("id")
             if not isinstance(sid, str) or sid in self.props:
@@ -702,6 +751,16 @@ class GrantsCheck:
                 p.append(f"step_up {sid}: no proposal")
             self.props[sid] = {"ended": False, "text": e.get("proposal"), "held": held, "refused": False}
             self.nprop += 1
+            if held:                             # v1.42 step 4: its scope
+                sc = e.get("scope")
+                if sc not in ("run", "thread"):
+                    p.append(f"step_up {sid}: held with a scope the Warden does not write ({sc!r})")
+                elif sc == "run":
+                    if not self.can_freeze:
+                        p.append(f"step_up {sid}: held with scope=run, where run_start says the run cannot be frozen")
+                    self.runheld.add(sid)
+                    if not self.frozen:
+                        self.await_frz = sid
         elif ev == "grant":
             gid, text, prop = e.get("id"), e.get("text"), e.get("proposal")
             if not isinstance(text, str) or not isinstance(gid, str) or \
@@ -745,10 +804,15 @@ class GrantsCheck:
                 g = self.grants.get(e.get("grant"))
                 if g is None or g["prop"] != sid:
                     p.append(f"step_up_end for {sid}: approved, but no grant record of its approval before it")
+                if sid in self.runheld and pr["held"]:
+                    self.replays.add(sid)        # v1.42 step 4: decided again before the thaw
             elif end == "denied" and not isinstance(e.get("approver_uid"), int):
                 p.append(f"step_up_end for {sid}: denied by no one")
 
     def finish(self, complete):
+        self._freeze_due()
+        if complete and self.frozen:
+            self.problems.append("the run ended frozen (no run_thawed after its last run_frozen)")
         for sid, seq in self.named.items():
             self.problems.append(f"seq {seq}: names proposal {sid}, which no step_up record holds")
         if complete:
@@ -5028,7 +5092,7 @@ def start_checks(a, meta, rs, run, sec, res, prules, rules, names_policy, proxy_
     k["changes"] = ChangesCheck(openas_policy, sec["changes"])
     k["dry"] = DryCheck(rs, sec)
     k["hold"] = HoldCheck(rs, sec["hold_head"], sec["hold"])
-    k["grants"] = GrantsCheck(run, sec["grants"])                         # v1.42
+    k["grants"] = GrantsCheck(run, sec["grants"], rs)                     # v1.42
     try:                                                                  # v1.27.1
         nx = check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, Section(), quiet=True)
     except (OSError, ValueError):

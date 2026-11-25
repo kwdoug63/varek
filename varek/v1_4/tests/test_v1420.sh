@@ -27,7 +27,7 @@
 #      hold, symbolic flags a grant does not cover).
 #
 # Step 2, runtime grants in mode=grant (section 5, as root):
-#   5. A policy needing a step not built yet (mode=hold) is refused at start.
+#   5. A policy needing a step not built yet (notify=) is refused at start.
 #      A read the step_up rule refuses proposes the narrowest grant, which
 #      the approvers' socket lists only to who may answer it. The agent's own
 #      user, another user (no approvers=), and grants wider than the proposal
@@ -56,6 +56,21 @@
 #      at the proxy, each proposal the call itself; approved, each is sent
 #      on; denied, the request is refused (403) and never reaches the server;
 #      the records and the audit.
+#
+# Step 4, scope=run (section 8, as root):
+#   8. Where the run can be frozen (cgroup v2, and Linux 5.19 or later for a
+#      held call to wait through the freeze): a read a scope=run rule holds
+#      freezes the run, so another process's counter stops; approved, the
+#      read goes on, then the run is thawed and the counter goes on; past
+#      the timeout, refused, then thawed; the records in order (step_up
+#      scope run, run_frozen, the ending, the call decided again,
+#      run_thawed) and the audit, which refuses a thaw moved before the
+#      ending or before the call decided again, and a freeze or thaw
+#      dropped; the run stopped while frozen thaws after its endings. Where
+#      it cannot (forced with VAREK_WARDEN_TEST_NO_FREEZE, and on such a
+#      host), run_start says why and the read is refused at once with a
+#      proposal, its record saying why it was not held (unheld), the counter
+#      going on; the audit passes. A startup check says which.
 #
 # Usage: sudo ./test_v1420.sh   (from varek/v1_4, after `make warden tools/vdp_check tools/vdp_cert_check`;
 #        sections 1 to 4 need no root, and run without it)
@@ -281,9 +296,9 @@ start() {   # start POLICY OUT N: the Warden on the agent, in the background; SO
 }
 recs() { python3 -c "import json,sys; rs=[json.loads(l) for l in open(sys.argv[1]) if l.startswith('{')]; sys.exit(0 if $2 else 1)" "$1"; }
 
-printf "${BASE}step_up path $W/data/ scope=run\n" > "$W/hold.txt"
+printf "${BASE}step_up path $W/data/ notify=https://hooks.example.test/x\n" > "$W/hold.txt"
 o="$("$WARDEN" "$W/hold.txt" --check-startup 2>&1)"
-grep -q "scope=run is not built yet" <<<"$o" && pass "a policy with scope=run is refused at start (built in step 4)" || flunk "scope=run at start: $o"
+grep -q "notify= is not built yet" <<<"$o" && pass "a policy with notify= is refused at start (built in step 7)" || flunk "notify= at start: $o"
 
 printf "${BASE}step_up path $W/data/ timeout=30\nstep_up host api.example.test:443\n" > "$W/p1.txt"     # step_up on line 9, the host one 10
 start "$W/p1.txt" "$W/r1" 80
@@ -551,6 +566,74 @@ grep -qx "MCP 200" "$W/x.out" && grep -q "GOT POST /mcp" "$W/echo.log" && pass "
 check "the records: three held, two allowed under their grants, one refused naming its proposal" recs "$W/x.log" \
   "len([r for r in rs if r.get('event') == 'step_up' and r.get('state') == 'held']) == 3 and len([r for r in rs if r.get('cert_grant') and r.get('decision_final') == 'ALLOW' and r.get('action') in ('net.request', 'net.mcp')]) == 2 and [r for r in rs if r.get('held') is True and r.get('action') == 'net.request' and r['decision_final'] == 'DENY']"
 audit_ok "$W/x.txt" "$W/x.log" && pass "the audit passes the run" || flunk "audit x: $(grep PROBLEM "$W/x.log.audit" | head -2)"
+
+echo "== 8. step 4: scope=run, the run frozen while a call is held (as root) =="
+mkdir -p "$W/out"; chmod 777 "$W/out"
+cat > "$W/bin/tick.sh" <<'AG'
+# a counter in one process; then a read (held) in another; the counter's last value at the end
+( i=0; while [ $i -lt 40 ]; do i=$((i+1)); echo $i > "$2/n"; sleep 0.1; done ) &
+until [ -s "$2/n" ]; do sleep 0.1; done; sleep 0.3
+( if read -r l < "$1"; then echo "held: ok $l"; else echo "held: no"; fi ) &
+wait
+read -r c < "$2/n"; echo "counted: $c"
+AG
+chmod 755 "$W/bin/tick.sh"
+FB="${BASE}allow path $W/out/\n"
+printf "${FB}step_up path $W/data/ mode=hold scope=run timeout=20\n" > "$W/s1.txt"
+AU=0; AG=0
+o="$("$WARDEN" "$W/s1.txt" --check-startup 2>&1)"
+grep -q "calls held with scope=run" <<<"$o" && pass "a startup check says whether the run can be frozen" || flunk "check: $o"
+cnt() { cat "$W/out/n" 2>/dev/null || echo 0; }
+rm -f "$W/out/n"
+hstart "$W/s1.txt" "$W/s1" tick.sh "$W/data/r.csv" "$W/out"
+if grep -q "freeze the run's control group" "$W/s1.log"; then
+    S1="$(wait_prop)"
+    a="$(cnt)"; sleep 1.2; b="$(cnt)"
+    [ -n "$S1" ] && [ "$a" -gt 0 ] && [ "$a" = "$b" ] && pass "a read a scope=run rule holds freezes the run: another process's counter stops ($a)" \
+        || flunk "frozen: $S1 / $a -> $b / $(tail -3 "$W/s1.log")"
+    apv 0 0 "approve $S1" > /dev/null; wait "$WPID"
+    grep -q "held: ok a,b" "$W/s1.out" && grep -q "counted: 40" "$W/s1.out" && pass "approved, the read goes on, the run is thawed and the counter goes on" \
+        || flunk "after approval: $(cat "$W/s1.out")"
+    check "the records in order: step_up (scope run), run_frozen, step_up_end, the read decided again, run_thawed" recs "$W/s1.log" \
+      "(lambda i: i[0] < i[1] < i[2] < i[3] < i[4])([next(k for k, r in enumerate(rs) if c(r)) for c in (lambda r: r.get('event') == 'step_up' and r.get('scope') == 'run', lambda r: r.get('event') == 'run_frozen' and r.get('step_up') == '$S1', lambda r: r.get('event') == 'step_up_end' and r.get('ending') == 'approved', lambda r: r.get('resolved') == '$W/data/r.csv' and r.get('decision_final') == 'ALLOW' and r.get('cert_grant'), lambda r: r.get('event') == 'run_thawed' and r.get('frozen_ms', 0) >= 1000)]) and [r for r in rs if r.get('event') == 'run_start' and r['scope_run']['freeze'] is True]"
+    audit_ok "$W/s1.txt" "$W/s1.log" && pass "the audit passes a run frozen and thawed" || flunk "audit s1: $(grep PROBLEM "$W/s1.log.audit" | head -2)"
+    cp "$W/s1.log" "$W/r1.log"; cp "$W/s1.txt" "$W/p1.txt"
+    TH="X = [r for r in recs if isinstance(r, dict) and r.get('event') == 'run_thawed'][0]; recs.remove(X)"
+    qforge "the thaw moved before the hold's ending" "$TH; recs.insert([i for i, r in enumerate(recs) if isinstance(r, dict) and r.get('event') == 'step_up_end'][0], X)" "held with scope=run, was still held"
+    qforge "the thaw moved before the call is decided again" "$TH; recs.insert([i for i, r in enumerate(recs) if isinstance(r, dict) and r.get('event') == 'step_up_end'][0] + 1, X)" "was decided again"
+    qforge "the freeze's record dropped" "recs.remove([r for r in recs if isinstance(r, dict) and r.get('event') == 'run_frozen'][0])" "no run_frozen follows it"
+    qforge "the thaw's record dropped" "$TH" "the run ended frozen"
+
+    printf "${FB}step_up path $W/data/ mode=hold scope=run timeout=2\n" > "$W/s2.txt"
+    rm -f "$W/out/n"
+    hstart "$W/s2.txt" "$W/s2" tick.sh "$W/data/r.csv" "$W/out"
+    wait "$WPID"
+    grep -q "held: no" "$W/s2.out" && grep -q "counted: 40" "$W/s2.out" && pass "unanswered, the read is refused at the rule's timeout and the run thawed" \
+        || flunk "timeout: $(cat "$W/s2.out")"
+    check "... the refusal and the ending before the thaw" recs "$W/s2.log" \
+      "(lambda i: i[0] < i[1] < i[2])([next(k for k, r in enumerate(rs) if c(r)) for c in (lambda r: r.get('held') is True and r.get('decision_final') == 'DENY', lambda r: r.get('event') == 'step_up_end' and r.get('ending') == 'timeout', lambda r: r.get('event') == 'run_thawed')])"
+    audit_ok "$W/s2.txt" "$W/s2.log" && pass "the audit passes it" || flunk "audit s2: $(grep PROBLEM "$W/s2.log.audit" | head -2)"
+
+    rm -f "$W/out/n"
+    hstart "$W/s1.txt" "$W/s4" tick.sh "$W/data/r.csv" "$W/out"
+    S4="$(wait_prop)"
+    kill -TERM "$WPID"; wait "$WPID"
+    check "the run stopped while frozen: the hold abandoned, then the thaw, then run_end" recs "$W/s4.log" \
+      "(lambda i: i[0] < i[1] < i[2])([next(k for k, r in enumerate(rs) if c(r)) for c in (lambda r: r.get('event') == 'step_up_end' and r.get('id') == '$S4' and r.get('ending') == 'abandoned', lambda r: r.get('event') == 'run_thawed', lambda r: r.get('event') == 'run_end')])"
+    audit_ok "$W/s1.txt" "$W/s4.log" && pass "the audit passes it" || flunk "audit s4: $(grep PROBLEM "$W/s4.log.audit" | head -2)"
+else
+    printf '  %-6s %s\n' SKIP "freezing the run: this host cannot ($(grep -o 'cannot freeze the run: [^;]*' "$W/s1.log" | head -1))"
+    wait "$WPID"
+fi
+
+rm -f "$W/out/n"
+VAREK_WARDEN_TEST_NO_FREEZE=1 hstart "$W/s1.txt" "$W/s3" tick.sh "$W/data/r.csv" "$W/out"
+wait "$WPID"
+grep -q "held: no" "$W/s3.out" && grep -q "counted: 40" "$W/s3.out" && pass "where the run cannot be frozen, the read is refused at once and the run goes on" \
+    || flunk "no freeze: $(cat "$W/s3.out")"
+check "... run_start says why; the refusal names a proposal and why it was not held; nothing frozen" recs "$W/s3.log" \
+  "[r for r in rs if r.get('event') == 'run_start' and r['scope_run'] == {'freeze': False, 'why': 'VAREK_WARDEN_TEST_NO_FREEZE is set'}] and [r for r in rs if r.get('resolved') == '$W/data/r.csv' and r.get('decision_final') == 'DENY' and len(r.get('step_up', '')) == 16 and r.get('unheld') == 'scope=run: VAREK_WARDEN_TEST_NO_FREEZE is set'] and not [r for r in rs if r.get('event') in ('run_frozen', 'run_thawed') or r.get('state') == 'held']"
+audit_ok "$W/s1.txt" "$W/s3.log" && pass "the audit passes it" || flunk "audit s3: $(grep PROBLEM "$W/s3.log.audit" | head -2)"
 
 fi
 

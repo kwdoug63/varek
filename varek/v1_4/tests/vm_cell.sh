@@ -124,6 +124,7 @@ if [ "$CMD" = inside ]; then
             '^musl \('                      # no musl-gcc in Amazon Linux 2023's repositories (arm64_sweep.sh notes it)
             'no git or no v1\.13\.0 tag'     # the checkout is shallow, without tags
             'needs a host in FIPS mode'     # v1.41: these VMs are not; tests/fips_acceptance.sh runs on one
+            'cannot keep a held call waiting while the run is frozen'   # v1.42 step 4: RHEL 9's 5.14 kernel (5.19 needed); Amazon Linux 2023's 6.1 freezes
         )
         allowed="$(IFS='|'; echo "${EXPECTED_SKIPS[*]}")"
         for f in "$OUT"/sweep/test-*.log "$OUT"/sweep/crosscheck.log; do

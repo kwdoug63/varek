@@ -313,24 +313,27 @@ static int sub_find_cgroup2(char *mnt, size_t mn, char *root, size_t rn, char *s
 /* Is the policy's writing reach into the control groups? The paths a write
  * would move a process with, for the run's group (run, as the agent sees
  * it) and each sub-agent's first. */
-static int sub_refuse_writable(const struct policy *p, const char *mnt, const char *run) {
+static bool sub_writable_path(const struct policy *p, const char *mnt, const char *run, char *path, size_t pn) {
     static const char *const kFiles[] = { "cgroup.procs", "cgroup.threads", "cgroup.freeze", "cgroup.kill",
                                           "cgroup.subtree_control" };
-    char path[PATH_MAX + 128];
     for (size_t f = 0; f < sizeof kFiles / sizeof kFiles[0]; f++) {
         const char *bases[3] = { mnt, run, NULL };
         for (int b = 0; bases[b]; b++) {
-            snprintf(path, sizeof path, "%s/%s", bases[b], kFiles[f]);
-            if (vdpc_path_writable(&p->c, path, strlen(path))) goto refuse;
+            snprintf(path, pn, "%s/%s", bases[b], kFiles[f]);
+            if (vdpc_path_writable(&p->c, path, strlen(path))) return true;
         }
         for (size_t i = 0; i < p->v.n; i++) {
             if (!p->v.rules[i].subagent[0]) continue;
-            snprintf(path, sizeof path, "%s/%s-1/%s", run, p->v.rules[i].subagent, kFiles[f]);
-            if (vdpc_path_writable(&p->c, path, strlen(path))) goto refuse;
+            snprintf(path, pn, "%s/%s-1/%s", run, p->v.rules[i].subagent, kFiles[f]);
+            if (vdpc_path_writable(&p->c, path, strlen(path))) return true;
         }
     }
-    return 0;
-refuse:
+    return false;
+}
+
+static int sub_refuse_writable(const struct policy *p, const char *mnt, const char *run) {
+    char path[PATH_MAX + 128];
+    if (!sub_writable_path(p, mnt, run, path, sizeof path)) return 0;
     fprintf(stderr, "[warden] the policy lets the agent write %s: with sub-agents named, the control groups "
             "must be out of the agent's reach (deny the cgroup filesystem, %s); refusing to start\n", path, mnt);
     return -1;
@@ -690,8 +693,9 @@ static int sub_setup(const struct policy *p, bool check_only, bool agent_root) {
 }
 
 /* The agent, in its child before its launch (still root): into the run's group */
+static bool g_frz_own;               /* v1.42 step 4: the run's group was made for freezing alone */
 static int sub_enter_run(void) {
-    if (!g_sub_on) return 0;
+    if (!g_sub_on && !g_frz_own) return 0;
     char procs[PATH_MAX + 32];
     snprintf(procs, sizeof procs, "%s/cgroup.procs", g_cg_dir);
     int fd = open(procs, O_WRONLY | O_CLOEXEC);
@@ -1089,7 +1093,7 @@ static void sub_launch_fields(struct action *a, int s) {
  * the agent while sub-agents are named: true when fd is such a file and the
  * open writes */
 static bool sub_cgroup_write(int fd, int flags) {
-    if (!g_sub_on || ((flags & O_ACCMODE) == O_RDONLY && !(flags & O_TRUNC))) return false;
+    if ((!g_sub_on && !g_frz_ok) || ((flags & O_ACCMODE) == O_RDONLY && !(flags & O_TRUNC))) return false;
     struct statfs sf;
     return fstatfs(fd, &sf) == 0 && (sf.f_type == CGROUP2_SUPER_MAGIC || sf.f_type == CGROUP_SUPER_MAGIC);
 }
@@ -1097,11 +1101,13 @@ static bool sub_cgroup_write(int fd, int flags) {
 /* The run's end: its groups removed, the deepest first (each process has
  * ended: the agent's PID namespace is gone; under the node agent, the
  * container's, as its first process has ended) */
+static int frz_set(bool on);
 static void sub_finish(void) {
-    if (!g_sub_on || !g_sub) return;
+    if ((!g_sub_on || !g_sub) && !g_frz_own) return;
+    if (g_frz_ok) (void)frz_set(false);              /* v1.42 step 4: never left frozen */
     for (int round = 0; round < 50; round++) {
         bool left = false;
-        for (size_t i = g_nsub; i-- > 1; ) {
+        for (size_t i = g_sub ? g_nsub : 0; i-- > 1; ) {
             if (g_sub[i].state == SUB_FAILED || g_sub[i].state == SUB_FREE) continue;   /* removed already */
             char dir[PATH_MAX + SUB_REL_MAX];
             sub_dir((int)i, dir, sizeof dir);
@@ -1115,4 +1121,138 @@ static void sub_finish(void) {
     }
     fprintf(stderr, "[warden] sub-agents: could not remove the run's control groups under %s\n",
             g_cg_container ? g_cg_self : g_cg_dir);
+}
+
+/* ---- v1.42 step 4: scope=run, the run frozen while a call is held ----
+ *
+ * A policy whose step_up rules hold calls with scope=run needs the run's
+ * control group (cgroup v2), so the whole run can be frozen
+ * (cgroup.freeze) while such a call is held, and thawed when its hold ends.
+ * With sub-agents named the group is theirs (each sub-agent's group is
+ * below it, frozen with it); otherwise it is made here, varek-<run> under
+ * the Warden's own, as for sub-agents, and the agent enters it before its
+ * launch. The Warden and its helpers stay outside it and go on serving.
+ *
+ * Freezing stops a thread with a signal's wake-up: a call held in the
+ * kernel must then wait for a fatal signal only
+ * (SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV, Linux 5.19 and later), or the
+ * freeze would end its wait and the kernel would notify it again. So the
+ * run can be frozen only with that (g_waitkill) and the group. Where it
+ * cannot (no cgroup v2, a group that cannot be made, a policy letting the
+ * agent write the control groups, the agent running as root, an older
+ * kernel), nothing stops the run: a call a scope=run rule would hold is
+ * refused at once instead, with a proposal (as mode=grant), its record
+ * saying why (fail closed). run_start says which. */
+
+static bool g_frozen;                   /* the run's group is frozen now */
+
+static bool frz_wanted(const struct policy *p) {
+    for (size_t i = 0; i < p->v.n; i++) {
+        const vdp_rule_t *r = &p->v.rules[i];
+        if (r->verb == VDP_STEP_UP && r->su_mode == VDP_SU_HOLD && r->su_scope == VDP_SCOPE_RUN) return true;
+    }
+    return false;
+}
+
+/* After sub_setup: the run's group for freezing. Not fatal: where the run
+ * cannot be frozen, g_frz_why says why. */
+static void frz_setup(const struct policy *p, bool check_only, bool agent_root) {
+    if (g_nr.on) return;                                 /* under the node agent nothing is held */
+    g_frz_want = frz_wanted(p);
+    if (!g_frz_want) return;
+    const char *pre = "[warden] note: calls held with scope=run";
+    if (getenv("VAREK_WARDEN_TEST_NO_FREEZE")) {         /* make test-v1420: act as if it could not */
+        snprintf(g_frz_why, sizeof g_frz_why, "VAREK_WARDEN_TEST_NO_FREEZE is set");
+    } else if (!g_waitkill) {
+        snprintf(g_frz_why, sizeof g_frz_why, "this kernel cannot keep a held call waiting while the run is frozen "
+                 "(Linux 5.19 or later is needed)");
+    } else if (g_sub_on) {
+        g_frz_ok = true;                                 /* the sub-agents' group, made (or checked) already */
+    } else if (agent_root) {
+        snprintf(g_frz_why, sizeof g_frz_why, "the agent runs as root (--run-as root) and could leave the run's "
+                 "control group");
+    } else {
+        char mnt[PATH_MAX], root[PATH_MAX], self[PATH_MAX], why[PATH_MAX + 64], wp[PATH_MAX + 128];
+        if (sub_find_cgroup2(mnt, sizeof mnt, root, sizeof root, self, sizeof self, why, sizeof why) < 0) {
+            snprintf(g_frz_why, sizeof g_frz_why, "no cgroup v2 group for the run: %.150s", why);
+            goto out;
+        }
+        size_t rl = strcmp(root, "/") ? strlen(root) : 0;
+        if (rl && (strncmp(self, root, rl) || (self[rl] && self[rl] != '/'))) {
+            snprintf(g_frz_why, sizeof g_frz_why, "the Warden's control group is outside the cgroup2 mount");
+            goto out;
+        }
+        const char *under = self + rl;
+        if (!strcmp(under, "/")) under = "";
+        int a = snprintf(g_cg_dir, sizeof g_cg_dir, "%s%s/varek-%s", mnt, under, check_only ? "RUN" : g_run_id);
+        int b = snprintf(g_cg_self, sizeof g_cg_self, "%s/varek-%s", strcmp(self, "/") ? self : "",
+                         check_only ? "RUN" : g_run_id);
+        if (a < 0 || (size_t)a >= sizeof g_cg_dir - 64 || b < 0 || (size_t)b >= sizeof g_cg_self) {
+            snprintf(g_frz_why, sizeof g_frz_why, "the run's control group's path is too long");
+            goto out;
+        }
+        if (sub_writable_path(p, mnt, g_cg_dir, wp, sizeof wp)) {
+            snprintf(g_frz_why, sizeof g_frz_why, "the policy lets the agent write %.150s", wp);
+            goto out;
+        }
+        if (check_only) {
+            char parent[PATH_MAX];
+            snprintf(parent, sizeof parent, "%s%s", mnt, under);
+            if (access(parent, W_OK) < 0)
+                snprintf(g_frz_why, sizeof g_frz_why, "cannot make groups in %.150s (%s)", parent, strerror(errno));
+            else
+                fprintf(stderr, "%s: the run's control group goes under %s, frozen while such a call is held\n",
+                        pre, parent);
+            goto out;
+        }
+        if (mkdir(g_cg_dir, 0755) < 0) {
+            snprintf(g_frz_why, sizeof g_frz_why, "cannot make the run's control group %.120s (%s)", g_cg_dir,
+                     strerror(errno));
+            goto out;
+        }
+        char fz[PATH_MAX + 32];
+        snprintf(fz, sizeof fz, "%s/cgroup.freeze", g_cg_dir);
+        if (access(fz, W_OK) < 0) {
+            snprintf(g_frz_why, sizeof g_frz_why, "the kernel's cgroup v2 has no cgroup.freeze (5.2 or later is "
+                     "needed)");
+            rmdir(g_cg_dir);
+            goto out;
+        }
+        g_frz_own = true;
+        g_frz_ok = true;
+    }
+out:
+    if (g_frz_why[0]) {
+        if (!g_sub_on) g_cg_dir[0] = '\0';
+        fprintf(stderr, "%s cannot freeze the run: %s; such a call is refused at once instead, with a proposal "
+                "(as mode=grant)\n", pre, g_frz_why);
+    } else if (g_frz_ok && !check_only) {
+        fprintf(stderr, "%s freeze the run's control group %s while held\n", pre, g_cg_self);
+    }
+}
+
+/* Freeze (or thaw) the run's group: 0, or -1 */
+static int frz_write(bool on) {
+    char f[PATH_MAX + 32];
+    snprintf(f, sizeof f, "%s/cgroup.freeze", g_cg_dir);
+    int fd = sub_cg_open(f, O_WRONLY);
+    if (fd < 0) return -1;
+    ssize_t w = write(fd, on ? "1" : "0", 1);
+    close(fd);
+    return w == 1 ? 0 : -1;
+}
+
+static long long g_frz_t0;              /* when frozen (monotonic ms) */
+/* Freeze or thaw the run (once each way): 0, or -1 with errno. A thaw that
+ * fails still counts the run as thawed for the Warden (it is said, in the
+ * record and on stderr): nothing is held any more. */
+static int frz_set(bool on) {
+    if (!g_frz_ok || on == g_frozen) return 0;
+    int rc = frz_write(on);
+    if (rc < 0 && on) return -1;
+    int e = errno;
+    g_frozen = on;
+    if (on) g_frz_t0 = mono_ms_sub();
+    errno = e;
+    return rc;
 }

@@ -79,18 +79,20 @@ static int grant_policy_check(const struct policy *p, const char *path) {
     for (size_t i = 0; i < p->v.n; i++) {
         const vdp_rule_t *r = &p->v.rules[i];
         if (r->verb != VDP_STEP_UP) continue;
-        const char *what = r->su_scope == VDP_SCOPE_RUN ? "scope=run" : r->su_notify[0] ? "notify=" : NULL;
-        if (what) {
-            fprintf(stderr, "[warden] policy %s:%d: %s is not built yet (v1.42 is being built in steps; "
-                    "this one has mode=grant and mode=hold); refusing to start\n", path, r->line, what);
+        if (r->su_notify[0]) {
+            fprintf(stderr, "[warden] policy %s:%d: notify= is not built yet (v1.42 is being built in steps; "
+                    "this one has mode=grant, mode=hold and scope=run); refusing to start\n", path, r->line);
             return -1;
         }
     }
     g_gr_p = p;
-    if (grant_holds(p) && !wd_filter_waitkill_built())
-        fprintf(stderr, "[warden] note: calls are held (mode=hold); this build cannot ask the kernel to end a "
-                "held call's wait on a fatal signal only (libseccomp before 2.6), so a signal ends it: the "
-                "call ends `abandoned` and, notified again, is held again\n");
+    /* v1.42 step 4: asked of the kernel itself (a child tries it), since
+     * the filter is loaded with the flag whatever libseccomp's version */
+    g_waitkill = grant_holds(p) && wd_filter_waitkill_built() && wd_filter_waitkill_kernel();
+    if (grant_holds(p) && !g_waitkill)
+        fprintf(stderr, "[warden] note: calls are held (mode=hold); this kernel cannot end a held call's wait on "
+                "a fatal signal only (Linux 5.19 or later is needed), so a signal ends it: the call ends "
+                "`abandoned` and, notified again, is held again\n");
     return 0;
 }
 
@@ -359,6 +361,9 @@ static size_t g_nheld;
 static const char *g_held_end;               /* a held call's proposal, on its refusal's record */
 static bool g_replaying;                     /* deciding a held call again, after its approval */
 
+static const char *g_unheld;                 /* v1.42 step 4: why the call being decided was not held (scope=run) */
+static bool su_scope_run(const vdp_rule_t *su) { return su->su_scope == VDP_SCOPE_RUN; }
+
 static void step_up_note(const struct action *a, decision_t d_raw, decision_t d_final, char *buf, size_t n) {
     buf[0] = '\0';
     g_new_prop = -1;
@@ -379,13 +384,26 @@ static void step_up_note(const struct action *a, decision_t d_raw, decision_t d_
         snprintf(buf, n, "\"step_up\":\"none\",\"step_up_why\":\"max_held\",");
         return;
     }
+    /* v1.42 step 4: a call a scope=run rule would hold, refused at once
+     * because the run cannot be frozen: the record says why */
+    char un[240] = "";
+    if (su->su_mode == VDP_SU_HOLD && su_scope_run(su) && hold_kind(a) && g_apv_listen >= 0) {
+        const char *w = g_unheld ? g_unheld : !g_frz_ok ? g_frz_why : NULL;
+        g_unheld = NULL;                         /* this call's: used once */
+        if (w) {
+            size_t l = (size_t)snprintf(un, sizeof un, "\"unheld\":\"scope=run: ");
+            for (const char *c = w; *c && l + 3 < sizeof un; c++)
+                if (*c != '"' && *c != '\\' && (unsigned char)*c >= 0x20) un[l++] = *c;
+            snprintf(un + l, sizeof un - l, "\",");
+        }
+    }
     const char *why;
     int same;
     int k = prop_make(a, true, &why, &same);
-    if (same >= 0) { snprintf(buf, n, "\"step_up\":\"%s\",", g_prop[same].id); return; }
-    if (k < 0) { snprintf(buf, n, "\"step_up\":\"none\",\"step_up_why\":\"%s\",", why ? why : "?"); return; }
+    if (same >= 0) { snprintf(buf, n, "%s\"step_up\":\"%s\",", un, g_prop[same].id); return; }
+    if (k < 0) { snprintf(buf, n, "%s\"step_up\":\"none\",\"step_up_why\":\"%s\",", un, why ? why : "?"); return; }
     g_new_prop = k;
-    snprintf(buf, n, "\"step_up\":\"%s\",", g_prop[k].id);
+    snprintf(buf, n, "%s\"step_up\":\"%s\",", un, g_prop[k].id);
 }
 
 /* ---- v1.42 step 3: mode=hold, a call held at the kernel ----
@@ -414,16 +432,68 @@ struct held_call {
     char                 rule_id[40];
     char                 prop[17];
     struct timespec      t0;
+    bool                 frz;        /* v1.42 step 4: held with scope=run: the run is frozen */
 };
 
 static struct held_call *g_held;
 static size_t g_held_cap;
 static struct seccomp_notif g_replay_q[VDP_MAX_HELD_LIMIT];  /* approved held calls, to decide again */
+static bool g_replay_frz[VDP_MAX_HELD_LIMIT];                /* v1.42 step 4: ... held with scope=run */
 static size_t g_nreplay;
 static bool g_cur_set;                       /* g_cur_req is the notification being decided */
 static struct seccomp_notif g_cur_req;
 static uint64_t g_hold_swallow;              /* the refusal of this notification is not sent */
 static int g_grant_notify_fd = -1;
+
+/* ---- v1.42 step 4: scope=run ----
+ * A call a scope=run rule holds freezes the run (frz_setup, in
+ * warden_subagent.inc.c, says whether it can be): its other threads and
+ * processes stop until the hold ends, its timeout included. The thaw
+ * comes at the top of the supervision loop, once no call held with
+ * scope=run is left, held or approved and waiting to be decided again: an
+ * approved call is answered before the run goes on. Calls already in the
+ * kernel when the freeze began are decided as any. Where the run cannot be
+ * frozen, the call is not held: it is refused at once with a proposal (as
+ * mode=grant), its record saying why (g_unheld). */
+static char g_unheld_buf[160];
+
+/* Freeze the run for a hold (proposal id prop): true when frozen (now or
+ * before), false with g_unheld */
+static bool frz_hold(void) {
+    if (!g_frz_ok) { g_unheld = g_frz_why; return false; }
+    if (g_frozen) return true;
+    if (frz_set(true) < 0) {
+        snprintf(g_unheld_buf, sizeof g_unheld_buf, "cannot freeze the run (%s)", strerror(errno));
+        g_unheld = g_unheld_buf;
+        return false;
+    }
+    return true;
+}
+
+static void frz_record(bool frozen, const char *prop, int err) {
+    FILE *f = rec_begin();
+    if (frozen)
+        fprintf(f, "{\"event\":\"run_frozen\",\"run\":\"%s\",\"step_up\":\"%s\",\"cgroup\":\"", g_run_id, prop);
+    else
+        fprintf(f, "{\"event\":\"run_thawed\",\"run\":\"%s\",\"frozen_ms\":%lld,%s%s%s\"cgroup\":\"", g_run_id,
+                mono_ms_sub() - g_frz_t0, err ? "\"error\":\"" : "", err ? strerror(err) : "", err ? "\"," : "");
+    json_escape(f, g_cg_self);
+    fprintf(f, "\",\"timestamp_ns\":%lld}\n", gr_now_ns());
+    rec_end(NULL);
+    if (!frozen && err) {
+        log_line_start();
+        fprintf(g_log, "[warden] cannot thaw the run's control group %s (%s)\n", g_cg_self, strerror(err));
+    }
+}
+
+/* Each round: thaw the run once nothing held with scope=run is left */
+static void frz_update(void) {
+    if (!g_frozen) return;
+    for (size_t i = 0; i < g_nheld; i++) if (g_held[i].frz) return;
+    for (size_t i = 0; i < g_nreplay; i++) if (g_replay_frz[i]) return;
+    int err = frz_set(false) < 0 ? errno : 0;
+    frz_record(false, NULL, err);
+}
 
 static bool hold_kind(const struct action *a) {
     return a->kind == ACT_FILE_OPEN || a->kind == ACT_FILE_STAT || a->kind == ACT_FILE_ACCESS ||
@@ -460,6 +530,8 @@ static void hold_round(int notify_fd) {
     g_cur_set = false;
     g_replaying = false;
     g_hold_swallow = 0;
+    g_unheld = NULL;
+    frz_update();                                    /* v1.42 step 4 */
 }
 
 /* The notification about to be decided */
@@ -473,6 +545,7 @@ static bool hold_replay_pop(struct seccomp_notif *req) {
     if (!g_nreplay) return false;
     *req = g_replay_q[0];
     memmove(&g_replay_q[0], &g_replay_q[1], (g_nreplay - 1) * sizeof g_replay_q[0]);
+    memmove(&g_replay_frz[0], &g_replay_frz[1], (g_nreplay - 1) * sizeof g_replay_frz[0]);
     g_nreplay--;
     g_replaying = true;
     return true;
@@ -507,12 +580,14 @@ static bool hold_take(pid_t pid, const struct action *a, decision_t d_raw, decis
         g_held = nh;
         g_held_cap = nc;
     }
+    bool was_frozen = g_frozen;
+    if (su_scope_run(su) && !frz_hold()) return false;     /* v1.42 step 4: refused at once, with a proposal */
     struct action *copy = malloc(sizeof *copy);
-    if (!copy) return false;
+    if (!copy) { if (!was_frozen) (void)frz_set(false); return false; }
     const char *why;
     int same;
     int k = prop_make(a, false, &why, &same);
-    if (k < 0) { free(copy); return false; }
+    if (k < 0) { free(copy); if (!was_frozen) (void)frz_set(false); return false; }
     *copy = *a;
     struct held_call *h = &g_held[g_nheld++];
     memset(h, 0, sizeof *h);
@@ -521,6 +596,7 @@ static bool hold_take(pid_t pid, const struct action *a, decision_t d_raw, decis
     h->d_raw = d_raw;
     snprintf(h->rule_id, sizeof h->rule_id, "%s", rule_id ? rule_id : "none");
     memcpy(h->prop, g_prop[k].id, sizeof h->prop);
+    h->frz = su_scope_run(su);
     clock_gettime(CLOCK_MONOTONIC, &h->t0);           /* when it was decided: now less its latency */
     long long t0ns = (long long)h->t0.tv_sec * 1000000000LL + h->t0.tv_nsec - (long long)latency_ns;
     h->t0.tv_sec = (time_t)(t0ns / 1000000000LL);
@@ -534,8 +610,10 @@ static bool hold_take(pid_t pid, const struct action *a, decision_t d_raw, decis
     json_escape(f, a->resolved);
     fputs("\",\"proposal\":\"", f);
     json_escape(f, g_prop[k].text);
-    fprintf(f, "\",\"held\":%zu,\"timestamp_ns\":%lld}\n", g_nheld, gr_now_ns());
+    fprintf(f, "\",\"held\":%zu,\"scope\":\"%s\",\"timestamp_ns\":%lld}\n", g_nheld,
+            su_scope_run(su) ? "run" : "thread", gr_now_ns());
     rec_end(NULL);
+    if (su_scope_run(su) && !was_frozen) frz_record(true, h->prop, 0);   /* v1.42 step 4 */
     return true;
 }
 
@@ -559,12 +637,14 @@ static bool px_hold_take(const struct action *a, decision_t d_raw, int what, uin
         g_held = nh;
         g_held_cap = nc;
     }
+    bool was_frozen = g_frozen;
+    if (su_scope_run(su) && !frz_hold()) return false;     /* v1.42 step 4: refused at once, with a proposal */
     void *copy = malloc(len);
-    if (!copy) return false;
+    if (!copy) { if (!was_frozen) (void)frz_set(false); return false; }
     const char *why;
     int same;
     int k = prop_make(a, false, &why, &same);
-    if (k < 0) { free(copy); return false; }
+    if (k < 0) { free(copy); if (!was_frozen) (void)frz_set(false); return false; }
     memcpy(copy, msg, len);
     struct held_call *h = &g_held[g_nheld++];
     memset(h, 0, sizeof *h);
@@ -574,6 +654,7 @@ static bool px_hold_take(const struct action *a, decision_t d_raw, int what, uin
     h->f1 = f1;
     h->f2 = f2;
     memcpy(h->prop, g_prop[k].id, sizeof h->prop);
+    h->frz = su_scope_run(su);
     clock_gettime(CLOCK_MONOTONIC, &h->t0);
     uint32_t timeout = su->su_timeout ? su->su_timeout : VDP_SU_TIMEOUT_DEFAULT;
     struct wp_heldnote hn = { .type = WP_MSG_HELDNOTE, .ms = timeout * 1000u, .id = conn };
@@ -585,8 +666,10 @@ static bool px_hold_take(const struct action *a, decision_t d_raw, int what, uin
     json_escape(f, a->resolved);
     fputs("\",\"proposal\":\"", f);
     json_escape(f, g_prop[k].text);
-    fprintf(f, "\",\"held\":%zu,\"timestamp_ns\":%lld}\n", g_nheld, gr_now_ns());
+    fprintf(f, "\",\"held\":%zu,\"scope\":\"%s\",\"timestamp_ns\":%lld}\n", g_nheld,
+            su_scope_run(su) ? "run" : "thread", gr_now_ns());
     rec_end(NULL);
+    if (su_scope_run(su) && !was_frozen) frz_record(true, h->prop, 0);   /* v1.42 step 4 */
     return true;
 }
 
@@ -717,10 +800,12 @@ static void grant_expire(void) {
 /* At the run's end: each open proposal ends `abandoned` */
 static void grant_end_all(void) {
     while (g_nheld) held_drop(g_nheld - 1);        /* the run is ending: its callers are gone */
+    g_nreplay = 0;
     while (g_nprop) {
         step_up_end_record(&g_prop[g_nprop - 1], "abandoned", NULL, -1, NULL, NULL);
         prop_free(g_nprop - 1);
     }
+    frz_update();                                  /* v1.42 step 4: thawed (recorded) before run_end */
 }
 
 /* ---- the approvers' socket ---- */
@@ -903,7 +988,8 @@ static const char *apv_answer(const struct ucred *cr, bool approve, const char *
         hi = -1;
     }
     if (hi >= 0) {
-        if (g_nreplay < sizeof g_replay_q / sizeof g_replay_q[0]) g_replay_q[g_nreplay++] = g_held[hi].req;
+        if (g_nreplay < sizeof g_replay_q / sizeof g_replay_q[0])
+            g_replay_frz[g_nreplay] = g_held[hi].frz, g_replay_q[g_nreplay++] = g_held[hi].req;
         else held_refuse((size_t)hi), hi = -1;
         if (hi >= 0) held_drop((size_t)hi);
     }
