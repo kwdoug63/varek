@@ -589,6 +589,18 @@ static int policy_load(const char *path, struct policy *p) {
                 "`on unknown` line differently; refusing to start\n", path);
         return -1;
     }
+    /* v1.42 step 6: and the approvers' pinned keys */
+    bool apv_same = p->v.napprovers == p->c.napprovers;
+    for (size_t k = 0; apv_same && k < p->v.napprovers; k++)
+        apv_same = !strcmp(p->v.approvers[k].key, p->c.approvers[k].key) &&
+                   !strcmp(p->v.approvers[k].group, p->c.approvers[k].group) &&
+                   !strcmp(p->v.approvers[k].name, p->c.approvers[k].name) &&
+                   p->v.approvers[k].line == p->c.approvers[k].line;
+    if (!apv_same) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read the "
+                "approver lines differently; refusing to start\n", path);
+        return -1;
+    }
     /* v1.42 step 5b: and the `on outside_plan` line */
     if (p->v.op_line != p->c.op_line || p->v.op_timeout != p->c.op_timeout ||
         p->v.op_scope != (uint8_t)p->c.op_scope || strcmp(p->v.op_approvers, p->c.op_approvers)) {
@@ -2323,6 +2335,10 @@ static bool g_frz_want;                 /* v1.42 step 4: the policy holds calls 
 static bool g_frz_ok;                   /* ... and the run can be frozen */
 static char g_frz_why[200];             /* ... or why it cannot */
 static bool g_waitkill;                 /* the kernel ends a held call's wait on a fatal signal only */
+/* v1.42 step 6: the plan's approval (warden_signed.inc.c), for run_start */
+static bool g_plan_apv;
+static char g_plan_apv_key[195], g_plan_apv_name[33], g_plan_apv_group[33], g_plan_apv_sig[VFIPS_SIG_HEX_MAX + 1];
+static char g_plan_apv_note[400];
 static void sub_obo(FILE *f, int s);
 static bool sub_cgroup_write(int fd, int flags);
 static char       g_cred_ph[WS_MAX_CREDS][WP_PH_MAX]; /* v1.28: each credential's placeholder (not a secret) */
@@ -2764,6 +2780,11 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
     fprintf(f, "\"crypto_provider\":\"%s\",", vfips_provider_label());
     /* v1.35 step 4: the run is held to this plan (if it passes the gate) */
     if (g_hold_req) fprintf(f, "\"hold\":{\"plan\":\"%s\",\"plan_sha256\":\"%s\"},", g_hold_plan_json, g_hold_plan_sha);
+    /* v1.42 step 6: the plan's approval, signed by a pinned approver's key over the plan's bytes */
+    if (g_plan_apv)
+        fprintf(f, "\"plan_approved_by\":{\"key\":\"%s\",\"name\":\"%s\",\"group\":\"%s\",\"sig\":\"%s\","
+                "\"plan_sha256\":\"%s\"},", g_plan_apv_key, g_plan_apv_name, g_plan_apv_group, g_plan_apv_sig, g_plan_snap_sha);
+    else if (g_plan_apv_note[0]) { fputs("\"plan_approval_note\":\"", f); json_escape(f, g_plan_apv_note); fputs("\",", f); }
     if (g_signing) {
         fprintf(f, "\"log_pubkey\":\"%s\",\"sigalg\":\"%s\",", g_pub_hex, VFIPS_SIGALG_P384);
     }
@@ -4266,6 +4287,7 @@ static void syn_hosts_view(const struct policy *p, FILE *f);
 #include "warden_trust.inc.c"        /* v1.26.1: the run's CA and the trust views */
 #include "warden_subagent.inc.c"     /* v1.28.1: sub-agents' control groups and attribution */
 #include "warden_grant.inc.c"        /* v1.42 step 2: runtime grants */
+#include "warden_signed.inc.c"       /* v1.42 step 6: signed approvals */
 #include "warden_exec.inc.c"         /* v1.27: the launch set and its Landlock ruleset */
 #include "warden_noexec.inc.c"       /* v1.27.1: writable directories mounted noexec */
 #include "warden_change.inc.c"       /* v1.29: changes by name */
@@ -6013,7 +6035,7 @@ static void usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s <policy.txt> [--plan <plan.txt> [--hold-to-plan] [--flow-policy <cfg>\n"
         "              [--session <id>] [--breaker-state <file>] [--gate-status <file>]]]\n"
-        "              [--sign-key <key>]\n"
+        "              [--sign-key <key>] [--grants <dir>] [--require-approved-plan]\n"
         "              [--anchor <path>] [--checkpoint-every <n>] [--run-as <user>]\n"
         "              [--dns-server <a.b.c.d[:port]>] [--dns-ttl-min <s>] [--dns-ttl-max <s>]\n"
         "              [--dns-grace-max <s>] [--psl <file>] [--shared-domains <file>]\n              [--proxy-as <user>] [--proxy-bin <warden-proxy>] [--trust-bundle <pem>]\n"
@@ -6203,6 +6225,8 @@ int main(int argc, char **argv) {
 
     const char *policy_path = argv[1];
     const char *plan_path   = NULL;
+    const char *grants_dir  = NULL;     /* v1.42 step 6: --grants DIR (standing grants) */
+    bool require_apv_plan   = false;    /* v1.42 step 6: --require-approved-plan */
     const char *key_path    = NULL;     /* v1.16 */
     const char *anchor_path = NULL;     /* v1.16 */
     const char *run_as_arg  = NULL;     /* v1.17.0 */
@@ -6251,6 +6275,10 @@ int main(int argc, char **argv) {
             anchor_path = argv[++i];
         } else if (strcmp(argv[i], "--hold-to-plan") == 0) {             /* v1.35 step 4 */
             g_hold_req = true;
+        } else if (strcmp(argv[i], "--grants") == 0 && !grants_dir && i + 1 < argc) {   /* v1.42 step 6 */
+            grants_dir = argv[++i];
+        } else if (strcmp(argv[i], "--require-approved-plan") == 0) {   /* v1.42 step 6 */
+            require_apv_plan = true;
         } else if (strcmp(argv[i], "--node-agent") == 0 && !node_sock && i + 1 < argc) {   /* v1.34 step 2 */
             node_sock = argv[++i];
         } else if (strcmp(argv[i], "--node-streams") == 0 && !node_streams && i + 1 < argc) {
@@ -6593,6 +6621,13 @@ int main(int argc, char **argv) {
         if (g_nr.on) node_fail("the policy needs a step_up option not built yet");
         return 2;
     }
+    /* v1.42 step 6: standing grants and the plan's approval, checked before anything runs */
+    if ((grants_dir || require_apv_plan) && g_nr.on) {
+        fprintf(stderr, "[warden] --grants and --require-approved-plan are not taken under the node agent\n");
+        return 2;
+    }
+    if (!g_nr.on && plan_approval_check(&p, plan_path, require_apv_plan) < 0) return 1;
+    if (grants_dir && standing_load(&p, grants_dir) < 0) return 1;
     /* v1.29: a dry run (section 3), on the command line only (D3); not with
      * a plan, credentials or sub-agents (dry_refusal). v1.36 step 7 (D6):
      * under the node agent, the pod's VarekPolicy's, refused the same */
@@ -7149,6 +7184,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (!g_nr.on) emit_run_start(policy_path, &p);     /* v1.34 step 3: node_supervise's, after the launch set */
+    if (!g_nr.on) standing_start();                                        /* v1.42 step 6 */
     ctl_open();                                                            /* v1.28 step 4 */
     if (!g_nr.on) apv_open();                                              /* v1.42: approvals */
     /* v1.24: every allowed host name is resolved before the agent runs.

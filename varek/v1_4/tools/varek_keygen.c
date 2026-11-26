@@ -15,8 +15,10 @@
 // tool performs no cryptography of its own and only writes the files.
 
 #include "../varek_fips.h"
+#include "../varek_approval.h"
 
 #include <errno.h>
+#include <stdbool.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,7 +42,80 @@ static int write_new(const char *path, const char *text, mode_t mode) {
     return 0;
 }
 
+/* v1.42 step 6: a whole file into a malloc'd buffer (at most max bytes) */
+static char *read_all_file(const char *path, size_t max, size_t *n) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { fprintf(stderr, "varek_keygen: %s: %s\n", path, strerror(errno)); return NULL; }
+    char *b = malloc(max + 1);
+    size_t got = 0;
+    ssize_t r = 0;
+    while (b && got <= max && (r = read(fd, b + got, max + 1 - got)) > 0) got += (size_t)r;
+    close(fd);
+    if (!b || r < 0 || got > max) {
+        fprintf(stderr, "varek_keygen: %s: %s\n", path, !b ? "out of memory" : r < 0 ? strerror(errno) : "too large");
+        free(b);
+        return NULL;
+    }
+    *n = got;
+    return b;
+}
+
+/* v1.42 step 6: varek_keygen --sign KIND KEYFILE FILE [--force]: FILE.sig;
+ * varek_keygen --verify KIND PUBHEX FILE: exit 0 if FILE.sig is a valid
+ * signature of FILE as KIND by PUBHEX (varek_approval.h has the format) */
+static int sign_or_verify(int argc, char **argv) {
+    bool sign = !strcmp(argv[1], "--sign");
+    bool force = argc == 6 && !strcmp(argv[5], "--force");
+    if (!(argc == 5 || (sign && force)) || !vappr_kind_ok(argv[2])) {
+        fprintf(stderr, "usage: varek_keygen --sign grant|plan KEYFILE FILE [--force]\n"
+                        "       varek_keygen --verify grant|plan PUBHEX FILE\n");
+        return 2;
+    }
+    char why[256] = {0};
+    if (vfips_init(sign ? VFIPS_INIT_SECURE_HEAP : 0, why, sizeof why) != 0) {
+        fprintf(stderr, "varek_keygen: crypto init failed: %s\n", why);
+        return 1;
+    }
+    size_t fl = 0;
+    char *body = read_all_file(argv[4], 16u << 20, &fl);
+    if (!body) return 1;
+    size_t pl = strlen(argv[4]);
+    char *sigp = malloc(pl + 5);
+    if (!sigp) { free(body); return 1; }
+    memcpy(sigp, argv[4], pl);
+    memcpy(sigp + pl, ".sig", 5);
+    int rc = 1;
+    if (sign) {
+        size_t kl = 0;
+        char *pem = read_all_file(argv[3], 16384, &kl);
+        vfips_key *k = pem ? vfips_key_load_pem(pem, kl, why, sizeof why) : NULL;
+        if (pem) { vfips_memzero(pem, kl); free(pem); }
+        char out[VAPPR_SIG_MAX];
+        if (!k) fprintf(stderr, "varek_keygen: %s: %s\n", argv[3], why[0] ? why : "cannot load the key");
+        else if (vappr_sign(k, argv[2], body, fl, out, sizeof out) != 0) fprintf(stderr, "varek_keygen: signing failed\n");
+        else {
+            if (force) unlink(sigp);
+            if (write_new(sigp, out, 0644) == 0) { printf("%s\n", sigp); rc = 0; }
+        }
+        vfips_key_free(k);
+    } else {
+        size_t sl = 0;
+        char *st = read_all_file(sigp, VAPPR_SIG_MAX, &sl);
+        vappr_sig_t sg;
+        if (!st) rc = 1;
+        else if (vappr_parse(st, sl, &sg, why, sizeof why) < 0) fprintf(stderr, "varek_keygen: %s: %s\n", sigp, why);
+        else if (strcmp(sg.key, argv[3])) fprintf(stderr, "varek_keygen: %s: signed by another key\n", sigp);
+        else if (!vappr_verify(&sg, argv[2], body, fl, why, sizeof why)) fprintf(stderr, "varek_keygen: %s: %s\n", sigp, why);
+        else { printf("ok\n"); rc = 0; }
+        free(st);
+    }
+    free(sigp);
+    free(body);
+    return rc;
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 2 && (!strcmp(argv[1], "--sign") || !strcmp(argv[1], "--verify"))) return sign_or_verify(argc, argv);
     if (argc != 2) {
         fprintf(stderr, "usage: %s <keyfile>   (writes <keyfile> and <keyfile>.pub)\n", argv[0]);
         return 2;

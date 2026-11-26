@@ -1941,6 +1941,12 @@ def cmd_run(args):
         if not args.plan:
             raise CliError("--hold-to-plan holds the run to a plan", fix="give the plan with --plan PLAN")
         argv += ["--hold-to-plan"]
+    if getattr(args, "require_approved_plan", False):                 # v1.42 step 6
+        if not args.plan:
+            raise CliError("--require-approved-plan checks the plan's approval", fix="give the plan with --plan PLAN")
+        argv += ["--require-approved-plan"]
+    if getattr(args, "grants", None):                                 # v1.42 step 6
+        argv += ["--grants", os.path.abspath(args.grants)]
     if cfg["sign_key"]:
         if _key_is_v140(cfg["sign_key"]):                                 # v1.41
             raise CliError(f"the signing key {cfg['sign_key']} is v1.40's Ed25519 key, which the Warden "
@@ -2231,6 +2237,19 @@ def cmd_pending(args):
     return 0
 
 
+def cmd_plan_approve(args):
+    """v1.42 step 6: an approver signs a plan (PLAN.sig), for --require-approved-plan"""
+    if os.path.exists(args.plan + ".sig") and not args.force:
+        raise CliError(f"{args.plan}.sig exists", fix="give --force to sign the plan again")
+    argv = [tool("varek_keygen"), "--sign", "plan", args.key, args.plan] + (["--force"] if args.force else [])
+    q = run_cmd(argv, capture=True)
+    if q.returncode != 0:
+        fail(f"cannot sign {args.plan}: {(q.stderr or '').strip()}")
+        return 1
+    ok(f"{args.plan}.sig: the plan, signed with {args.key}")
+    return 0
+
+
 def cmd_plan_extend(args):
     """v1.42 step 5b: steps added to a running run's plan, through its plan gate"""
     run = apv_run(args.run)
@@ -2250,6 +2269,22 @@ def cmd_plan_extend(args):
     return 1
 
 
+def approval_sign(kind, keyfile, text):
+    """v1.42 step 6: (sig, key) of text signed as kind with keyfile, through
+    varek_keygen (the crypto backend; varek_approval.h has the format)"""
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "x")
+        with open(f, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        q = run_cmd([tool("varek_keygen"), "--sign", kind, keyfile, f], capture=True)
+        if q.returncode != 0:
+            raise CliError(f"cannot sign with {keyfile}: {(q.stderr or '').strip()}")
+        with open(f + ".sig", encoding="ascii") as fh:
+            lines = fh.read().splitlines()
+    got = dict(ln.split(" ", 1) for ln in lines[1:] if " " in ln)
+    return got["sig"], got["key"]
+
+
 def cmd_approve(args, deny=False):
     run = apv_run(args.run)
     req = f"{'deny' if deny else 'approve'} {args.id}\n"
@@ -2257,9 +2292,25 @@ def cmd_approve(args, deny=False):
         if "\n" in args.reason:
             raise CliError("a reason is one line")
         req += f"reason {args.reason}\n"
+    text = None
     if not deny and args.narrow:
         with open(args.narrow, encoding="utf-8") as fh:
-            req += fh.read()
+            text = fh.read()
+    if not deny and getattr(args, "sign_key", None):
+        # v1.42 step 6: sign the very text approved: the narrowed grant, or the proposal's own
+        if text is None:
+            listing = apv_ask(run, "pending")
+            for line in (listing or "").splitlines():
+                if line.startswith("{"):
+                    p = json.loads(line)
+                    if p.get("id") == args.id and "proposal" in p:
+                        text = p["proposal"]
+            if text is None:
+                raise CliError(f"no open proposal {args.id} you may answer in {run}")
+        sig, key = approval_sign("grant", args.sign_key, text)
+        req += f"sig {sig} key {key}\n"
+    if text is not None:
+        req += text
     ans = apv_ask(run, req)
     if ans is None:
         fail(f"{run}: no such run is running")
@@ -3652,6 +3703,15 @@ def build_parser():
     x.add_argument("run", help="the run's id (or its verdict stream)")
     x.add_argument("plan", help="the plan's steps (plan 1.35 format)")
     x.set_defaults(fn=cmd_plan_extend)
+    x = plsub.add_parser("approve", help="v1.42: sign a plan as its approver (PLAN.sig), for "
+                                         "`varek run --require-approved-plan`",
+                         description="Sign PLAN with an approver's key (from varek_keygen, its public half "
+                                     "pinned in the policy by `approver key=... group=...`). The Warden checks "
+                                     "PLAN.sig over the plan's very bytes at the start.")
+    x.add_argument("plan", help="the plan")
+    x.add_argument("--key", required=True, help="the approver's private key (varek_keygen KEYFILE)")
+    x.add_argument("--force", action="store_true", help="write over PLAN.sig")
+    x.set_defaults(fn=cmd_plan_approve)
 
     sp = add("preflight", cmd_preflight, "check the deployment before running agents")
     sp.add_argument("--run", action="store_true", help="also do a real trial run and audit it (root)")
@@ -3683,6 +3743,11 @@ def build_parser():
     sp.add_argument("--hold-to-plan", action="store_true",
                     help="v1.35: also hold the run to the plan: a call the policy allows but no step of the plan "
                          "covers is refused (outside_plan)")
+    sp.add_argument("--require-approved-plan", action="store_true",
+                    help="v1.42: refuse the run unless the plan carries an approver's signature (PLAN.sig, "
+                         "`varek plan approve`)")
+    sp.add_argument("--grants", metavar="DIR",
+                    help="v1.42: standing grants (DIR/NAME.grant, each signed: NAME.grant.sig), checked at the start")
     sp.add_argument("--run-as", help="unprivileged user for the agent (default from settings; with the "
                                      "baseline, the user who ran sudo)")
     sp.add_argument("--log", help="write the verdict stream here instead of a new file")
@@ -3716,6 +3781,8 @@ def build_parser():
     sp.add_argument("--narrow", metavar="FILE", help="a grant narrower than the proposal: its count, time "
                     "and scope no wider")
     sp.add_argument("--reason", help="why, recorded with the grant")
+    sp.add_argument("--sign-key", metavar="KEYFILE", help="v1.42: also sign the grant with an approver's key "
+                    "(pinned in the policy by `approver key=... group=...`), recorded with it")
     sp = add("deny", cmd_deny, "refuse a proposed grant (v1.42)")
     sp.add_argument("run", help="the run id (or its verdict log)")
     sp.add_argument("id", help="the proposal's id (varek pending)")

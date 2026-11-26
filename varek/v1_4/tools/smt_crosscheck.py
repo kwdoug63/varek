@@ -681,6 +681,7 @@ def parse_lines(raw_lines, path):
     require_plan = False                           # v1.35 step 4
     max_seen = set()                               # v1.42: max_held, max_pending
     unknown_seen = [False, False]                  # v1.42 step 5 (5b): an `on unknown` (`on outside_plan`) line
+    approver_keys = []                             # v1.42 step 6: the approvers' pinned keys
     if True:
         for lineno, raw in enumerate(raw_lines, 1):
             if b"\0" in raw:
@@ -736,6 +737,28 @@ def parse_lines(raw_lines, path):
                     raise PolicyError(f"{path}:{lineno}: on unknown defer without escalate")
                 if op and "escalate" in seen_o:
                     raise PolicyError(f"{path}:{lineno}: escalate on on outside_plan")
+                continue
+            if toks[0] == "approver":
+                # v1.42 step 6: approver key=HEX group=GROUP [name=NAME], each once, any order
+                if req < (1, 42):
+                    raise PolicyError(f"{path}:{lineno}: approver before 1.42")
+                got = {}
+                for o in toks[1:]:
+                    k = o.split("=", 1)[0] if "=" in o else ""
+                    if k not in ("key", "group", "name") or k in got:
+                        raise PolicyError(f"{path}:{lineno}: bad approver option")
+                    v_ = o.split("=", 1)[1]
+                    ok = (k == "key" and re.fullmatch(r"04[0-9a-f]{192}", v_) is not None) or \
+                         (k == "group" and re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}|[a-z_][a-z0-9_-]{0,30}\$", v_) is not None) or \
+                         (k == "name" and re.fullmatch(r"[A-Za-z0-9._-]{1,32}", v_) is not None)
+                    if not ok:
+                        raise PolicyError(f"{path}:{lineno}: bad approver {k}=")
+                    got[k] = v_
+                if "key" not in got or "group" not in got:
+                    raise PolicyError(f"{path}:{lineno}: approver without key= and group=")
+                if got["key"] in approver_keys or len(approver_keys) >= 16:
+                    raise PolicyError(f"{path}:{lineno}: approver key twice, or over 16")
+                approver_keys.append(got["key"])
                 continue
             if toks[0] in ("max_held", "max_pending"):
                 # v1.42: max_held N, max_pending N (1 to 1024, each once)
@@ -2075,6 +2098,16 @@ def fuzz_policy(rng, path, v142=False):
                                                        "on outside_plan defer escalate=1",
                                                        "on outside_plan defer until=/m",
                                                        "on outside_plan deny\non outside_plan defer"])))
+        if rng.random() < 0.2:
+            # v1.42 step 6: approver lines, valid and not
+            ka, kb = "04" + "a1" * 96, "04" + "b2" * 96
+            lines.append(rng.choice([f"approver key={ka} group=ops", f"approver group=ops key={ka} name=alice",
+                                     f"approver key={ka} group=ops\napprover key={kb} group=sec name=bob"] +
+                                    ([] if valid else [f"approver key={ka}", f"approver key={ka} group=Ops",
+                                                       f"approver key={ka}0 group=ops", f"approver key=05{ka[2:]} group=ops",
+                                                       f"approver key={ka} group=ops\napprover key={ka} group=x",
+                                                       f"approver key={ka} group=ops name=", f"approver key={ka} group=ops x",
+                                                       f"approver key={ka.upper()} group=ops"])))
     elif rng.random() < 0.3:
         lines.append(rng.choice(["require warden 1.14", "require warden 1.13", "require warden 01.14",
                                  "require warden 1.15", "require warden 1.16", "require warden 1.21",

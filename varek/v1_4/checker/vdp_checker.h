@@ -162,6 +162,9 @@ typedef struct {
     uint32_t      op_timeout;         /* ... its timeout=, 0: not set */
     int           op_scope;           /* ... scope= (0 thread, 1 run; default run) */
     char          op_approvers[33];   /* ... approvers= */
+    struct { char key[195]; char group[33]; char name[33]; int line; }
+                  approvers[16];      /* v1.42 step 6: `approver key=HEX group=G [name=N]` */
+    size_t        napprovers;
     vdpc_subject_t subjects[32];      /* v1.31: subject k is subjects[k - 1] */
     size_t        nsubjects;
     vdpc_mcpres_t mcpres[8];          /* v1.31 */

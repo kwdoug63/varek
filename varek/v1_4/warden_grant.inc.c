@@ -1577,8 +1577,11 @@ static void op_suggest(const struct held_call *h, char *out, size_t n) {
 }
 
 /* approve ID / deny ID, from peer cr: the answer */
+static const char *apv_sig_check(const vdp_rule_t *su, const char *text, const char *key, const char *sig,
+                                 int *ki, char *why, size_t wn);            /* warden_signed.inc.c */
+static void signed_by_json(FILE *f, int ki, const char *sig);
 static const char *apv_answer(const struct ucred *cr, bool approve, const char *id, const char *reason,
-                              const char *text, char *ans, size_t an) {
+                              const char *text, const char *skey, const char *ssig, char *ans, size_t an) {
     int pi = prop_find(id);
     if (pi < 0) return "refused: no open proposal of that id";
     struct proposal *pp = &g_prop[pi];
@@ -1628,6 +1631,17 @@ static const char *apv_answer(const struct ucred *cr, bool approve, const char *
         snprintf(ans, an, "refused: wider than the proposal: %s", wide);
         return ans;
     }
+    /* v1.42 step 6: signed (varek approve --sign-key): by a pinned key of the rule's group */
+    int ski = -1;
+    if (skey && skey[0]) {
+        const char *bad = apv_sig_check(su, text, skey, ssig, &ski, ans, an);
+        if (bad) {
+            vdp_grant_free(&g->v);
+            vdpc_grant_free(&g->c);
+            free(g);
+            return bad;
+        }
+    }
     unsigned char h[32];
     if (vfips_sha256(text, tl, h) != 0) {
         vdp_grant_free(&g->v);
@@ -1643,6 +1657,7 @@ static const char *apv_answer(const struct ucred *cr, bool approve, const char *
     json_escape(f, who);
     fprintf(f, "\",\"approvers\":\"%s\",", su->su_approvers);
     if (reason && *reason) { fputs("\"reason\":\"", f); json_escape(f, reason); fputs("\",", f); }
+    if (ski >= 0) signed_by_json(f, ski, ssig);                         /* v1.42 step 6 */
     fputs("\"text\":\"", f);
     json_escape(f, text);
     fprintf(f, "\",\"timestamp_ns\":%lld}\n", gr_now_ns());
@@ -1728,7 +1743,15 @@ static void apv_service(void) {
                 if (e) { *e = '\0'; rest = e + 1; } else rest = reason + strlen(reason);
                 if (strlen(reason) > 1024) reason[1024] = '\0';
             }
-            ans = apv_answer(&cr, verb[0] == 'a', id, reason, rest, ansb, sizeof ansb);
+            /* v1.42 step 6: `sig SIGHEX key HEX`, the grant's text signed (varek approve --sign-key) */
+            char skey[VFIPS_PUB_HEX_MAX + 1] = "", ssig[VFIPS_SIG_HEX_MAX + 1] = "";
+            if (!strncmp(rest, "sig ", 4)) {
+                char *e = strchr(rest, '\n');
+                if (e) *e = '\0';
+                if (sscanf(rest, "sig %232s key %196s", ssig, skey) != 2) ans = "refused: need: sig SIGHEX key HEX";
+                rest = e ? e + 1 : rest + strlen(rest);
+            }
+            if (!ans) ans = apv_answer(&cr, verb[0] == 'a', id, reason, rest, skey, ssig, ansb, sizeof ansb);
         }
     }
     char line[512];

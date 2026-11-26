@@ -1422,6 +1422,57 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             memcpy(p->op_approvers, o.su_approvers, sizeof p->op_approvers);
             continue;
         }
+        /* v1.42 step 6: approver key=HEX group=GROUP [name=NAME] */
+        if (!strcmp(tok[0], "approver")) {
+            if (!(req_maj > 1 || (req_maj == 1 && req_min >= 42))) {
+                rc = perr(err, errlen, path, lineno, "`approver` needs `require warden 1.42` before it");
+                break;
+            }
+            const char *why = NULL;
+            vdp_approver_t ap;
+            memset(&ap, 0, sizeof ap);
+            bool sk = false, sg = false, sn = false;
+            for (int i = 1; i < nt && !why; i++) {
+                const char *o = tok[i];
+                if (!strncmp(o, "key=", 4) && !sk) {
+                    sk = true;
+                    const char *v = o + 4;
+                    bool ok = strlen(v) == VDP_APPROVER_KEY_HEX && v[0] == '0' && v[1] == '4';
+                    for (size_t j = 0; ok && v[j]; j++) ok = (v[j] >= '0' && v[j] <= '9') || (v[j] >= 'a' && v[j] <= 'f');
+                    if (!ok) why = "key= is the approver's public key as varek_keygen writes KEY.pub: 194 lowercase "
+                                   "hex digits, the uncompressed P-384 point (04...)";
+                    else memcpy(ap.key, v, VDP_APPROVER_KEY_HEX + 1);
+                } else if (!strncmp(o, "group=", 6) && !sg) {
+                    sg = true;
+                    vdp_rule_t tmp;
+                    memset(&tmp, 0, sizeof tmp);
+                    char a[64];
+                    snprintf(a, sizeof a, "approvers=%.40s", o + 6);
+                    char *one[1] = { a };
+                    if (strlen(o + 6) > 32 || su_options(one, 1, VDP_STEP_UP, &tmp, false))
+                        why = "group= is a Unix group name ([a-z_][a-z0-9_-]{0,31})";
+                    else memcpy(ap.group, tmp.su_approvers, sizeof ap.group);
+                } else if (!strncmp(o, "name=", 5) && !sn) {
+                    sn = true;
+                    const char *v = o + 5;
+                    size_t vl = strlen(v);
+                    bool ok = vl >= 1 && vl <= 32;
+                    for (size_t j = 0; ok && j < vl; j++)
+                        ok = (v[j] >= 'a' && v[j] <= 'z') || (v[j] >= 'A' && v[j] <= 'Z') || (v[j] >= '0' && v[j] <= '9') ||
+                             v[j] == '.' || v[j] == '_' || v[j] == '-';
+                    if (!ok) why = "name= is 1 to 32 of A-Z a-z 0-9 . _ -";
+                    else memcpy(ap.name, v, vl + 1);
+                } else why = "need: approver key=HEX group=GROUP [name=NAME], each once";
+            }
+            if (!why && (!sk || !sg)) why = "need: approver key=HEX group=GROUP [name=NAME]";
+            for (size_t j = 0; !why && j < p->napprovers; j++)
+                if (!strcmp(p->approvers[j].key, ap.key)) why = "the same approver key given twice";
+            if (!why && p->napprovers >= VDP_MAX_APPROVERS) why = "more than 16 approver lines";
+            if (why) { rc = perr(err, errlen, path, lineno, "%s", why); break; }
+            ap.line = lineno;
+            p->approvers[p->napprovers++] = ap;
+            continue;
+        }
         /* v1.42: max_held N, max_pending N */
         if (!strcmp(tok[0], "max_held") || !strcmp(tok[0], "max_pending")) {
             bool held = tok[0][4] == 'h';
