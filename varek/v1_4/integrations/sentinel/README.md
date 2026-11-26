@@ -105,6 +105,15 @@ az deployment group create -g RESOURCE_GROUP --template-file /opt/varek/integrat
   came 10 minutes after the run.
 - **VAREK: a dry run let through what its policy refuses**
   (Informational; no incident).
+- **VAREK: an approval nobody gave in time** (v1.42; Medium; an
+  incident): a call a `step_up` rule held or proposed was refused at its
+  timeout, with no approver's answer, or a deferral's context (its marker,
+  or a plan extension) did not come in time. One alert for each run, agent
+  and policy line, with the calls that waited. It reads the row's
+  `EventName` (`varek.step_up_end`, `varek.defer_end`) and the ending in
+  `OcsfEvent`, so the table needs no new column. An approval abandoned
+  because its call or its run ended first (usual for `mode=grant` at a
+  run's end) raises nothing.
 - **The workbook, *VAREK: the Warden's decisions***: counts; refusals over
   time, by policy line and by agent; runs; the latest refusals; dry runs;
   failed audits.

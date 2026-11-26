@@ -2,7 +2,7 @@
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
   "contentVersion": "1.40.0.0",
   "metadata": {
-    "description": "VAREK for Microsoft Sentinel (v1.40): analytics rules on VarekOCSF_CL (a refusal, a failed audit, a dry run's let-through calls) and a workbook, in the Sentinel workspace. Deploy azuredeploy.json first: it makes the table."
+    "description": "VAREK for Microsoft Sentinel (v1.40): analytics rules on VarekOCSF_CL (a refusal, a failed audit, a dry run's let-through calls, and from v1.42 an approval nobody gave in time) and a workbook, in the Sentinel workspace. Deploy azuredeploy.json first: it makes the table."
   },
   "parameters": {
     "workspaceName": {
@@ -373,6 +373,65 @@
             ],
             "groupByAlertDetails": [],
             "groupByCustomDetails": []
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.OperationalInsights/workspaces/providers/alertRules",
+      "apiVersion": "2023-02-01",
+      "name": "[concat(parameters('workspaceName'), '/Microsoft.SecurityInsights/', guid(parameters('workspaceName'), 'varek-approval-expired'))]",
+      "kind": "Scheduled",
+      "properties": {
+        "displayName": "VAREK: an approval nobody gave in time",
+        "description": "A call a VAREK policy's step_up rule holds or proposes (v1.42) was refused at its timeout: no approver answered. Or a deferral's context (its marker, or a plan extension) did not come in time. The agent's action did not happen; check that the approvers are reached (the rule's notify= webhook, varek pending). One alert for each run, agent and policy line in the period. An approval abandoned because its call or its run ended first is not alerted.",
+        "severity": "Medium",
+        "enabled": true,
+        "query": "VarekOCSF_CL\n| where TimeGenerated > ago(1d) and ingestion_time() > ago(5m) and ingestion_time() <= now()\n| where EventName in (\"varek.step_up_end\", \"varek.defer_end\") and tostring(OcsfEvent.unmapped.varek.ending) == \"timeout\"\n| extend Waited = iff(EventName == \"varek.step_up_end\", \"an approval\", \"a deferral's context\"), DecidedBy = iff(PolicyLine > 0, strcat(\"line \", tostring(PolicyLine), \": \", PolicyText), Rule)\n| summarize TimeGenerated = max(TimeGenerated), Expired = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Targets = make_set(Target, 20), Waits = make_set(Waited) by RunId, Computer, Agent, DecidedBy, PolicyName",
+        "queryFrequency": "PT5M",
+        "queryPeriod": "P1D",
+        "triggerOperator": "GreaterThan",
+        "triggerThreshold": 0,
+        "suppressionDuration": "PT1H",
+        "suppressionEnabled": false,
+        "tactics": [],
+        "eventGroupingSettings": {
+          "aggregationKind": "AlertPerResult"
+        },
+        "entityMappings": [
+          {
+            "entityType": "Host",
+            "fieldMappings": [
+              {
+                "identifier": "HostName",
+                "columnName": "Computer"
+              }
+            ]
+          }
+        ],
+        "customDetails": {
+          "Expired": "Expired",
+          "Targets": "Targets",
+          "DecidedBy": "DecidedBy",
+          "RunId": "RunId"
+        },
+        "alertDetailsOverride": {
+          "alertDisplayNameFormat": "VAREK: {{Agent}} on {{Computer}} waited for an approval nobody gave: {{DecidedBy}}"
+        },
+        "incidentConfiguration": {
+          "createIncident": true,
+          "groupingConfiguration": {
+            "enabled": true,
+            "reopenClosedIncident": false,
+            "lookbackDuration": "PT5H",
+            "matchingMethod": "Selected",
+            "groupByEntities": [
+              "Host"
+            ],
+            "groupByAlertDetails": [],
+            "groupByCustomDetails": [
+              "RunId"
+            ]
           }
         }
       }

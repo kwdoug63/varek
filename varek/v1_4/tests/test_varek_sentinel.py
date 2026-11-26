@@ -75,10 +75,10 @@ def test_the_template_table_rule_and_rows_agree():
     content = json.load(open(os.path.join(SENTINEL, "sentinel-content.json")))
     queries = [r["properties"]["query"] for r in content["resources"] if r.get("kind") == "Scheduled"]
     queries += [i["content"]["query"] for i in content["variables"]["workbook"]["items"] if i["type"] == 3]
-    assert len(queries) == 11                                     # 3 analytics rules, the workbook's 8
+    assert len(queries) == 12                                     # 4 analytics rules (v1.42: 4), the workbook's 8
     made = {"DecidedBy", "Refused", "FirstSeen", "LastSeen", "Targets", "Verdicts", "Problems", "AuditMode",
             "LetThrough", "Decisions", "Runs", "Last", "Count", "Name", "Value", "Column", "Audit", "Start", "End",
-            "Policy", "TimeRange", "Run"}                          # the queries' own names
+            "Policy", "TimeRange", "Run", "Expired", "Waited", "Waits"}   # the queries' own names
     for q in queries:
         assert "VarekOCSF_CL" in q and not q.startswith("[")      # not an ARM expression
         body = re.sub(r'"[^"]*"', '""', q)                         # strings out
@@ -103,7 +103,7 @@ def test_the_rules_judge_each_row_when_it_arrives():
     # export 23 minutes late).
     content = json.load(open(os.path.join(SENTINEL, "sentinel-content.json")))
     rules = [r["properties"] for r in content["resources"] if r.get("kind") == "Scheduled"]
-    assert len(rules) == 3
+    assert len(rules) == 4                 # v1.42: an approval nobody gave in time
     for r in rules:
         assert r["queryFrequency"] == "PT5M" and r["queryPeriod"] == "P1D", r["displayName"]
         first = r["query"].split("\n")[1]
@@ -117,7 +117,7 @@ def test_the_rules_judge_each_row_when_it_arrives():
         if inc["createIncident"]:          # a run's repeated alerts join its run's incident
             g = inc["groupingConfiguration"]
             assert g["enabled"] is True and "RunId" in g["groupByCustomDetails"], r["displayName"]
-    assert sum(r["incidentConfiguration"]["createIncident"] for r in rules) == 2   # the dry run's: no incident
+    assert sum(r["incidentConfiguration"]["createIncident"] for r in rules) == 3   # the dry run's: no incident
 
 def test_batches_and_the_url():
     rows = [{"x": "a" * 100}] * 50
