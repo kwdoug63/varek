@@ -1071,7 +1071,11 @@ grep -q "refused: signed by a key of group vk1420s; the rule is approved by grou
 o="$(apv "$AU" "$AG" "approve $ID6\nsig $(sed -n 's/^sig //p' "$W/pt2.txt.sig") key $KO\n$(cat "$W/pt.txt")\n")"
 grep -q "refused: the signature does not verify" <<<"$o" && pass "... and one whose signature is over other text" || flunk "bad signature: $o"
 cp "$W/k/ops" "$W/k43/ops"; chown -R 4243 "$W/k43"; chmod 700 "$W/k43"; chmod 600 "$W/k43/ops"
-o="$(cd "$W/k43" && setpriv --reuid=4243 --regid="$GG" --clear-groups env HOME="$W/k43" python3 "$HERE/tools/varek" approve "$RUN" "$ID6" --sign-key "$W/k43/ops" --reason signed 2>&1)"
+# the CLI as a user other than root: a copy it can read (the checkout may be
+# readable by its owner alone, as on GitHub's runners), with its modules and varek_keygen beside
+# it, where the CLI finds it (VAREK_HOME/tools)
+mkdir -p "$W/vh/tools" && cp "$HERE/tools/varek" "$HERE/tools/varek_keygen" "$HERE"/tools/*.py "$W/vh/tools/" && chmod -R a+rX "$W/vh"
+o="$(cd "$W/k43" && setpriv --reuid=4243 --regid="$GG" --clear-groups env HOME="$W/k43" VAREK_HOME="$W/vh" python3 "$W/vh/tools/varek" approve "$RUN" "$ID6" --sign-key "$W/k43/ops" --reason signed 2>&1)"
 grep -q "approved [0-9a-f]\{64\}" <<<"$o" && pass "varek approve --sign-key, by a member of the rule's group with ops1's key: approved" || flunk "approve --sign-key: $o"
 for k in $(seq 1 40); do grep -q ' ok$' "$W/s2.out" && break; sleep 0.25; done
 grep -q ' ok$' "$W/s2.out" && pass "... the agent's next read is allowed" || flunk "no read after the signed approval: $(tail -2 "$W/s2.out")"
