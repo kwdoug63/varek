@@ -148,6 +148,36 @@
 #      request's text or its side file changed, or the request copied into
 #      another record.
 #
+# Step 8, the exports (section 13): each stream above audited, exported as
+#      OCSF and --verify'd, every event valid, each v1.42 record an event of
+#      its own; the exports built on OCSF take each event.
+#
+# Step 9, the rest of the plan's list (section 14, as root):
+#  14. Order: within a process a call after the held one waits behind it;
+#      across processes two held calls are answered in the other order, each
+#      going on when its own is approved. max_pending refuses one more
+#      proposal at once (step_up_why max_pending). A signal that does not
+#      kill leaves a held call waiting (Linux 5.19 or later; before, the hold
+#      ends abandoned, as the Warden's note says). The caller killed, and
+#      the Warden stopped (SIGTERM), during a hold: abandoned, then run_end;
+#      the Warden killed (SIGKILL): the held read is not allowed, and the
+#      stream, with no run_end, passes only with --allow-incomplete. 70
+#      held reads each approved, more than the 64 grants a run holds at once:
+#      a grant used up leaves them (the audit summing a grant whose text is
+#      approved again within a second; a grant record repeated refused). The
+#      audit refuses a grant without its approver, an ALLOW under a grant
+#      without its certificate, a grant used after its time, and a grant
+#      widened to carry a call outside its step_up rule.
+#  15. AARM's conformance tests for R1 to R6 (aarm.dev/conformance), in
+#      mode=hold, each check named by its requirement: one run with the
+#      five decisions but MODIFY (an allow, a deny, a step_up held and
+#      approved, a deferral resolved by its marker, a read no rule names
+#      deferred and escalated), signed and with the user's request; its
+#      receipts, the identity across the hold and the deferral, the request
+#      shown to the approver, tampering found (in place: the chain; the chain
+#      made again: the signatures); STEP_UP and DEFER timing out refused; the
+#      Warden killed while a call is held, the call failing.
+#
 # Usage: sudo ./test_v1420.sh   (from varek/v1_4, after `make warden warden-notify tools/vdp_check tools/vdp_cert_check tools/varek_keygen`;
 #        sections 1 to 4 need no root, and run without it)
 set -u
@@ -369,6 +399,11 @@ rej "the wrong step_up rule for the grant"     "path 0 $R 3 - grant=0:0:-"
 rej "a host under a path rule's grant"         "host 0 $H 3 - grant=0:0:-"
 rej "a call a deny rule decides first"         "path 0 $(hx /srv/data/secret) 2 - grant=1:0:-"
 rej "a call an allow rule decides"             "path 0 $(hx /srv/other) 4 - grant=1:0:-"
+# v1.42 step 9: batch @LIST, the grant files named in a file (a long run's, more than a command line holds)
+for i in $(seq 0 69); do printf 'grant\nstep_up line 4\nallow path /srv/data/r.csv readonly\ncount %s\n' $((i + 1)) > "$T/gl$i.txt"; echo "$T/gl$i.txt"; done > "$T/glist"
+o="$(printf 'path 0 %s 2 - grant=69:0:-\npath 0 %s 2 - grant=70:0:-\n' "$R" "$R" | "$CERT" "$T/p.txt" batch "@$T/glist")"
+[ "$(sed -n 1p <<<"$o" | grep -c '"check":"ok"')" = 1 ] && sed -n 2p <<<"$o" | grep -q '"why":"bad grant"' \
+  && pass "the checker's batch @LIST: 70 grant files named in a file, the 70th's certificate accepted, a 71st refused" || flunk "batch @LIST: $o"
 rej "a grant rule that does not exist"         "path 0 $R 2 - grant=0:1:-"
 rej "symbolic flags the read-only grant does not cover" "path - $R 2 - grant=0:0:-"
 o="$(chk x "path 0 $R 2 - grant=7:0:-")"
@@ -1400,6 +1435,373 @@ sys.exit(1 if bad else 0)
 PY
 [ "$(cat "$EV/check.out")" = ok ] && pass "each v1.42 record an event of its own, with its call, obo and policy line; no webhook URL; the request carried; each export takes each event; Sentinel's rule takes h3's timeout and not h1's approval" \
   || flunk "the events: $(head -4 "$EV/check.out")"
+
+# ---- v1.42 step 9: the rest of the plan's test list. Order within a thread
+# and across processes, max_pending, a signal, the caller killed and the
+# Warden stopped or killed during a hold, and the audit's remaining forgeries.
+echo "== 14. step 9: order, max_pending, signals and endings during a hold, the remaining forgeries (as root) =="
+if [ "$(id -u)" != 0 ] || ! command -v setpriv > /dev/null; then
+    echo "  SKIP   section 14 needs root and setpriv"
+else
+AU=0; AG=0
+cat > "$W/bin/seqr.sh" <<'AG'
+# two reads in turn in one process: the second only after the first returns
+for f in "$@"; do if read -r l < "$f"; then echo "$f: ok"; else echo "$f: no"; fi; done
+AG
+cat > "$W/bin/par.sh" <<'AG'
+# two processes, each with a read to hold
+( if read -r l < "$1"; then echo "first: ok"; else echo "first: no"; fi ) &
+sleep 0.3
+( if read -r l < "$2"; then echo "second: ok"; else echo "second: no"; fi ) &
+wait
+AG
+cat > "$W/bin/sig.sh" <<'AG'
+# a read with a handler for SIGUSR1 (a signal that does not kill)
+trap 'echo usr1' USR1
+if read -r l < "$1"; then echo "read: ok"; else echo "read: no"; fi
+AG
+chmod 755 "$W/bin/seqr.sh" "$W/bin/par.sh" "$W/bin/sig.sh"
+# prop_for FILE: the open proposal whose grant names FILE
+prop_for() {
+    local k
+    for k in $(seq 1 40); do
+        local id; id="$(apv 0 0 pending | python3 -c 'import json,sys; f=sys.argv[1]; print(next((d["id"] for d in (json.loads(l) for l in sys.stdin if l.startswith("{")) if d.get("id") and f in json.dumps(d)), ""))' "$1" 2>/dev/null)"
+        [ -n "$id" ] && { echo "$id"; return 0; }
+        sleep 0.25
+    done
+    return 1
+}
+# held_pid LOG ID: the pid of the caller whose call proposal ID holds
+held_pid() { python3 -c "import json,sys; print(next(r['agent_pid'] for r in (json.loads(l) for l in open(sys.argv[1]) if l.startswith('{')) if r.get('event') == 'step_up' and r.get('id') == sys.argv[2]))" "$1" "$2" 2>/dev/null; }
+printf "${BASE}step_up path $W/data/ mode=hold timeout=20\nmax_held 2\n" > "$W/q1.txt"
+
+# order within a thread: a later call of the caller waits behind the held one
+hstart "$W/q1.txt" "$W/q1" seqr.sh "$W/data/r.csv" "$W/bin/free.txt"
+Q1="$(wait_prop)"; sleep 1
+[ -n "$Q1" ] && [ ! -s "$W/q1.out" ] && ! grep -q "free.txt" "$W/q1.log" \
+  && pass "within a process, a call after the held one waits behind it (nothing decided for it yet)" || flunk "order within: $(cat "$W/q1.out")"
+apv 0 0 "approve $Q1" > /dev/null; wait "$WPID"
+grep -q "r.csv: ok" "$W/q1.out" && grep -q "free.txt: ok" "$W/q1.out" && pass "... approved, the held read goes on, then the later one" || flunk "order within, after: $(cat "$W/q1.out")"
+check "... the records in order: step_up held, step_up_end approved, the held read allowed, then the later read" recs "$W/q1.log" \
+  "(lambda a, b, c, d: a < b < c < d)(*[next(i for i, r in enumerate(rs) if f(r)) for f in (lambda r: r.get('event') == 'step_up' and r['id'] == '$Q1', lambda r: r.get('event') == 'step_up_end' and r['id'] == '$Q1' and r['ending'] == 'approved', lambda r: r.get('resolved') == '$W/data/r.csv' and r.get('decision_final') == 'ALLOW', lambda r: r.get('resolved') == '$W/bin/free.txt' and 'decision_final' in r)])"
+audit_ok "$W/q1.txt" "$W/q1.log" && pass "the audit passes it" || flunk "audit q1: $(grep PROBLEM "$W/q1.log.audit" | head -2)"
+
+# order across processes: two held calls, answered in the other order
+hstart "$W/q1.txt" "$W/q2" par.sh "$W/data/r.csv" "$W/data/b.csv"
+QA="$(prop_for "$W/data/r.csv")"; QB="$(prop_for "$W/data/b.csv")"
+[ -n "$QA" ] && [ -n "$QB" ] && [ "$QA" != "$QB" ] && pass "two processes' reads held at once (max_held 2): two proposals" || flunk "two holds: $QA / $QB / $(cat "$W/q2.out")"
+apv 0 0 "approve $QB" > /dev/null
+for k in $(seq 1 40); do grep -q "second:" "$W/q2.out" && break; sleep 0.25; done
+grep -q "second: ok" "$W/q2.out" && ! grep -q "first:" "$W/q2.out" && pass "the second approved first goes on; the first is still held" || flunk "across, second: $(cat "$W/q2.out")"
+apv 0 0 "approve $QA" > /dev/null; wait "$WPID"
+grep -q "first: ok" "$W/q2.out" && pass "... then the first, approved, goes on" || flunk "across, first: $(cat "$W/q2.out")"
+audit_ok "$W/q1.txt" "$W/q2.log" && pass "the audit passes it" || flunk "audit q2: $(grep PROBLEM "$W/q2.log.audit" | head -2)"
+
+# max_pending: one more proposal than it allows is refused at once, with no proposal
+printf "${BASE}step_up path $W/data/ timeout=20\nmax_pending 1\n" > "$W/q3.txt"
+hstart "$W/q3.txt" "$W/q3" seqr.sh "$W/data/r.csv" "$W/data/b.csv"
+wait "$WPID"
+grep -q "r.csv: no" "$W/q3.out" && grep -q "b.csv: no" "$W/q3.out" && pass "max_pending 1 (mode=grant): both reads refused" || flunk "max_pending: $(cat "$W/q3.out")"
+check "... the first proposes a grant; the second, with one open, proposes none (step_up_why max_pending)" recs "$W/q3.log" \
+  "[r for r in rs if r.get('resolved') == '$W/data/r.csv' and r.get('step_up') not in (None, 'none')] and [r for r in rs if r.get('resolved') == '$W/data/b.csv' and r.get('step_up') == 'none' and r.get('step_up_why') == 'max_pending']"
+audit_ok "$W/q3.txt" "$W/q3.log" && pass "the audit passes it" || flunk "audit q3: $(grep PROBLEM "$W/q3.log.audit" | head -2)"
+
+# a signal that does not kill, during a hold
+hstart "$W/q1.txt" "$W/q4" sig.sh "$W/data/r.csv"
+Q4="$(wait_prop)"; sleep 0.5
+P4="$(held_pid "$W/q4.log" "$Q4")"
+[ -n "$P4" ] && kill -USR1 "$P4"; sleep 1
+if ! grep -q "cannot end a held call's wait on a fatal signal only" "$W/q4.log"; then
+    [ -n "$P4" ] && [ ! -s "$W/q4.out" ] && [ "$(prop_for "$W/data/r.csv")" = "$Q4" ] \
+      && pass "a signal that does not kill (SIGUSR1) during a hold: the call goes on waiting, its proposal open" || flunk "signal: $(cat "$W/q4.out")"
+    apv 0 0 "approve $Q4" > /dev/null; wait "$WPID"
+    grep -q "read: ok" "$W/q4.out" && grep -q "usr1" "$W/q4.out" && pass "... approved, the read goes on, and the handler runs after" || flunk "signal, after: $(cat "$W/q4.out")"
+else
+    # Linux before 5.19 (the Warden's note): the signal ends the wait
+    check "a signal during a hold, on a kernel before 5.19: the hold ends abandoned (as the Warden's note says)" recs "$W/q4.log" \
+      "[r for r in rs if r.get('event') == 'step_up_end' and r['id'] == '$Q4' and r['ending'] == 'abandoned']"
+    for k in $(seq 1 20); do kill -0 "$WPID" 2> /dev/null || break; q="$(prop_for "$W/data/r.csv")"; [ -n "$q" ] && apv 0 0 "approve $q" > /dev/null; sleep 0.5; done
+    wait "$WPID"
+fi
+audit_ok "$W/q1.txt" "$W/q4.log" && pass "the audit passes it" || flunk "audit q4: $(grep PROBLEM "$W/q4.log.audit" | head -2)"
+
+# the caller killed during a hold (the agent exiting): abandoned
+hstart "$W/q1.txt" "$W/q5" one.sh "$W/data/r.csv"
+Q5="$(wait_prop)"; sleep 0.5
+P5="$(held_pid "$W/q5.log" "$Q5")"
+[ -n "$P5" ] && kill -KILL "$P5"; wait "$WPID"
+check "the caller killed (SIGKILL) during a hold, the agent ending: its hold ends abandoned, then run_end" recs "$W/q5.log" \
+  "(lambda a, b: a < b)(*[next(i for i, r in enumerate(rs) if f(r)) for f in (lambda r: r.get('event') == 'step_up_end' and r['id'] == '$Q5' and r['ending'] == 'abandoned', lambda r: r.get('event') == 'run_end')])"
+audit_ok "$W/q1.txt" "$W/q5.log" && pass "the audit passes it" || flunk "audit q5: $(grep PROBLEM "$W/q5.log.audit" | head -2)"
+
+# the Warden stopped (SIGTERM) during a hold: the endings, then run_end
+hstart "$W/q1.txt" "$W/q6" one.sh "$W/data/r.csv"
+Q6="$(wait_prop)"; sleep 0.5
+kill -TERM "$WPID"; wait "$WPID"
+! grep -q "r.csv: ok" "$W/q6.out" && pass "the Warden stopped (SIGTERM) during a hold: the held read is not allowed" || flunk "SIGTERM: $(cat "$W/q6.out")"
+check "... its hold ends abandoned, then run_end" recs "$W/q6.log" \
+  "(lambda a, b: a < b)(*[next(i for i, r in enumerate(rs) if f(r)) for f in (lambda r: r.get('event') == 'step_up_end' and r['id'] == '$Q6' and r['ending'] == 'abandoned', lambda r: r.get('event') == 'run_end')])"
+audit_ok "$W/q1.txt" "$W/q6.log" && pass "the audit passes it" || flunk "audit q6: $(grep PROBLEM "$W/q6.log.audit" | head -2)"
+
+# the Warden killed (SIGKILL) during a hold: nothing more is recorded
+hstart "$W/q1.txt" "$W/q7" one.sh "$W/data/r.csv"
+Q7="$(wait_prop)"; sleep 0.5
+P7="$(held_pid "$W/q7.log" "$Q7")"
+kill -KILL "$WPID"; wait "$WPID" 2> /dev/null
+for k in $(seq 1 20); do [ -n "$P7" ] && kill -0 "$P7" 2> /dev/null || break; sleep 0.25; done
+[ -n "$P7" ] && kill -KILL "$P7" 2> /dev/null
+! grep -q "r.csv: ok" "$W/q7.out" && pass "the Warden killed (SIGKILL) during a hold: the held read is not allowed" || flunk "SIGKILL: $(cat "$W/q7.out")"
+o="$(python3 "$HERE/tools/varek_audit.py" --policy "$W/q1.txt" --checker "$CERT" "$W/q7.log" 2>&1)"
+! grep -q 'varek_audit: PASS' <<<"$o" && grep -q "run_end" <<<"$o" && pass "... the stream has no run_end: the audit does not pass it as a whole run" || flunk "SIGKILL audit: $(grep -i 'PROBLEM\|run_end' <<<"$o" | head -2)"
+o="$(python3 "$HERE/tools/varek_audit.py" --policy "$W/q1.txt" --checker "$CERT" --allow-incomplete "$W/q7.log" 2>&1)"
+grep -q 'varek_audit: PASS' <<<"$o" && pass "... and passes what was recorded, with --allow-incomplete" || flunk "SIGKILL audit, incomplete: $(grep PROBLEM <<<"$o" | head -2)"
+rm -f "/run/varek-approve/$RUN.sock"
+
+# more approvals than the grants a run holds at once (64): a used grant leaves them
+cat > "$W/bin/many.sh" <<'AG'
+# N reads of the file, each held until approved; how many were allowed
+k=0; for i in $(seq 1 "$2"); do read -r l < "$1" && k=$((k + 1)); done; echo "allowed: $k"
+AG
+cat > "$W/bin/apvloop.py" <<'PY'
+# apvloop.py SOCK: approve every proposal the socket lists, until it is gone
+import json, socket, sys, time
+def ask(req):
+    s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(req.encode()); s.shutdown(socket.SHUT_WR)
+    out = b""
+    while True:
+        b = s.recv(65536)
+        if not b: return out.decode()
+        out += b
+n = 0
+while True:
+    try:
+        ids = [json.loads(l).get("id") for l in ask("pending").splitlines() if l.startswith("{")]
+        for i in ids:
+            if i and ask(f"approve {i}\nreason apvloop").startswith("approved"): n += 1
+    except OSError:
+        break
+    time.sleep(0.05)
+print(n)
+PY
+chmod 755 "$W/bin/many.sh"
+printf "${BASE}step_up path $W/data/ mode=hold timeout=20\n" > "$W/q8.txt"
+hstart "$W/q8.txt" "$W/q8" many.sh "$W/data/r.csv" 70
+python3 -I "$W/bin/apvloop.py" "$SOCK" > "$W/q8.apv" 2>&1 &
+APID=$!
+wait "$WPID"; wait "$APID"
+grep -q "allowed: 70" "$W/q8.out" && [ "$(cat "$W/q8.apv")" = 70 ] \
+  && pass "70 held reads, each approved (more than the 64 grants a run holds at once): all allowed, a used grant retired" || flunk "70 grants: $(cat "$W/q8.out") / $(cat "$W/q8.apv") / $(grep 'as many grants' "$W/q8.log" | head -1)"
+audit_ok "$W/q8.txt" "$W/q8.log" && pass "the audit passes it (the same grant text approved again within a second: one grant, its counts summed)" || flunk "audit q8: $(grep PROBLEM "$W/q8.log.audit" | head -2)"
+QG="[r for r in recs if isinstance(r, dict) and r.get('event') == 'grant'][0]"
+sforge "a grant record repeated for its own proposal" "$W/q8.log" "$W/q8.txt" "recs.insert(recs.index($QG) + 1, dict($QG))" "recorded twice"
+
+# the audit's remaining forgeries, on h1 (a held read approved, then allowed under its grant)
+HG="[r for r in recs if isinstance(r, dict) and r.get('event') == 'grant'][0]"
+HA="[r for r in recs if isinstance(r, dict) and r.get('cert_grant') and r.get('decision_final') == 'ALLOW'][0]"
+sforge "a grant without its approver" "$W/h1.log" "$W/h1.txt" "$HG.pop('approver_uid')" "no approver"
+sforge "an ALLOW under a grant without its certificate (the grant's half dropped)" "$W/h1.log" "$W/h1.txt" "X = $HA
+for k in ('cert_grant', 'cert_grant_rule', 'cert_grant_witness'): X.pop(k)" "refused: deciding rule is not an allow rule"
+sforge "a grant used after its time" "$W/h1.log" "$W/h1.txt" "import re, datetime
+u = re.search(r'until (\S+)', $HG['text']).group(1)
+t = int(datetime.datetime.strptime(u, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc).timestamp())
+$HA['timestamp_ns'] = (t + 1) * 10**9" "used after its time"
+# an approver may widen a grant's object (not its count, time or scope), but no
+# grant carries a call outside its step_up rule: widened, the read moved out
+sforge "a grant widened past its step_up rule (its id made again), a read outside the rule allowed under it" "$W/h1.log" "$W/h1.txt" "import hashlib
+g = $HG; old = g['id']
+g['text'] = g['text'].replace('allow path exact $W/data/r.csv', 'allow path $W/')
+new = hashlib.sha256(g['text'].encode()).hexdigest(); g['id'] = new
+for r in recs:
+    if isinstance(r, dict):
+        for k in ('grant', 'cert_grant'):
+            if r.get(k) == old: r[k] = new
+X = $HA; X['resolved'] = '$W/bin/free.txt'" "certificate for '$W/bin/free.txt' refused"
+fi
+
+# ---- v1.42 step 9: AARM's conformance tests for R1 to R6 (aarm.dev/conformance,
+# as docs/security/aarm-mapping.md quotes them), in mode=hold. Each check's
+# name starts with the test's requirement; the mapping records the results.
+echo "== 15. step 9: AARM's conformance tests, R1 to R6, in mode=hold (as root) =="
+if [ "$(id -u)" != 0 ] || ! command -v setpriv > /dev/null || [ ! -x "$HERE/tools/varek_keygen" ]; then
+    echo "  SKIP   section 15 needs root, setpriv and tools/varek_keygen"
+else
+AU=0; AG=0
+mkdir -p "$W/dd" "$W/other"; chmod 755 "$W/dd" "$W/other"
+echo "x" > "$W/dd/x.csv"; echo "u" > "$W/other/u.csv"; echo "s" > "$W/data/secret.csv"
+chmod 644 "$W/dd/x.csv" "$W/other/u.csv" "$W/data/secret.csv"
+cat > "$W/bin/aarm.sh" <<'AG'
+# one process, one read at a time: allowed, denied, stepped up (held), deferred (held), and one no rule names
+for f in "$@"; do if read -r l < "$f"; then echo "$f: ok"; else echo "$f: no"; fi; done
+AG
+chmod 755 "$W/bin/aarm.sh"
+"$HERE/tools/varek_keygen" "$W/ak" > /dev/null
+printf 'Summarise r.csv and x.csv; do not read secret.csv.\n' > "$W/aarm-intent.txt"; chmod 644 "$W/aarm-intent.txt"
+# the five-decision policy: deny before the step_up rule; a defer rule; on unknown defer escalate
+# (/dev/tty denied, and the agent started in $W/bin with an empty environment: bash's own
+# start-up calls no rule names are refused, not escalated)
+printf "${BASE}deny path $W/data/secret.csv\nstep_up path $W/data/ mode=hold timeout=30\ndefer path $W/dd/ until=$W/m/ok timeout=30 scope=thread\ndeny path /dev/tty\non unknown defer escalate timeout=30 scope=thread\n" > "$W/a1.txt"
+rm -f "$W/m/ok"
+astart() {   # astart POLICY OUT SCRIPT ARGS... (the Warden's flags in AFLAGS): RUN and SOCK once open
+    local pol="$1" out="$2" scr="$3"; shift 3
+    (cd "$W/bin" && exec env -i PATH=/usr/bin:/bin "$WARDEN" "$pol" "${AFLAGS[@]}" -- /bin/bash "$W/bin/$scr" "$@") > "$out.out" 2> "$out.log" &
+    WPID=$!
+    SOCK=""; RUN=""; local k
+    for k in $(seq 1 40); do
+        SOCK="$(grep -o '/run/varek-approve/[0-9a-f]*\.sock' "$out.log" 2>/dev/null | head -1)"
+        [ -n "$SOCK" ] && [ -S "$SOCK" ] && break
+        sleep 0.25
+    done
+    RUN="$(basename "$SOCK" .sock)"
+}
+AFLAGS=(--sign-key "$W/ak" --intent "$W/aarm-intent.txt")
+astart "$W/a1.txt" "$W/a1" aarm.sh "$W/bin/free.txt" "$W/data/secret.csv" "$W/data/r.csv" "$W/dd/x.csv" "$W/other/u.csv"
+A1="$(prop_for "$W/data/r.csv")"; sleep 0.5
+grep -q "free.txt: ok" "$W/a1.out" && grep -q "secret.csv: no" "$W/a1.out" && ! grep -q "r.csv:" "$W/a1.out" && [ -n "$A1" ] \
+  && pass "R4 (ALLOW, DENY, STEP_UP): an allowed read done, a denied one refused, a stepped-up one held, its grant proposed" || flunk "aarm a1: $(cat "$W/a1.out")"
+check "R1: a DENY policy's action does not execute, and its denial has a receipt (DENY, the deny rule and its line)" recs "$W/a1.log" \
+  "[r for r in rs if r.get('resolved') == '$W/data/secret.csv' and r.get('decision_final') == 'DENY' and r.get('rule') == 'policy_match' and r.get('policy_line', 0) > 0 and not r.get('step_up')]"
+check "R3: a forbidden action is denied at once: no proposal, no hold" recs "$W/a1.log" \
+  "not [r for r in rs if r.get('event') in ('step_up', 'defer') and r.get('resolved') == '$W/data/secret.csv']"
+o="$(apv 0 0 pending)"
+grep -q '"intent"' <<<"$o" && grep -q "do not read secret.csv" <<<"$o" && pass "R2: the approver sees the user's original request (--intent) with the held call" || flunk "aarm intent: $o"
+apv 0 0 "approve $A1\nreason aarm R3" > /dev/null
+wait_ev "$W/a1.log" defer && sleep 0.5
+grep -q "r.csv: ok" "$W/a1.out" && ! grep -q "x.csv:" "$W/a1.out" \
+  && pass "R3: a context-dependent action gives STEP_UP; approved, it goes on (ALLOW under the grant)" || flunk "aarm step_up: $(cat "$W/a1.out")"
+pass_if_suspended() { [ ! -e "$W/m/ok" ] && ! grep -q "x.csv:" "$W/a1.out"; }
+check "R1: a DEFER condition suspends the action: the read under the defer rule waits, nothing decided for it" pass_if_suspended
+marker "$RUN"
+A2=""; for k in $(seq 1 40); do grep -q "x.csv: ok" "$W/a1.out" && break; sleep 0.25; done
+grep -q "x.csv: ok" "$W/a1.out" && pass "R4 (DEFER): the context arrives (a root-owned marker naming the run), the deferred read goes on" || flunk "aarm defer: $(cat "$W/a1.out")"
+A3="$(prop_for "$W/other/u.csv")"
+[ -n "$A3" ] && ! grep -q "u.csv:" "$W/a1.out" && pass "R3: ambiguous context (a read no rule names: UNKNOWN) gives DEFER, escalated to a person (on unknown defer escalate)" || flunk "aarm unknown: ${A3:-none} / $(cat "$W/a1.out")"
+apv 0 0 "approve $A3" > /dev/null; wait "$WPID"
+grep -q "u.csv: ok" "$W/a1.out" && pass "... approved, it goes on under the on unknown line (cert_rule -1)" || flunk "aarm unknown, after: $(cat "$W/a1.out")"
+python3 - "$W/a1.log" "$W" > "$W/a1.chk" 2>&1 <<'PY'
+import json, sys
+rs = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+w = sys.argv[2]
+bad = []
+st = next(r for r in rs if r.get("event") == "run_start")
+dec = lambda f: [r for r in rs if r.get("resolved") == f and "decision_final" in r]
+a = [r for r in dec(w + "/data/r.csv") if r["decision_final"] == "ALLOW"]
+g = [r for r in rs if r.get("event") == "grant"]
+# R5: the approval's receipts: who asked (the run, the process, obo), who approved, the policy's hash
+if not (a and a[0].get("obo") and a[0].get("agent_pid") and a[0].get("cert_grant") and a[0].get("check") == "ok"):
+    bad.append("R5a: the allowed read under the grant lacks its requester, obo, grant or check")
+if not (g and g[0].get("approver") == "root" and g[0].get("reason") == "aarm R3" and g[0]["id"] == a[0].get("cert_grant")):
+    bad.append("R5a: no grant record naming its approver and reason")
+if len(st.get("policy_sha256", "")) != 64 or st.get("intent", {}).get("text", "").find("secret.csv") < 0:
+    bad.append("R5a: run_start lacks the policy's hash or the request")
+# R5: the deferral's receipt: its reason (the rule, the marker it waits for) and its resolution (the marker's hash)
+d = [r for r in rs if r.get("event") == "defer" and r.get("resolved") == w + "/dd/x.csv"]
+de = [r for r in rs if r.get("event") == "defer_end" and d and r.get("id") == d[0]["id"]]
+if not (d and d[0]["rule_line"] > 0 and d[0]["until"] == w + "/m/ok" and de and de[0]["ending"] == "resolved"
+        and len(de[0].get("marker_sha256", "")) == 64):
+    bad.append("R5b: the deferral's receipt lacks its reason or resolution")
+xa = [r for r in dec(w + "/dd/x.csv") if r["decision_final"] == "ALLOW"]
+if not (xa and xa[0].get("cert_defer") is True and xa[0].get("defer") == d[0]["id"]
+        and xa[0].get("defer_marker", {}).get("sha256") == de[0]["marker_sha256"]):
+    bad.append("R5b: the deferred read's allow does not name its deferral and marker")
+# R6: identity per principal and session, and kept across the deferral and the hold
+pids = {r.get("agent_pid") for r in rs if "decision_final" in r and r.get("resolved", "").startswith(w)}
+if len(pids) != 1 or not all(r.get("run") == st["run"] for r in rs if "run" in r):
+    bad.append(f"R6: the calls are not one process's in one run: {pids}")
+if not (xa and d[0]["agent_pid"] == xa[0]["agent_pid"] and xa[0]["obo"] == dec(w + "/bin/free.txt")[0]["obo"]):
+    bad.append("R6: the deferred read's process or obo changed across the deferral")
+su = [r for r in rs if r.get("event") == "step_up" and r.get("resolved") == w + "/data/r.csv"]
+if not (su and a and su[0]["agent_pid"] == a[0]["agent_pid"]):
+    bad.append("R6: the held read's process changed across the hold")
+u = [r for r in dec(w + "/other/u.csv") if r["decision_final"] == "ALLOW"]
+if not (u and u[0].get("cert_rule") == -1 and u[0].get("cert_grant")):
+    bad.append("R3u: the read no rule names was not allowed under the on unknown line's grant")
+print("\n".join(bad) or "ok")
+sys.exit(1 if bad else 0)
+PY
+for l in "R5a|R5: an approval's receipt names who asked (the run, the process, obo), who approved and why, the grant, and the policy's hash" \
+         "R5b|R5: a deferral's receipt names its reason (the rule, the marker it waits for) and its resolution (the marker's SHA-256)" \
+         "R6|R6: identity is per principal and session, and kept across the hold and the deferral (the same process and obo)" \
+         "R3u|R3: ... the read no rule names allowed under the on unknown line's grant"; do
+    tag="${l%%|*}"; lab="${l#*|}"
+    if [ ! -s "$W/a1.chk" ]; then flunk "$lab: no result"
+    elif grep -q "^$tag:" "$W/a1.chk"; then flunk "$lab: $(grep "^$tag:" "$W/a1.chk" | head -2 | tr '\n' ' ')"
+    else pass "$lab"; fi
+done
+grep -v -q -E '^(ok|R5a|R5b|R6|R3u):?' "$W/a1.chk" && flunk "aarm checks: $(head -3 "$W/a1.chk")"
+o="$(python3 "$HERE/tools/varek_audit.py" --policy "$W/a1.txt" --checker "$CERT" --pubkey "$W/ak.pub" "$W/a1.log" 2>&1)"
+grep -q "integrity: signed" <<<"$o" && grep -q 'varek_audit: PASS' <<<"$o" \
+  && pass "R5: the receipts' signature verifies offline (varek_audit --pubkey): PASS, signed" || flunk "aarm audit: $(grep 'PROBLEM\|integrity' <<<"$o" | head -3)"
+cat > "$W/bin/rechain.py" <<'PY'
+# rechain.py IN OUT 'PYTHON': records changed by PYTHON (with `recs`), the hash chain made again over
+# them, each record's signature (sig) kept as it was: what one without the signing key can do
+import json, sys
+sys.path.insert(0, sys.argv[4])
+import varek_logfmt
+src, out, code = sys.argv[1], sys.argv[2], sys.argv[3]
+recs = []
+for line in open(src, encoding="utf-8", errors="surrogateescape"):
+    if line.startswith("{"):
+        r = json.loads(line); r.pop("chain", None); recs.append((r, r.pop("sig", None)))
+    else:
+        recs.append((line, None))
+exec(code, {"recs": [r for r, _ in recs]})
+fmt = varek_logfmt.of_file(src)
+head = fmt["iv"]
+with open(out, "w", encoding="utf-8", errors="surrogateescape") as f:
+    for r, sig in recs:
+        if isinstance(r, str):
+            f.write(r); continue
+        body = json.dumps(r, separators=(",", ":"))[:-1]
+        head = fmt["hash"](head + body.encode()).digest()
+        f.write(body + ',"chain":"' + head.hex() + '"' + (',"sig":"' + sig + '"' if sig else "") + "}\n")
+PY
+aaudit() { python3 "$HERE/tools/varek_audit.py" --policy "$W/a1.txt" --checker "$CERT" --pubkey "$W/ak.pub" "$1" > "$W/af.out" 2>&1; }
+# R2: a prior entry edited in place (the chain and signatures as they were)
+python3 -c '
+import sys
+done = False
+with open(sys.argv[2], "w") as o:
+    for l in open(sys.argv[1]):
+        if not done and "\"decision_final\"" in l and "free.txt" in l:
+            l = l.replace("free.txt", "frex.txt"); done = True
+        o.write(l)' "$W/a1.log" "$W/at.log"
+! aaudit "$W/at.log" && grep -q "hash chain broken" "$W/af.out" \
+  && pass "R2: tampering with a prior context entry is detected (the read before the hold edited: the hash chain broken)" \
+  || flunk "R2 tampering: $(grep -i 'PROBLEM\|FAIL' "$W/af.out" | head -2)"
+aforge() {   # aforge LABEL PYTHON: re-chained but not re-signed, the stream fails the signed audit
+    python3 -I "$W/bin/rechain.py" "$W/a1.log" "$W/af.log" "$2" "$HERE/tests" > /dev/null 2>&1
+    if aaudit "$W/af.log"; then flunk "$1 (the audit passed it)"
+    elif grep -q "signature does not verify" "$W/af.out"; then pass "$1"
+    else flunk "$1 (not for its signature: $(grep '^  PROBLEM' "$W/af.out" | head -2 | tr '\n' ' '))"; fi
+}
+aforge "R2: ... and with the chain made again over it (its signatures do not verify)" \
+  "[r.__setitem__('resolved', '$W/data/other.csv') for r in recs if isinstance(r, dict) and r.get('resolved') == '$W/bin/free.txt' and 'decision_final' in r]"
+aforge "R5: tampering with a receipt fails its verification (the approval's approver changed)" \
+  "[r.__setitem__('approver', 'mallory') for r in recs if isinstance(r, dict) and r.get('event') == 'grant']"
+aforge "R5: ... and with a deferral's (its resolution changed to a timeout)" \
+  "[r.__setitem__('ending', 'timeout') for r in recs if isinstance(r, dict) and r.get('event') == 'defer_end' and r.get('ending') == 'resolved']"
+
+# R4: STEP_UP or DEFER timing out gives DENY
+printf "${BASE}step_up path $W/data/ mode=hold timeout=2\ndefer path $W/dd/ until=$W/m/ok timeout=2 scope=thread\n" > "$W/a2.txt"
+rm -f "$W/m/ok"
+AFLAGS=()
+astart "$W/a2.txt" "$W/a2" aarm.sh "$W/data/r.csv" "$W/dd/x.csv"
+wait "$WPID"
+grep -q "r.csv: no" "$W/a2.out" && grep -q "x.csv: no" "$W/a2.out" && \
+  recs "$W/a2.log" "[r for r in rs if r.get('event') == 'step_up_end' and r['ending'] == 'timeout'] and [r for r in rs if r.get('event') == 'defer_end' and r['ending'] == 'timeout'] and len([r for r in rs if r.get('held') is True and r.get('decision_final') == 'DENY']) == 2" \
+  && pass "R4: STEP_UP and DEFER timing out give DENY (each held read refused at its timeout, its ending timeout)" || flunk "aarm timeouts: $(cat "$W/a2.out")"
+audit_ok "$W/a2.txt" "$W/a2.log" && pass "... the audit passes it" || flunk "audit a2: $(grep PROBLEM "$W/a2.log.audit" | head -2)"
+
+# R1: the control plane unavailable, the action fails
+astart "$W/a2.txt" "$W/a3" aarm.sh "$W/data/r.csv"
+for k in $(seq 1 40); do grep -q '"event":"step_up"' "$W/a3.log" && break; sleep 0.1; done
+P3="$(python3 -c "import json,sys; print(next(r['agent_pid'] for r in (json.loads(l) for l in open(sys.argv[1]) if l.startswith('{')) if r.get('event') == 'step_up'))" "$W/a3.log" 2>/dev/null)"
+kill -KILL "$WPID"; wait "$WPID" 2> /dev/null
+for k in $(seq 1 20); do [ -n "$P3" ] && kill -0 "$P3" 2> /dev/null || break; sleep 0.25; done
+[ -n "$P3" ] && kill -KILL "$P3" 2> /dev/null
+! grep -q "r.csv: ok" "$W/a3.out" && pass "R1: the control plane unavailable (the Warden killed while the call is held), the action fails" || flunk "aarm control plane: $(cat "$W/a3.out")"
+rm -f "/run/varek-approve/$RUN.sock"
+fi
 
 echo
 [ $fail = 0 ] && echo "test_v1420: PASS ($n checks)" || echo "test_v1420: FAIL"
