@@ -27,8 +27,7 @@
 #      hold, symbolic flags a grant does not cover).
 #
 # Step 2, runtime grants in mode=grant (section 5, as root):
-#   5. A policy needing a step not built yet (notify=) is refused at start.
-#      A read the step_up rule refuses proposes the narrowest grant, which
+#   5. A read the step_up rule refuses proposes the narrowest grant, which
 #      the approvers' socket lists only to who may answer it. The agent's own
 #      user, another user (no approvers=), and grants wider than the proposal
 #      (count, time, run, another step_up rule) are refused; root approves,
@@ -126,7 +125,30 @@
 #      altered or dropped, a signer swapped for an unpinned key or named of
 #      another group, a plan approval's signature, key or name changed.
 #
-# Usage: sudo ./test_v1420.sh   (from varek/v1_4, after `make warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen`;
+# Step 7, the user's request and notify= (sections 1 and 12):
+#   1. notify= takes http:// only to a literal loopback address (127.0.0.0/8
+#      or [::1], a port 1 to 65535), read the same by both parsers; another
+#      host, a name such as localhost, user information, a bad address or
+#      port is refused.
+#  12. With a stand-in webhook on 127.0.0.1: a proposal of a notify= rule is
+#      posted once, its body the grant's exact text (one line of text and
+#      the varek object), and nothing of the call or the user's request; the
+#      notify record (sent, status, attempts, host, the URL's SHA-256) and no
+#      URL in the stream; an answer of 500, then 200: sent in 2 attempts,
+#      the held call approved after; always 500: failed in 2 attempts, the
+#      run unaffected; a webhook that never answers: abandoned at the run's
+#      end, warden-notify gone; https:// verified against a test CA
+#      (SSL_CERT_FILE), and refused without it; a URL with user
+#      information refused at start. --intent: the request in run_start
+#      (its text, or a file beside the stream when over 4 KiB, root's,
+#      0600), `varek pending` showing it to who may answer (not to another
+#      user), and --intent refusing a link, a directory and a file over
+#      1 MiB. The audit passes each run and refuses each forgery: a notify
+#      record dropped, repeated, of another host or URL, sent with a 500; the
+#      request's text or its side file changed, or the request copied into
+#      another record.
+#
+# Usage: sudo ./test_v1420.sh   (from varek/v1_4, after `make warden warden-notify tools/vdp_check tools/vdp_cert_check tools/varek_keygen`;
 #        sections 1 to 4 need no root, and run without it)
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -171,6 +193,12 @@ refused "timeout=01"                       'require warden 1.42\nstep_up path /s
 refused "approvers=Ops"                    'require warden 1.42\nstep_up path /s/ approvers=Ops\n'
 refused "scope=all"                        'require warden 1.42\nstep_up path /s/ scope=all\n'
 refused "notify=http://"                   'require warden 1.42\nstep_up path /s/ notify=http://h.example/x\n'
+# v1.42 step 7: http:// to a literal loopback address only
+accepted "notify=http:// to a loopback address (127.0.0.0/8, [::1], a port)" 'require warden 1.42\nstep_up path /s/ notify=http://127.0.0.1:8080/hook?a=b\nstep_up path /t/ notify=http://[::1]/x\nstep_up path /u/ notify=http://127.9.8.7\n'
+for b in "http://localhost/x" "http://128.0.0.1/x" "http://127.0.0.256/" "http://127.0.0/x" "http://127.0.0.1.5/" \
+         "http://127.0.0.1:0/" "http://127.0.0.1:65536/" "http://127.0.0.1@h.example/" "http://[::2]/" "http://0127.0.0.1/"; do
+    refused "notify=$b" "require warden 1.42\nstep_up path /s/ notify=$b\n"
+done
 refused "an option twice"                  'require warden 1.42\nstep_up path /s/ mode=hold mode=grant\n' "given twice"
 refused "an option before a flag clause"   'require warden 1.42\nstep_up path /s/ mode=hold readonly\n'
 refused "a step_up option on an allow rule" 'require warden 1.42\nallow path /s/ mode=hold\n'
@@ -413,7 +441,7 @@ AU=0; AG=0
 wait_prop() {
     local k
     for k in $(seq 1 40); do
-        local id; id="$(apv "$AU" "$AG" pending | python3 -c 'import json,sys; l=sys.stdin.readline(); print(json.loads(l)["id"] if l.startswith("{") else "")' 2>/dev/null)"
+        local id; id="$(apv "$AU" "$AG" pending | python3 -c 'import json,sys; ids=[json.loads(l).get("id") for l in sys.stdin if l.startswith("{")]; print(next((i for i in ids if i), ""))' 2>/dev/null)"
         [ -n "$id" ] && [ "$id" != "${1:-}" ] && { echo "$id"; return 0; }
         sleep 0.25
     done
@@ -431,10 +459,6 @@ start() {   # start POLICY OUT N: the Warden on the agent, in the background; SO
     RUN="$(basename "$SOCK" .sock)"
 }
 recs() { python3 -c "import json,sys; rs=[json.loads(l) for l in open(sys.argv[1]) if l.startswith('{')]; sys.exit(0 if $2 else 1)" "$1"; }
-
-printf "${BASE}step_up path $W/data/ notify=https://hooks.example.test/x\n" > "$W/hold.txt"
-o="$("$WARDEN" "$W/hold.txt" --check-startup 2>&1)"
-grep -q "notify= is not built yet" <<<"$o" && pass "a policy with notify= is refused at start (built in step 7)" || flunk "notify= at start: $o"
 
 printf "${BASE}step_up path $W/data/ timeout=30\nstep_up host api.example.test:443\n" > "$W/p1.txt"     # step_up on line 9, the host one 10
 start "$W/p1.txt" "$W/r1" 80
@@ -1087,6 +1111,206 @@ RG="[r for r in recs if isinstance(r, dict) and r.get('event') == 'grant' and 's
 sforge "a signed runtime grant's signature altered" "$W/s2.log" "$W/s6.txt" "$RG['sig'] = $RG['sig'][:-6] + ('000000' if $RG['sig'][-6:] != '000000' else '111111')" "its signature does not verify over its text"
 sforge "a signed runtime grant's signer swapped for a key the policy does not pin" "$W/s2.log" "$W/s6.txt" "$RG['signed_by']['key'] = '$KA'" "signed by a key the policy does not pin"
 
+fi
+
+echo "== 12. step 7: --intent and notify=URL (as root) =="
+if [ "$(id -u)" != 0 ] || ! command -v setpriv > /dev/null || [ ! -x "$HERE/warden-notify" ]; then
+    echo "  SKIP   section 12 needs root, setpriv and warden-notify (make warden-notify)"
+else
+cat > "$W/bin/hook.py" <<'PY'
+# a stand-in webhook on 127.0.0.1: each POST answered with the next status of
+# PLAN (the last kept; "hang": never answered), its path, type and body
+# appended to LOG; with CERT (a PEM of the certificate and key), over TLS
+import http.server, json, os, ssl, sys, time
+port_file, log, plan = sys.argv[1], sys.argv[2], sys.argv[3].split(",")
+n = [0]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        i = min(n[0], len(plan) - 1); n[0] += 1
+        with open(log, "a") as fh:
+            fh.write(json.dumps({"path": self.path, "ct": self.headers.get("Content-Type"), "body": body.decode()}) + "\n")
+        if plan[i] == "hang":
+            time.sleep(600)
+        self.send_response(int(plan[i])); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"ok")
+    def log_message(self, *a): pass
+s = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+if len(sys.argv) > 4:
+    c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); c.load_cert_chain(sys.argv[4])
+    s.socket = c.wrap_socket(s.socket, server_side=True)
+open(port_file + ".tmp", "w").write(str(s.server_address[1]))
+os.rename(port_file + ".tmp", port_file)
+s.serve_forever()
+PY
+HPID=""
+hook() {   # hook NAME PLAN [CERT]: a webhook for this run; HP its port, HLOG its requests
+    [ -n "$HPID" ] && kill "$HPID" 2> /dev/null; [ -n "$HPID" ] && wait "$HPID" 2> /dev/null
+    HLOG="$W/$1.hook"
+    python3 -I "$W/bin/hook.py" "$W/$1.port" "$HLOG" "$2" ${3:+"$3"} & HPID=$!
+    local k; for k in $(seq 1 40); do [ -s "$W/$1.port" ] && break; sleep 0.1; done
+    HP="$(cat "$W/$1.port")"
+}
+nrec() { python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in open(sys.argv[1]) if l.startswith('{') and '\"event\":\"notify\"' in l]))" "$1"; }
+run_agent() {   # run_agent POLICY OUT N [WARDEN ARGS...]: the Warden on the agent (N reads), to its end
+    local pol="$1" out="$2" nr="$3"; shift 3
+    "$WARDEN" "$pol" "$@" -- /bin/bash "$W/bin/agent.sh" "$W/data/r.csv" "$nr" > "$out.out" 2> "$out.log"
+}
+start_bg() {   # start_bg POLICY OUT N [WARDEN ARGS...]: in the background; WPID, SOCK, RUN
+    local pol="$1" out="$2" nr="$3"; shift 3
+    "$WARDEN" "$pol" "$@" -- /bin/bash "$W/bin/agent.sh" "$W/data/r.csv" "$nr" > "$out.out" 2> "$out.log" &
+    WPID=$!
+    SOCK=""; local k
+    for k in $(seq 1 40); do
+        SOCK="$(grep -o '/run/varek-approve/[0-9a-f]*\.sock' "$out.log" 2>/dev/null | head -1)"
+        [ -n "$SOCK" ] && [ -S "$SOCK" ] && break
+        sleep 0.25
+    done
+    RUN="$(basename "$SOCK" .sock)"
+}
+printf 'Please summarise r.csv for the review, then delete nothing.\n' > "$W/intent.txt"
+
+# the start
+printf "${BASE}step_up path $W/data/ notify=https://u@hooks.example.test/x\n" > "$W/nt0.txt"
+o="$("$WARDEN" "$W/nt0.txt" --check-startup 2>&1)"
+grep -q "notify= names no host warden-notify posts to" <<<"$o" && pass "a notify= URL with user information is refused at start" || flunk "notify= with user information: $o"
+printf "${BASE}step_up path $W/data/ notify=https://hooks.example.test/x\n" > "$W/nt0.txt"
+o="$("$WARDEN" "$W/nt0.txt" --check-startup 2>&1)"
+grep -q "startup checks passed" <<<"$o" && grep -q "notifications' helper .*warden-notify, SHA-256 [0-9a-f]\{64\}" <<<"$o" \
+  && pass "a startup check finds and hashes warden-notify for a notify= policy" || flunk "check-startup with notify=: $o"
+o="$("$WARDEN" "$W/nt0.txt" --check-startup --notify-bin "$W/nonexistent" 2>&1)"
+grep -q "warden-notify (the policy has notify=): cannot open $W/nonexistent" <<<"$o" && pass "... and refuses to start without it" || flunk "no warden-notify: $o"
+
+# 1. mode=grant: posted once, sent; the user's request inline
+hook n1 200
+NU="http://127.0.0.1:$HP/hook/n1?team=ops"
+printf "${BASE}step_up path $W/data/ timeout=30 notify=$NU\n" > "$W/n1.txt"
+NL="$(printf '%b' "$BASE" | wc -l)"; NL=$((NL + 1))
+start_bg "$W/n1.txt" "$W/n1" 14 --intent "$W/intent.txt"
+AU=0; AG=0; N1="$(wait_prop)"
+o="$(apv 0 0 pending)"
+head -1 <<<"$o" | python3 -c 'import json,sys; i=json.loads(sys.stdin.readline())["intent"]; sys.exit(0 if i["text"] == open(sys.argv[1]).read() and not i["truncated"] and i["bytes"] == len(open(sys.argv[1], "rb").read()) else 1)' "$W/intent.txt" \
+  && pass "pending shows the user's request first, to an approver (root here)" || flunk "pending's intent: $(head -1 <<<"$o")"
+o="$(apv 4243 4243 pending)"
+! grep -q '"intent"' <<<"$o" && ! grep -q "summarise" <<<"$o" && pass "... and not to a user who may answer nothing ($o)" || flunk "pending as 4243: $o"
+o="$(python3 "$HERE/tools/varek" pending "$RUN" 2>&1)"
+grep -q "the user's request (" <<<"$o" && grep -q "Please summarise r.csv for the review" <<<"$o" && pass "varek pending prints it above the proposals" || flunk "varek pending: $o"
+wait "$WPID"
+o="$(nrec "$W/n1.log")"
+python3 -c 'import json,sys,hashlib; n=json.loads(sys.argv[1]); sys.exit(0 if len(n) == 1 and n[0]["id"] == sys.argv[2] and n[0]["outcome"] == "sent" and n[0]["status"] == 200 and n[0]["attempts"] == 1 and n[0]["host"] == "127.0.0.1" and n[0]["rule_line"] == int(sys.argv[4]) and n[0]["url_sha256"] == hashlib.sha256(sys.argv[3].encode()).hexdigest() else 1)' "$o" "$N1" "$NU" "$NL" \
+  && pass "one notify record for the proposal: sent, 200, 1 attempt, the host and the URL's SHA-256" || flunk "notify record n1: $o"
+[ "$(wc -l < "$HLOG")" = 1 ] && pass "the webhook got one post (the later refusals name the same proposal)" || flunk "posts: $(wc -l < "$HLOG")"
+python3 - "$HLOG" "$W/n1.log" "$N1" "$RUN" "$NL" <<'PY' && pass "the post: JSON, the grant's exact text, the run, the id, the rule's line, a line of text; not the request, not the data" || flunk "the post's body: $(head -c 400 "$HLOG")"
+import json, sys
+h = json.loads(open(sys.argv[1]).readline())
+rs = [json.loads(l) for l in open(sys.argv[2]) if l.startswith("{")]
+prop = [r for r in rs if r.get("event") == "step_up" and r["id"] == sys.argv[3]][0]["proposal"]
+b = json.loads(h["body"])
+v = b["varek"]
+ok = h["path"] == "/hook/n1?team=ops" and h["ct"].startswith("application/json") and v["grant"] == prop and \
+     v["id"] == sys.argv[3] and v["run"] == sys.argv[4] and v["rule_line"] == int(sys.argv[5]) and v["mode"] == "grant" and \
+     "asks for approval: allow path exact" in b["text"] and "\n" not in b["text"] and \
+     "summarise" not in h["body"] and "a,b" not in h["body"] and \
+     set(v) == {"event", "run", "id", "rule_line", "mode", "approvers", "grant", "user", "subagent", "until", "expires"}
+sys.exit(0 if ok else 1)
+PY
+! grep -q "$HP/hook" "$W/n1.log" && pass "the URL itself is in no record" || flunk "the URL is in the stream"
+check "run_start: the request's text, SHA-256 and length; warden-notify's SHA-256 and user" recs "$W/n1.log" \
+  "[r for r in rs if r.get('event') == 'run_start' and r['intent'] == {'sha256': '$(sha256sum "$W/intent.txt" | cut -c1-64)', 'bytes': $(wc -c < "$W/intent.txt"), 'text': open('$W/intent.txt').read()} and r['notify']['uid'] == 65530 and len(r['notify']['helper_sha256']) == 64]"
+audit_ok "$W/n1.txt" "$W/n1.log" && pass "the audit passes it" || flunk "audit n1: $(grep PROBLEM "$W/n1.log.audit" | head -2)"
+NR="[r for r in recs if isinstance(r, dict) and r.get('event') == 'notify'][0]"
+RS="[r for r in recs if isinstance(r, dict) and r.get('event') == 'run_start'][0]"
+sforge "a notify record dropped" "$W/n1.log" "$W/n1.txt" "recs.remove($NR)" "with no notify outcome"
+sforge "a notify record repeated" "$W/n1.log" "$W/n1.txt" "recs.insert(recs.index($NR) + 1, dict($NR))" "recorded twice"
+sforge "a notify record of another host" "$W/n1.log" "$W/n1.txt" "$NR['host'] = 'hooks.example.test'" "names a host or URL other than"
+sforge "a notify record of another URL" "$W/n1.log" "$W/n1.txt" "$NR['url_sha256'] = '0' * 64" "names a host or URL other than"
+sforge "a post recorded sent with a 500" "$W/n1.log" "$W/n1.txt" "$NR['status'] = 500" "sent, without a 2xx status"
+sforge "the request's text changed" "$W/n1.log" "$W/n1.txt" "$RS['intent']['text'] = 'Delete everything.'" "is not the request the Warden recorded"
+sforge "the request copied into a decision record" "$W/n1.log" "$W/n1.txt" "[r for r in recs if isinstance(r, dict) and 'decision_final' in r][0]['intent'] = 'x'" "holds the user's request"
+
+# 2. mode=hold: 500, then 200 (sent in 2 attempts), approved; the request in a file beside the stream
+hook n2 500,200
+python3 -c 'import sys; open(sys.argv[1], "w").write("Résumé of r.csv, please. " * 400)' "$W/big.txt"
+printf "${BASE}step_up path $W/data/ mode=hold timeout=30 notify=http://127.0.0.1:$HP/h\n" > "$W/n2.txt"
+start_bg "$W/n2.txt" "$W/n2" 1 --intent "$W/big.txt"
+N2="$(wait_prop)"
+for k in $(seq 1 60); do grep -q '"event":"notify"' "$W/n2.log" && break; sleep 0.25; done
+o="$(apv 0 0 pending)"
+head -1 <<<"$o" | python3 -c 'import json,sys; i=json.loads(sys.stdin.readline())["intent"]; t=open(sys.argv[1]).read(); sys.exit(0 if i["truncated"] and t.startswith(i["text"]) and 1500 < len(i["text"].encode()) <= 2048 else 1)' "$W/big.txt" \
+  && pass "pending shows a long request's first 2 KiB, cut at a character, marked truncated" || flunk "pending's long intent: $(head -c 200 <<<"$o")"
+apv 0 0 "approve $N2\n" > /dev/null
+wait "$WPID"
+grep -q '^1 ok$' "$W/n2.out" && pass "the held read, approved, goes on" || flunk "n2: $(cat "$W/n2.out")"
+o="$(nrec "$W/n2.log")"
+python3 -c 'import json,sys; n=json.loads(sys.argv[1]); sys.exit(0 if len(n) == 1 and n[0]["outcome"] == "sent" and n[0]["attempts"] == 2 and n[0]["status"] == 200 else 1)' "$o" \
+  && [ "$(wc -l < "$HLOG")" = 2 ] && pass "a 500, then a 200: sent in 2 attempts (the webhook got 2 posts)" || flunk "notify n2: $o"
+check "run_start: the request's SHA-256 and length, and the file beside the stream it is in" recs "$W/n2.log" \
+  "[r for r in rs if r.get('event') == 'run_start' and r['intent'] == {'sha256': '$(sha256sum "$W/big.txt" | cut -c1-64)', 'bytes': $(wc -c < "$W/big.txt"), 'file': 'n2.log.intent'}]"
+cmp -s "$W/big.txt" "$W/n2.log.intent" && [ "$(stat -c '%u %a' "$W/n2.log.intent")" = "0 600" ] \
+  && pass "... the file: the request's bytes, root's, 0600" || flunk "the side file: $(stat -c '%u %a' "$W/n2.log.intent" 2>&1)"
+audit_ok "$W/n2.txt" "$W/n2.log" && pass "the audit passes it, the file checked" || flunk "audit n2: $(grep PROBLEM "$W/n2.log.audit" | head -2)"
+cp "$W/n2.log.intent" "$W/n2.keep"; printf 'x' >> "$W/n2.log.intent"
+! audit_ok "$W/n2.txt" "$W/n2.log" && grep -q "is not the request the Warden recorded" "$W/n2.log.audit" \
+  && pass "the audit refuses the file changed" || flunk "audit, the side file changed: $(grep PROBLEM "$W/n2.log.audit" | head -2)"
+mv "$W/n2.keep" "$W/n2.log.intent"
+ln -sf "$W/intent.txt" "$W/il.txt"; mkdir -p "$W/idir"; head -c $((1024 * 1024 + 1)) /dev/zero > "$W/ihuge.txt"
+for c in "il.txt:a symbolic link" "idir:not a regular file" "ihuge.txt:over 1 MiB"; do
+    run_agent "$W/n1.txt" "$W/ie" 1 --intent "$W/${c%%:*}"
+    grep -q -- "--intent $W/${c%%:*}: ${c#*:}; refusing to start" "$W/ie.log" && ! grep -q '"event":"run_start"' "$W/ie.log" \
+      && pass "--intent refuses ${c#*:}" || flunk "--intent ${c%%:*}: $(tail -1 "$W/ie.log")"
+done
+
+# varek run --intent-text: the text in a private file for the run, removed after
+printf "require warden 1.42\ndeny path /etc/varek/\n$(printf '%b' "$BASE" | tail -n +2)\nallow path $W/data/ readonly\n" > "$W/cli.txt"
+ls -d /tmp/varek-intent-* > "$W/it0" 2> /dev/null
+o="$(VAREK_HOME="$HERE" python3 "$HERE/tools/varek" run --policy "$W/cli.txt" --log "$W/cli.log" --intent-text "Review r.csv, résumé" -- /bin/bash "$W/bin/agent.sh" "$W/data/r.csv" 1 2>&1)"
+ls -d /tmp/varek-intent-* > "$W/it1" 2> /dev/null
+recs "$W/cli.log" "[r for r in rs if r.get('event') == 'run_start' and r['intent']['text'] == 'Review r.csv, résumé' and r['intent']['bytes'] == len('Review r.csv, résumé'.encode())]" \
+  && cmp -s "$W/it0" "$W/it1" && pass "varek run --intent-text: the request in run_start, its private file removed after" || flunk "varek run --intent-text: $o"
+o="$(python3 "$HERE/tools/varek" run --policy "$W/cli.txt" --intent "$W/intent.txt" --intent-text x -- /bin/true 2>&1)"
+grep -q -- "--intent and --intent-text together" <<<"$o" && pass "... and refuses --intent with it" || flunk "both intents: $o"
+
+# 3. always 500: failed in 2 attempts, the run unaffected
+hook n3 500
+printf "${BASE}step_up path $W/data/ timeout=30 notify=http://127.0.0.1:$HP/h\n" > "$W/n3.txt"
+run_agent "$W/n3.txt" "$W/n3" 32; rc=$?
+o="$(nrec "$W/n3.log")"
+python3 -c 'import json,sys; n=json.loads(sys.argv[1]); sys.exit(0 if len(n) == 1 and n[0]["outcome"] == "failed" and n[0]["attempts"] == 2 and n[0]["status"] == 500 and "answered 500" in n[0]["why"] else 1)' "$o" \
+  && [ "$rc" = 0 ] && [ "$(grep -c ' no$' "$W/n3.out")" = 32 ] && pass "always 500: failed in 2 attempts, why; the run goes on as before" || flunk "notify n3 (rc $rc): $o"
+audit_ok "$W/n3.txt" "$W/n3.log" && pass "the audit passes it" || flunk "audit n3: $(grep PROBLEM "$W/n3.log.audit" | head -2)"
+
+# 4. a webhook that never answers: abandoned at the run's end
+hook n4 hang
+printf "${BASE}step_up path $W/data/ timeout=30 notify=http://127.0.0.1:$HP/h\n" > "$W/n4.txt"
+run_agent "$W/n4.txt" "$W/n4" 4
+o="$(nrec "$W/n4.log")"
+python3 -c 'import json,sys; n=json.loads(sys.argv[1]); sys.exit(0 if len(n) == 1 and n[0]["outcome"] == "abandoned" else 1)' "$o" \
+  && pass "a post with no outcome by the run's end: abandoned" || flunk "notify n4: $o"
+sleep 0.5; ! pgrep -f '^warden-notify ' > /dev/null && pass "... and warden-notify has ended with the run" || flunk "warden-notify left: $(pgrep -fa '^warden-notify ')"
+audit_ok "$W/n4.txt" "$W/n4.log" && pass "the audit passes it" || flunk "audit n4: $(grep PROBLEM "$W/n4.log.audit" | head -2)"
+
+# 5. https://, verified against the host's trust store (here a test CA, by SSL_CERT_FILE)
+if command -v openssl > /dev/null; then
+    (cd "$W" && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key -out ca.pem -days 2 -subj "/CN=v1420 test CA" \
+       && openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout srv.key -out srv.csr -subj "/CN=127.0.0.1" \
+       && printf "subjectAltName=IP:127.0.0.1\nbasicConstraints=CA:FALSE\n" > ext.cnf \
+       && openssl x509 -req -in srv.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out srv.crt -days 2 -extfile ext.cnf \
+       && cat srv.crt srv.key > srv.pem) > /dev/null 2>&1
+    chmod 644 "$W/ca.pem"
+    hook n5 200 "$W/srv.pem"
+    printf "${BASE}step_up path $W/data/ timeout=30 notify=https://127.0.0.1:$HP/h\n" > "$W/n5.txt"
+    SSL_CERT_FILE="$W/ca.pem" run_agent "$W/n5.txt" "$W/n5" 4
+    o="$(nrec "$W/n5.log")"
+    python3 -c 'import json,sys; n=json.loads(sys.argv[1]); sys.exit(0 if len(n) == 1 and n[0]["outcome"] == "sent" and n[0]["attempts"] == 1 else 1)' "$o" \
+      && pass "https:// to a server the trust store vouches for (its address in the certificate): sent" || flunk "notify n5: $o"
+    run_agent "$W/n5.txt" "$W/n6" 32
+    o="$(nrec "$W/n6.log")"
+    python3 -c 'import json,sys; n=json.loads(sys.argv[1]); sys.exit(0 if len(n) == 1 and n[0]["outcome"] == "failed" and n[0]["attempts"] == 2 and "TLS to 127.0.0.1 failed" in n[0]["why"] else 1)' "$o" \
+      && pass "... and failed, nothing posted, where the store does not (TLS refused, twice)" || flunk "notify n6: $o"
+    audit_ok "$W/n5.txt" "$W/n5.log" && audit_ok "$W/n5.txt" "$W/n6.log" && pass "the audit passes both" || flunk "audit n6: $(grep PROBLEM "$W/n6.log.audit" | head -2)"
+else
+    echo "  SKIP   https:// (needs openssl)"
+fi
+[ -n "$HPID" ] && kill "$HPID" 2> /dev/null
 fi
 
 echo
