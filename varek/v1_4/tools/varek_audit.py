@@ -438,6 +438,66 @@ def policy_approvers(checker, policy):
     return out
 
 
+def policy_notify(checker, policy):
+    """v1.42 step 7: each step_up rule's notify= URL, as the checker reads
+    the file (its "notify" mode): {LINE: URL}"""
+    q = subprocess.run([checker, policy, "notify"], capture_output=True, text=True)
+    if q.returncode != 0:
+        raise ValueError(q.stderr.strip() or "the checker failed")
+    out = {}
+    for ln in q.stdout.splitlines():
+        f = ln.split()
+        if len(f) != 3 or f[0] != "notify" or not f[1].isdigit():
+            raise ValueError(f"unexpected checker output {ln!r}")
+        out[int(f[1])] = bytes.fromhex(f[2]).decode("ascii")
+    return out
+
+
+def notify_host(url):
+    """v1.42 step 7: a notify= URL's host, as warden-notify reads it (no
+    brackets, no port)"""
+    m = re.match(r"https?://([^/?#]*)", url)
+    hp = m.group(1) if m else ""
+    if hp.startswith("["):
+        return hp[1:hp.find("]")] if "]" in hp else hp
+    return hp.rsplit(":", 1)[0] if ":" in hp else hp
+
+
+def check_intent(rs, logs, problems):
+    """v1.42 step 7: run_start's intent, the user's request: its SHA-256 and
+    length those of its text (at most 4 KiB), or of the file it names beside
+    the stream (STREAM.intent, at most 1 MiB)"""
+    it = rs.get("intent")
+    if it is None:
+        return
+    if not isinstance(it, dict) or not isinstance(it.get("sha256"), str) or \
+            not re.fullmatch(r"[0-9a-f]{64}", it["sha256"]) or type(it.get("bytes")) is not int:
+        problems.append("run_start's intent is malformed")
+        return
+    if "text" in it:
+        b = it["text"].encode("utf-8", errors="surrogateescape") if isinstance(it["text"], str) else None
+        if b is None or "file" in it or len(b) > 4096:
+            problems.append("run_start's intent: a text of over 4 KiB, or with a file too")
+            return
+        where = "its text"
+    else:
+        f = it.get("file")
+        if not isinstance(f, str) or not f or "/" in f or f in (".", "..") or not logs:
+            problems.append("run_start's intent names no file beside the stream")
+            return
+        path = os.path.join(os.path.dirname(os.path.abspath(logs[0])), f)
+        try:
+            with open(path, "rb") as fh:
+                b = fh.read((1 << 20) + 1)
+        except OSError as e:
+            problems.append(f"run_start's intent: cannot read {path}: {e.strerror}")
+            return
+        where = path
+    if len(b) != it["bytes"] or hashlib.sha256(b).hexdigest() != it["sha256"]:
+        problems.append(f"run_start's intent: {where} is not the request the Warden recorded (its SHA-256 or "
+                        f"length differs)")
+
+
 APPROVAL_DOMAIN = b"varek-approval-v1\0"
 
 
@@ -719,10 +779,24 @@ class GrantsCheck:
     and had not expired when recorded. A runtime grant that carries
     signed_by is signed by a pinned key of the rule's approvers= group, if
     it names one. Each signature is verified over the grant's text, as kind
-    grant: a forged or missing one is a problem."""
+    grant: a forged or missing one is a problem.
 
-    def __init__(self, run, problems, rs=None, apv=None):
+    v1.42 step 7 (notify=): each proposal of a rule with notify= has one
+    `notify` record after its step_up record (by the run's end, when it is
+    complete), and no other proposal has one: its rule's line, the host of
+    the rule's URL and the URL's SHA-256, and an outcome the Warden writes
+    (sent: a 2xx status, in 1 or 2 attempts; failed: why; abandoned). The
+    user's request (run_start's intent) is in no other record."""
+
+    def __init__(self, run, problems, rs=None, apv=None, nt=None):
         self.run, self.problems = run, problems
+        self.nt = nt or {}                   # v1.42 step 7: notify= URL by rule line
+        self.notes = {}                      # ... proposal id -> its notify outcome
+        if self.nt:
+            ntr = (rs or {}).get("notify")
+            if not isinstance(ntr, dict) or not isinstance(ntr.get("helper_sha256"), str) or \
+                    not re.fullmatch(r"[0-9a-f]{64}", ntr["helper_sha256"]):
+                problems.append("the policy has notify= rules, and run_start names no warden-notify that posted for them")
         self.apv = apv if apv is not None else {"keys": {}, "rules": {}, "unknown": 0}
         sr = (rs or {}).get("scope_run")
         self.can_freeze = isinstance(sr, dict) and sr.get("freeze") is True
@@ -813,6 +887,8 @@ class GrantsCheck:
 
     def rec(self, r):
         p = self.problems
+        if "intent" in r:                    # v1.42 step 7
+            p.append(f"seq {r.get('seq')}: a decision record holds the user's request (intent), which is run_start's alone")
         self._freeze_due()
         self._prop_due()
         self._defer_rec(r)
@@ -905,9 +981,47 @@ class GrantsCheck:
             if not isinstance(m, dict) or m.get("sha256") != df["sha"]:
                 p.append(f"seq {seq}: allowed after deferral {d}, under a marker other than the one that resolved it")
 
+    def _notify(self, e):
+        """v1.42 step 7: a post's outcome"""
+        p, sid = self.problems, e.get("id")
+        pr = self.props.get(sid)
+        if pr is None:
+            p.append(f"notify for {sid!r}, which no step_up record before it holds")
+            return
+        line = pr.get("line")
+        if sid in self.notes:
+            p.append(f"notify for {sid}: recorded twice")
+            return
+        self.notes[sid] = e.get("outcome")
+        url = self.nt.get(line)
+        if url is None:
+            p.append(f"notify for {sid}: its rule (line {line}) has no notify=")
+            return
+        if e.get("rule_line") != line:
+            p.append(f"notify for {sid}: names line {e.get('rule_line')!r}; its proposal is line {line}'s")
+        if e.get("host") != notify_host(url) or e.get("url_sha256") != hashlib.sha256(url.encode()).hexdigest():
+            p.append(f"notify for {sid}: names a host or URL other than line {line}'s notify=")
+        if "url" in e:
+            p.append(f"notify for {sid}: holds the URL itself")
+        out, st, at = e.get("outcome"), e.get("status"), e.get("attempts")
+        if out == "sent":
+            if type(st) is not int or not 200 <= st <= 299 or at not in (1, 2):
+                p.append(f"notify for {sid}: sent, without a 2xx status in 1 or 2 attempts")
+        elif out == "failed":
+            if not isinstance(e.get("why"), str) or (at is not None and at not in (1, 2)) or \
+                    (st is not None and (type(st) is not int or 200 <= st <= 299)):
+                p.append(f"notify for {sid}: failed, without why, or with a status or attempts the Warden does not write")
+        elif out != "abandoned":
+            p.append(f"notify for {sid}: an outcome {out!r} the Warden does not write")
+
     def ev(self, e):
         p = self.problems
         ev = e.get("event")
+        if "intent" in e:                    # v1.42 step 7: in run_start only
+            p.append(f"a {ev} record holds the user's request (intent), which is run_start's alone")
+        if ev == "notify":                   # v1.42 step 7: written between other records' groups
+            self._notify(e)
+            return
         if ev != "run_frozen":
             self._freeze_due()
         if not (ev == "step_up" and self.await_prop is not None and e.get("id") == self.await_prop):
@@ -1021,7 +1135,8 @@ class GrantsCheck:
                 p.append(f"step_up {sid}: a mode and state the Warden does not write")
             if not isinstance(e.get("proposal"), str):
                 p.append(f"step_up {sid}: no proposal")
-            self.props[sid] = {"ended": False, "text": e.get("proposal"), "held": held, "refused": False}
+            self.props[sid] = {"ended": False, "text": e.get("proposal"), "held": held, "refused": False,
+                               "line": e.get("rule_line")}
             self.nprop += 1
             if held:                             # v1.42 step 4: its scope
                 sc = e.get("scope")
@@ -1103,6 +1218,8 @@ class GrantsCheck:
             for sid, pr in self.props.items():
                 if not pr["ended"]:
                     self.problems.append(f"step_up {sid}: never ended")
+                if pr.get("line") in self.nt and sid not in self.notes:     # v1.42 step 7
+                    self.problems.append(f"step_up {sid}: under line {pr['line']}'s notify=, with no notify outcome")
 
     def row(self, rec):
         """MainLoop's certificate row's grant part, or None"""
@@ -5386,7 +5503,13 @@ def start_checks(a, meta, rs, run, sec, res, prules, rules, names_policy, proxy_
         sec["grants"].append(f"cannot read the policy's approver keys: {e}")
         apv = None
     k["apv"] = apv
-    k["grants"] = GrantsCheck(run, sec["grants"], rs, apv)                # v1.42
+    try:                                                                  # v1.42 step 7
+        nt = policy_notify(a.checker, a.policy)
+    except (OSError, ValueError) as e:
+        sec["grants"].append(f"cannot read the policy's notify= URLs: {e}")
+        nt = None
+    check_intent(rs, a.log, sec["grants"])                                # v1.42 step 7
+    k["grants"] = GrantsCheck(run, sec["grants"], rs, apv, nt)            # v1.42
     try:                                                                  # v1.27.1
         nx = check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, Section(), quiet=True)
     except (OSError, ValueError):
