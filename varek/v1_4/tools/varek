@@ -1947,6 +1947,10 @@ def cmd_run(args):
         argv += ["--require-approved-plan"]
     if getattr(args, "grants", None):                                 # v1.42 step 6
         argv += ["--grants", os.path.abspath(args.grants)]
+    if getattr(args, "intent", None) and getattr(args, "intent_text", None) is not None:   # v1.42 step 7
+        raise CliError("--intent and --intent-text together", fix="give the user's request one way")
+    if getattr(args, "intent", None):
+        argv += ["--intent", os.path.abspath(args.intent)]
     if cfg["sign_key"]:
         if _key_is_v140(cfg["sign_key"]):                                 # v1.41
             raise CliError(f"the signing key {cfg['sign_key']} is v1.40's Ed25519 key, which the Warden "
@@ -1978,8 +1982,20 @@ def cmd_run(args):
                              "policy refuses is let through."), file=sys.stderr)
     print(_paint("2", f"[varek] supervising `{' '.join(cmd)}` under {label}; "
                       f"verdicts -> {log}"), file=sys.stderr)
-    with os.fdopen(fd, "w") as err:
-        r = run_cmd(argv, check=False, stderr=err, env=env)
+    intent_dir = None
+    if getattr(args, "intent_text", None) is not None:              # v1.42 step 7
+        # the text, in a file for the Warden to read (in a private directory, removed after the run)
+        intent_dir = tempfile.mkdtemp(prefix="varek-intent-")
+        ip = os.path.join(intent_dir, "intent")
+        with open(os.open(ip, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as fh:
+            fh.write(args.intent_text)
+        argv[2:2] = ["--intent", ip]
+    try:
+        with os.fdopen(fd, "w") as err:
+            r = run_cmd(argv, check=False, stderr=err, env=env)
+    finally:
+        if intent_dir:
+            shutil.rmtree(intent_dir, ignore_errors=True)
 
     agent_err = []
     with open(log, encoding="utf-8", errors="replace") as fh:
@@ -2200,20 +2216,32 @@ def cmd_pending(args):
     if ans is None:
         fail(f"{run}: no such run is running (or it has no step_up rule)")
         return 1
-    props = []
+    props, intent = [], None
     for line in ans.splitlines():
         if line == "end":
             break
         if line.startswith("refused"):
             fail(f"{run}: {line}")
             return 1
-        props.append(json.loads(line))
+        o = json.loads(line)
+        if "intent" in o and "id" not in o:          # v1.42 step 7: the user's request, first
+            intent = o["intent"]
+            continue
+        props.append(o)
     if args.json:
+        if intent:                                   # each proposal with the run's request
+            props = [dict(p, intent=intent) for p in props]
         print(json.dumps(props, indent=2))
         return 0
     if not props:
         info(f"{run}: no proposal you may answer is open.")
         return 0
+    if intent:
+        info(f"the user's request ({intent['bytes']} bytes, SHA-256 {intent['sha256'][:16]}"
+             + (", the first part shown" if intent.get("truncated") else "") + "):")
+        for ln in intent["text"].splitlines() or [""]:
+            info(f"    {ln}")
+        info("")
     defers = [p for p in props if p.get("defer") == "outside_plan"]
     for p in props:
         if p in defers:
@@ -3748,6 +3776,11 @@ def build_parser():
                          "`varek plan approve`)")
     sp.add_argument("--grants", metavar="DIR",
                     help="v1.42: standing grants (DIR/NAME.grant, each signed: NAME.grant.sig), checked at the start")
+    sp.add_argument("--intent", metavar="FILE",
+                    help="v1.42: the user's request, as the agent framework received it: recorded in run_start (its "
+                         "SHA-256, and its text up to 4 KiB, or a file beside the log) and shown to approvers "
+                         "(`varek pending`); no rule matches on it")
+    sp.add_argument("--intent-text", metavar="TEXT", help="v1.42: the same, given as text")
     sp.add_argument("--run-as", help="unprivileged user for the agent (default from settings; with the "
                                      "baseline, the user who ran sudo)")
     sp.add_argument("--log", help="write the verdict stream here instead of a new file")

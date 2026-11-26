@@ -26,9 +26,10 @@
  * Records: `step_up` (proposed), `grant` (its text, id, approver, reason),
  * `step_up_end` (approved, denied, timeout). The audit replays them.
  *
- * Not in this step: mode=hold and scope=run (step 3 and 4), notify= (step
- * 7), proposals for requests and MCP calls; a policy that needs one of the
- * first three is refused at start. */
+ * Built since: mode=hold (step 3), proposals for requests and MCP calls
+ * (step 3b), scope=run (step 4), DEFER (steps 5 and 5b), signed approvals
+ * (step 6), notify= (step 7: warden_notify.inc.c posts each proposal of
+ * such a rule, after its step_up record). */
 
 #define GRANT_MAX 64
 #define PROP_TEXT_MAX 8192
@@ -99,19 +100,16 @@ static long long gr_now_ns(void) {
 }
 
 static bool grant_holds(const struct policy *p);
+struct proposal;
+static int  nt_policy_check(const struct policy *p, const char *path);   /* v1.42 step 7: warden_notify.inc.c */
+static void notify_post(const struct proposal *pp, const char *mode);
+static void notify_end_all(void);
 
-/* At start: a policy that needs what this build does not carry out yet is
+/* At start: a policy that needs what this build does not carry out is
  * refused (fail closed). 0, or -1 with the reason on stderr. */
 static int grant_policy_check(const struct policy *p, const char *path) {
-    for (size_t i = 0; i < p->v.n; i++) {
-        const vdp_rule_t *r = &p->v.rules[i];
-        if (r->verb != VDP_STEP_UP) continue;
-        if (r->su_notify[0]) {
-            fprintf(stderr, "[warden] policy %s:%d: notify= is not built yet (v1.42 is being built in steps; "
-                    "this one has mode=grant, mode=hold and scope=run); refusing to start\n", path, r->line);
-            return -1;
-        }
-    }
+    /* v1.42 step 7: each notify= URL one warden-notify can post to */
+    if (nt_policy_check(p, path) < 0) return -1;
     /* v1.42 step 5: a marker the agent could write would let it release
      * its own deferred calls */
     for (size_t i = 0; i < p->v.n; i++) {
@@ -1060,6 +1058,7 @@ static bool hold_take(pid_t pid, const struct action *a, decision_t d_raw, decis
             su_scope_run(su) ? "run" : "thread", gr_now_ns());
     rec_end(NULL);
     if (su_scope_run(su) && !was_frozen) frz_record(true, h->prop, 0);   /* v1.42 step 4 */
+    notify_post(&g_prop[k], "hold");                                    /* v1.42 step 7 */
     return true;
 }
 
@@ -1122,6 +1121,7 @@ static bool px_hold_take(const struct action *a, decision_t d_raw, int what, uin
             su_scope_run(su) ? "run" : "thread", gr_now_ns());
     rec_end(NULL);
     if (su_scope_run(su) && !was_frozen) frz_record(true, h->prop, 0);   /* v1.42 step 4 */
+    notify_post(&g_prop[k], "hold");                                    /* v1.42 step 7 */
     return true;
 }
 
@@ -1218,6 +1218,7 @@ static void step_up_after(uint64_t seq) {
     json_escape(f, pp->text);
     fprintf(f, "\",\"timestamp_ns\":%lld}\n", gr_now_ns());
     rec_end(NULL);
+    notify_post(pp, "grant");                       /* v1.42 step 7 */
 }
 
 static void step_up_end_record(const struct proposal *pp, const char *ending, const char *grant_id,
@@ -1319,6 +1320,7 @@ static void grant_end_all(void) {
         prop_free(g_nprop - 1);
     }
     frz_update();                                  /* v1.42 step 4: thawed (recorded) before run_end */
+    notify_end_all();                              /* v1.42 step 7: posts with no outcome end abandoned */
 }
 
 /* ---- the approvers' socket ---- */
@@ -1424,9 +1426,41 @@ static void apv_cat_json(char *b, size_t n, size_t *k, const char *s) {
     b[*k] = '\0';
 }
 
+/* v1.42 step 7: the user's request (--intent), shown to approvers: its
+ * first 2 KiB (cut at a character's start), UTF-8 kept as it is; text
+ * that is not UTF-8 is shown with each byte past ASCII escaped */
+#define INTENT_SHOWN 2048
+static void apv_intent(int c, char *line, size_t n) {
+    size_t shown = g_intent_len < INTENT_SHOWN ? g_intent_len : INTENT_SHOWN;
+    if (g_intent_utf8) while (shown && shown < g_intent_len && (g_intent[shown] & 0xc0) == 0x80) shown--;
+    size_t k = 0;
+    apv_cat(line, n, &k, "{\"intent\":{\"sha256\":\"%s\",\"bytes\":%zu,\"truncated\":%s,\"text\":\"", g_intent_sha,
+            g_intent_len, shown < g_intent_len ? "true" : "false");
+    for (size_t i = 0; i < shown && k + 8 < n; i++) {
+        unsigned char u = g_intent[i];
+        if (u == '"' || u == '\\') { line[k++] = '\\'; line[k++] = (char)u; }
+        else if (u == '\n') { line[k++] = '\\'; line[k++] = 'n'; }
+        else if (u < 0x20 || u == 0x7f || (u >= 0x80 && !g_intent_utf8)) apv_cat(line, n, &k, "\\u%04x", u);
+        else line[k++] = (char)u;
+        line[k] = '\0';
+    }
+    apv_cat(line, n, &k, "\"}}\n");
+    apv_send(c, line);
+}
+
 static void apv_pending(int c, const struct ucred *cr) {
     char line[PROP_TEXT_MAX * 2 + 512];
     long long now = gr_now_ms();
+    /* v1.42 step 7: first the user's request, to a peer who may answer
+     * something open in this run (and to no one else) */
+    if (g_intent_on) {
+        bool any = false;
+        char w[64];
+        for (size_t i = 0; !any && i < g_nprop; i++) any = !apv_may(cr->uid, cr->gid, prop_su(&g_prop[i]), w);
+        for (size_t i = 0; !any && g_gr_p->v.op_line && i < g_nheld; i++)
+            any = g_held[i].dkind == 2 && !apv_may(cr->uid, cr->gid, &g_op_rule, w);
+        if (any) apv_intent(c, line, sizeof line);
+    }
     for (size_t i = 0; i < g_nprop; i++) {
         const struct proposal *pp = &g_prop[i];
         const vdp_rule_t *su = prop_su(pp);

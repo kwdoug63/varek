@@ -57,7 +57,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
              $(V1_7_DIR)/plan_policy_config.c $(V1_7_DIR)/plan_breaker.c \
              $(V1_7_DIR)/plan_progress.c
 
-BINS := warden warden-proxy warden-secrets target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
+BINS := warden warden-proxy warden-secrets warden-notify target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
 .PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1410 test-v1420 fips-acceptance test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-v1311 test-v1320 test-v1321 test-v1340 test-v1350 test-v1300 test-v1300-oflags test-varek-k8s test-varek-chart sweep-v1340 test-v1340-kind test-v1340-apiserver varek-nri varek-admission varek-svid test-node-json test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
 
@@ -101,7 +101,7 @@ CHECKER := checker/vdp_checker.c checker/vdp_checker.h
 # uses the host's resolver library.
 RESOLVE := warden_resolve.c warden_resolve.h warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c shared_domains.c shared_domains.h warden_proxy.c warden_proxy.h proxy_parse.h warden_secrets.c warden_secrets.h warden_revoke.inc.c
 
-warden: warden.c warden_node.inc.c node_json.c node_json.h warden_oci.c warden_oci.h warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c warden_exec.inc.c warden_noexec.inc.c warden_subagent.inc.c warden_revoke.inc.c warden_grant.inc.c warden_signed.inc.c varek_approval.h warden_asagent.inc.c warden_change.inc.c warden_hold.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(CRYPTO) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
+warden: warden.c warden_node.inc.c node_json.c node_json.h warden_oci.c warden_oci.h warden_net.inc.c warden_names.inc.c warden_stub.inc.c warden_synth.inc.c warden_pxdecide.inc.c warden_trust.inc.c warden_exec.inc.c warden_noexec.inc.c warden_subagent.inc.c warden_revoke.inc.c warden_grant.inc.c warden_signed.inc.c varek_approval.h warden_notify.inc.c warden_notify.h warden_asagent.inc.c warden_change.inc.c warden_hold.inc.c warden_baseline_filter.c smt_decide.c smt_decide.h $(CHECKER) $(CRYPTO) $(RESOLVE) $(LIFECYCLE) $(FLOW_SRC) $(V1_6_SRC)
 	@$(MAKE) -s --no-print-directory deps-check
 	@# v1.27: Landlock does not govern a memfd, so the agent must never make one
 	@# (docs/security/v1.27-program-launches.md): memfd_create stays hard-denied
@@ -132,6 +132,13 @@ warden-proxy: warden_proxy_helper.c warden_proxy_mcp.inc.c warden_proxy.h proxy_
 warden-secrets: warden_secrets_helper.c warden_secrets.h mcp_json.c mcp_json.h mcp_aud.h $(CRYPTO)
 	@$(MAKE) -s --no-print-directory deps-check-ssl
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_secrets_helper.c mcp_json.c varek_fips.c -lssl -lcrypto
+
+# v1.42 step 7: warden-notify, the helper that posts each proposal of a
+# `step_up ... notify=URL` rule to its webhook. Its own program, as
+# warden-secrets is, so the Warden links no TLS code.
+warden-notify: warden_notify_helper.c warden_notify.h $(CRYPTO)
+	@$(MAKE) -s --no-print-directory deps-check-ssl
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ warden_notify_helper.c varek_fips.c -lssl -lcrypto
 
 # v1.15, TEST ONLY: a Warden whose decision procedure has a planted bug (a path
 # ending in /.inject is decided SATISFIED). test_v1150.sh uses it to show that
@@ -317,7 +324,7 @@ test-v1410: all
 # and DEFER. Step 1: the grammar, grants and the two-part certificate, in the
 # decision procedure and the certificate checker; step 2: runtime grants in
 # mode=grant, the approvers' socket, the audit (as root).
-test-v1420: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen
+test-v1420: warden warden-notify tools/vdp_check tools/vdp_cert_check tools/varek_keygen
 	@sudo ./tests/test_v1420.sh
 
 # v1.41: the Defense build's acceptance on RHEL 9 in FIPS mode (run there, as
@@ -674,10 +681,10 @@ INSTALL_TOOLS := tools/varek tools/vdp_check tools/vdp_cert_check tools/varek_ke
 	tools/varek_baseline.py tools/varek_suggest.py tools/varek_container.py tools/varek_node_export.py \
 	tools/bench_workload
 
-install: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
+install: warden warden-proxy warden-secrets warden-notify tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/tools $(DESTDIR)$(PREFIX)/policies $(DESTDIR)$(PREFIX)/data $(DESTDIR)$(BINDIR)
 	install -m 0644 data/public_suffix_list.dat data/varek_shared_domains.txt $(DESTDIR)$(PREFIX)/data/
-	install -m 0755 warden warden-proxy warden-secrets $(DESTDIR)$(PREFIX)/
+	install -m 0755 warden warden-proxy warden-secrets warden-notify $(DESTDIR)$(PREFIX)/
 	install -m 0755 $(INSTALL_TOOLS) $(DESTDIR)$(PREFIX)/tools/
 	install -m 0644 policies/*.policy.txt $(DESTDIR)$(PREFIX)/policies/
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/policies/agents
