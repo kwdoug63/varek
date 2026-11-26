@@ -9,6 +9,17 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed (documentation)
+
+- **The 510 TOCTOU figure has a record.** Since v1.18.0 the README said the
+  harness's "510 leaks in 20,000 attempts" had no recorded run. It was
+  measured: one run each way for v1.9.1 in GitHub Codespaces (naive 510,
+  mitigated 0), whose output was kept only in the build session. It is now
+  committed as `tests/toctou_results_v1.9.1.txt`, and the README,
+  `RELEASE-v1.18.0.md` and `tests/toctou_results_v1.18.0.txt` say so. The
+  v1.18.0 re-run (1,848 to 1,889 against 0 on a 2-vCPU host) stands; the naive
+  count depends on the host.
+
 ## [1.41.0] - 2026-11-24 — VAREK implements no cryptography of its own
 
 Every hash, signature, key and random byte of the Warden and its tools is

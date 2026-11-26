@@ -1,0 +1,25 @@
+VAREK seccomp user-notify TOCTOU harness (tests/seccomp_toctou_harness.c)
+Run for v1.9.1, June 2026, in GitHub Codespaces (host CPU count and kernel
+version were not recorded)
+Build:   cc -O2 -o /tmp/toctou tests/seccomp_toctou_harness.c
+Command: sudo /tmp/toctou --naive 20000       (one run)
+         sudo /tmp/toctou --mitigated 20000   (one run)
+
+naive (approve-then-CONTINUE, the kernel re-reads the path):
+[super  ] mode=naive  notify_fd=4  pid=14493
+[target ] iterations=20000  opens_succeeded=1874  sentinel_leaks=510
+
+mitigated (resolve, decide, inject the descriptor):
+[super  ] mode=mitigated  notify_fd=4  pid=17966
+[target ] iterations=20000  opens_succeeded=2783  sentinel_leaks=0
+
+Provenance: these lines are the terminal output of the two runs as pasted into
+the v1.9.1 build session. They were not written to a file by the harness at
+the time and were not committed until 2026-09-30, which is why the v1.18.0
+review, searching the repository only, found no record of the 510 figure.
+
+One run per mode on an unrecorded host; opens_succeeded differs between the
+runs, so the result is reported as raw counts, not a rate. The v1.18.0 re-run
+(tests/toctou_results_v1.18.0.txt) gave 1,848 to 1,889 naive leaks on a 2-vCPU
+host. The naive count depends on the host's scheduling; the mitigated count
+was 0 in every run.
