@@ -191,9 +191,9 @@ int main(int argc, char **argv) {
                       strcmp(argv[2], "launches") && strcmp(argv[2], "matches") &&
                       strcmp(argv[2], "openas") &&
                       strcmp(argv[2], "credentials") && strcmp(argv[2], "identity") &&
-                      strcmp(argv[2], "approvers"))) {
+                      strcmp(argv[2], "approvers") && strcmp(argv[2], "notify"))) {
         fprintf(stderr, "usage: %s <policy> digest|batch [GRANT...]|grant GRANT|holds|openable|kinds|rules|matches|proxy|launches|"
-                "openas|credentials|identity|approvers\n", argv[0]);
+                "openas|credentials|identity|approvers|notify\n", argv[0]);
         return 2;
     }
 args_ok:;
@@ -285,6 +285,21 @@ args_ok:;
                 printf("rule %d %s\n", ri.line, ri.su_approvers && ri.su_approvers[0] ? ri.su_approvers : "-");
         }
         if (pol.unk_line) printf("unknown %d %s\n", pol.unk_line, pol.unk_approvers[0] ? pol.unk_approvers : "-");
+        vdpc_free(&pol);
+        return 0;
+    }
+
+    /* v1.42 step 7: each step_up rule's notify= URL ("notify LINE URLHEX",
+     * the URL's bytes in hex), for varek_audit.py's notify checks */
+    if (!strcmp(argv[2], "notify")) {
+        for (size_t i = 0; i < pol.n; i++) {
+            vdpc_rule_info_t ri;
+            vdpc_rule_info(&pol, i, &ri);
+            if (!ri.step_up || !ri.su_notify || !ri.su_notify[0]) continue;
+            printf("notify %d ", ri.line);
+            for (const unsigned char *c = (const unsigned char *)ri.su_notify; *c; c++) printf("%02x", *c);
+            printf("\n");
+        }
         vdpc_free(&pol);
         return 0;
     }
