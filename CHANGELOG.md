@@ -7,6 +7,20 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- `tests/arm64_sweep.sh --deps` installs its Python packages with
+  `--require-hashes`, from `tools/requirements-sweep.txt`, now compiled from
+  `tools/requirements-sweep.in` (uv, for Python 3.9 and later) with every
+  package's version and hash (OpenSSF Scorecard, Pinned-Dependencies). On
+  Python 3.9 (RHEL 9, Rocky Linux 9, Amazon Linux 2023) pytest is the
+  distribution's `python3-pytest`, as no pytest for 3.9 is free of a known
+  vulnerability.
+
+---
+
 ## [1.42.0] - 2026-11-26 — STEP UP and DEFER: approvals as grants
 
 A call a policy cannot settle on its own can now wait: for a person

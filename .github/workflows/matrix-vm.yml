@@ -36,6 +36,7 @@ on:
       # the sweep's Python packages, so a Dependabot update of one runs the
       # sweep cells
       - "varek/v1_4/tools/requirements-sweep.txt"
+      - "varek/v1_4/tools/requirements-sweep.in"
       - "varek/v1_4/tools/requirements-test.txt"
       - "varek/v1_4/tools/requirements-crosscheck.txt"
       - "varek/v1_4/tests/v1340_kind.sh"
