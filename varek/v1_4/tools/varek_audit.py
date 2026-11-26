@@ -286,7 +286,18 @@ class Spool:
         self.rows.seek(0)
         out = tempfile.TemporaryFile("w+", encoding="utf-8", errors="surrogateescape")
         err = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
-        rc = subprocess.run([checker, policy, mode, *extra], stdin=self.rows, stdout=out, stderr=err).returncode
+        extra, lst = list(extra), None
+        if len(extra) > 64:              # v1.42 step 9: a long run's grants, named in a file (batch @LIST)
+            lst = tempfile.NamedTemporaryFile("w", suffix=".grants", encoding="utf-8", errors="surrogateescape",
+                                              delete=False)
+            lst.write("".join(f + "\n" for f in extra))
+            lst.close()
+            extra = ["@" + lst.name]
+        try:
+            rc = subprocess.run([checker, policy, mode, *extra], stdin=self.rows, stdout=out, stderr=err).returncode
+        finally:
+            if lst is not None:
+                os.unlink(lst.name)
         out.seek(0)
         err.seek(0)
         n = 0
@@ -897,8 +908,8 @@ class GrantsCheck:
             p.append(f"seq {r.get('seq')}: an unheld note on a call not refused by a step_up rule")
         if self.replays:                     # v1.42 step 4: an approved call held with scope=run, decided again
             g = self.grants.get(r.get("cert_grant")) if r.get("cert_grant") else None
-            if g is not None and g.get("prop") in self.replays:
-                self.replays.discard(g["prop"])
+            if g is not None and self.replays & g["props"]:
+                self.replays.discard(next(iter(self.replays & g["props"])))
             elif str(r.get("step_up_why", "")).startswith("held and approved"):
                 self.replays.pop()
         if "step_up" in r:
@@ -1162,7 +1173,19 @@ class GrantsCheck:
             elif prop not in self.props or self.props[prop]["ended"]:
                 p.append(f"grant {gid[:16]}: approves {prop!r}, which is not an open proposal")
             if gid in self.grants:
-                p.append(f"grant {gid[:16]} recorded twice")
+                old = self.grants[gid]
+                if standing or old["standing"] or prop is None or prop in old["props"]:
+                    p.append(f"grant {gid[:16]} recorded twice")
+                    return
+                # v1.42 step 9: the same text approved again, for another open proposal (two proposals of
+                # one call made within a second propose the same grant): one grant, its counts summed
+                g2 = self._parse(text)
+                old["count"] = old["count"] + g2["count"] if old["count"] and g2 and g2["count"] else 0
+                old["props"].add(prop)
+                if not isinstance(e.get("approver_uid"), int):
+                    p.append(f"grant {gid[:16]}: no approver")
+                if "signed_by" in e or "sig" in e:
+                    self._signed(gid, text, e, False, old)
                 return
             g = self._parse(text)
             if g is None:
@@ -1177,7 +1200,7 @@ class GrantsCheck:
             path = os.path.join(self.dir.name, f"g{len(self.files)}.txt")
             with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
                 fh.write(text)
-            g.update(index=len(self.files), used=0, prop=prop)
+            g.update(index=len(self.files), used=0, prop=prop, props={prop}, standing=standing)
             self.files.append(path)
             self.grants[gid] = g
         elif ev == "step_up_end":
@@ -1196,7 +1219,7 @@ class GrantsCheck:
                 p.append(f"step_up_end for {sid}: an ending {end!r} the Warden does not write")
             elif end == "approved":
                 g = self.grants.get(e.get("grant"))
-                if g is None or g["prop"] != sid:
+                if g is None or sid not in g["props"]:
                     p.append(f"step_up_end for {sid}: approved, but no grant record of its approval before it")
                 if sid in self.runheld and pr["held"]:
                     self.replays.add(sid)        # v1.42 step 4: decided again before the thaw
