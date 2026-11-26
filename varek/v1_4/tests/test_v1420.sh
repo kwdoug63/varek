@@ -1217,6 +1217,23 @@ PY
 check "run_start: the request's text, SHA-256 and length; warden-notify's SHA-256 and user" recs "$W/n1.log" \
   "[r for r in rs if r.get('event') == 'run_start' and r['intent'] == {'sha256': '$(sha256sum "$W/intent.txt" | cut -c1-64)', 'bytes': $(wc -c < "$W/intent.txt"), 'text': open('$W/intent.txt').read()} and r['notify']['uid'] == 65530 and len(r['notify']['helper_sha256']) == 64]"
 audit_ok "$W/n1.txt" "$W/n1.log" && pass "the audit passes it" || flunk "audit n1: $(grep PROBLEM "$W/n1.log.audit" | head -2)"
+
+# v1.42 step 8 (review): the chat's line writes the object's &, < and > as
+# Slack's mrkdwn asks, so an object named like a link or a mention is neither;
+# the grant's own text is exact
+hook n7 200
+printf "${BASE}step_up path $W/data/ timeout=30 notify=http://127.0.0.1:$HP/h\n" > "$W/n7.txt"
+A7="$W/data/<https:x.test|Approve>&<!channel>.csv"; printf 'x\n' > "$A7"; chmod 644 "$A7"
+"$WARDEN" "$W/n7.txt" -- /bin/bash "$W/bin/agent.sh" "$A7" 4 > "$W/n7.out" 2> "$W/n7.log"
+python3 - "$HLOG" "$A7" <<'PY' && pass "the chat's line: the object's &, < and > as &amp;, &lt; and &gt; (no link, no mention); the grant's text exact" || flunk "notify n7: $(head -c 600 "$HLOG" 2>&1)"
+import json, sys
+p = [json.loads(json.loads(l)["body"]) for l in open(sys.argv[1])]
+a = sys.argv[2]
+esc = a.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+sys.exit(0 if len(p) == 1 and esc in p[0]["text"] and "<" not in p[0]["text"] and ">" not in p[0]["text"]
+         and f"allow path exact {a} " in p[0]["varek"]["grant"] else 1)
+PY
+audit_ok "$W/n7.txt" "$W/n7.log" && pass "the audit passes it" || flunk "audit n7: $(grep PROBLEM "$W/n7.log.audit" | head -2)"
 NR="[r for r in recs if isinstance(r, dict) and r.get('event') == 'notify'][0]"
 RS="[r for r in recs if isinstance(r, dict) and r.get('event') == 'run_start'][0]"
 sforge "a notify record dropped" "$W/n1.log" "$W/n1.txt" "recs.remove($NR)" "with no notify outcome"
@@ -1312,6 +1329,77 @@ else
 fi
 [ -n "$HPID" ] && kill "$HPID" 2> /dev/null
 fi
+
+# ---- v1.42 step 8: the exports. The streams above, audited and exported as
+# OCSF (and on to OpenTelemetry, Splunk, Sentinel and Falcon): each record of
+# an approval, a deferral, the freeze and the webhook an event of its own.
+echo "== 13. step 8: the streams above, exported (OCSF, and the exports on it) =="
+OX="$HERE/tools/varek_ocsf.py"; OV="$HERE/tests/ocsf_validate.py"; EV="$W/ev"; mkdir -p "$EV"
+xs=""; xbad=""
+for p in h1:h1 h2:h1 h3:h3 x:x s1:s6 s2:s6 s3:s1 s4:s1 d1:d1 d2:d1 d3:d3 d4:d4 u1:u1 d6:d6 o1:o1 o2:o2 \
+         n1:n1 n2:n2 n3:n3 n4:n4 n5:n5 n6:n5 pl1:s6p; do
+    l="${p%%:*}"; [ -f "$W/$l.log" ] && [ -f "$W/${p#*:}.txt" ] || continue
+    if python3 "$OX" --log "$W/$l.log" --policy "$W/${p#*:}.txt" --checker "$CERT" -o "$EV/$l.ev" > "$EV/$l.err" 2>&1 \
+       && python3 "$OX" --verify "$EV/$l.ev" --log "$W/$l.log" --policy "$W/${p#*:}.txt" --checker "$CERT" >> "$EV/$l.err" 2>&1; then
+        xs="$xs $l"
+    else
+        xbad="$xbad $l($(grep -v '^ *PROBLEM' "$EV/$l.err" | tail -1))"
+    fi
+done
+[ -z "$xbad" ] && [ -n "$xs" ] && pass "each stream exported, and its events --verify'd against it:$xs" || flunk "exports:$xbad"
+python3 "$OV" $(for l in $xs; do printf '%s ' "$EV/$l.ev"; done) > "$EV/validate.out" 2>&1 \
+  && pass "every event valid OCSF 1.9.0 ($(tail -1 "$EV/validate.out" | cut -d' ' -f2) events)" || flunk "OCSF: $(head -3 "$EV/validate.out")"
+NURL="$(grep -o 'notify=[^ ]*' "$W/n1.txt" 2>/dev/null | head -1 | cut -d= -f2-)"
+python3 - "$W" "$EV" "$HERE" "$NURL" $xs > "$EV/check.out" 2>&1 <<'PY'
+import json, os, sys
+w, evd, here, nurl, logs = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
+sys.path.insert(0, os.path.join(here, "tools"))
+import varek_ocsf as ocsf, varek_otel as otel, varek_sentinel as sen, varek_splunk as spl, varek_falcon as fal
+bad = []
+def evs(l):
+    return [json.loads(x) for x in open(os.path.join(evd, l + ".ev"))]
+for l in logs:
+    recs = [json.loads(x) for x in open(os.path.join(w, l + ".log"), errors="replace") if x.startswith("{")]
+    want = [r.get("event") for r in recs if r.get("event") in ocsf.V142_EVENTS]
+    got = [e for e in evs(l) if e["unmapped"]["varek"].get("event") in ocsf.V142_EVENTS]
+    if [e["unmapped"]["varek"]["event"] for e in got] != want:
+        bad.append(f"{l}: the records {want} are not the events {[e['unmapped']['varek']['event'] for e in got]}")
+    for e in got:
+        v = e["unmapped"]["varek"]
+        if (e["class_uid"], e["activity_id"]) != (6002, 99) or not e.get("message"):
+            bad.append(f"{l}: {v['event']}: not an Application Lifecycle event with its message")
+        if v["event"] in ("step_up", "defer") and (not v.get("object") or v.get("obo") in (None, [])):
+            bad.append(f"{l}: {v['event']} {v.get('step_up') or v.get('defer')}: no call or obo")
+        if v["event"] in ("step_up", "defer", "notify") and not (e.get("policy") or {}).get("desc"):
+            bad.append(f"{l}: {v['event']}: no policy line text")
+        if v["event"] == "grant" and not (e.get("actor") or {}).get("user"):
+            bad.append(f"{l}: grant: no approver")
+        for f in (sen.row, otel.log_record, spl.hec_event, fal.event_of):
+            f(e)                                                   # each export takes each event
+    for e in evs(l):
+        if nurl and nurl in json.dumps(e):
+            bad.append(f"{l}: the webhook's URL in an event")
+ends = {l: [e for e in evs(l) if e["unmapped"]["varek"].get("event") == "step_up_end"] for l in logs}
+expired = lambda l: [sen.row(e) for e in ends.get(l, []) if e["unmapped"]["varek"]["ending"] == "timeout"]
+if "h3" in logs and not (expired("h3") and expired("h3")[0]["EventName"] == "varek.step_up_end"
+                         and expired("h3")[0]["Target"] and expired("h3")[0]["PolicyLine"] > 0):
+    bad.append("h3: no row Sentinel's expired-approval rule would take")
+if "h1" in logs and expired("h1"):
+    bad.append("h1: an approved call taken as expired")
+if "n1" in logs:
+    rs = evs("n1")[0]["unmapped"]["varek"]
+    if rs.get("intent", {}).get("text") != open(os.path.join(w, "intent.txt")).read():
+        bad.append("n1: run_start's event does not carry the request")
+    if not [e for e in evs("n1") if e["unmapped"]["varek"].get("event") == "notify"
+            and e["unmapped"]["varek"]["notify"].get("url_sha256")]:
+        bad.append("n1: no notify event with the URL's SHA-256")
+if "n2" in logs and evs("n2")[0]["unmapped"]["varek"].get("intent", {}).get("file") != "n2.log.intent":
+    bad.append("n2: run_start's event does not name the request's file")
+print("\n".join(bad) or "ok")
+sys.exit(1 if bad else 0)
+PY
+[ "$(cat "$EV/check.out")" = ok ] && pass "each v1.42 record an event of its own, with its call, obo and policy line; no webhook URL; the request carried; each export takes each event; Sentinel's rule takes h3's timeout and not h1's approval" \
+  || flunk "the events: $(head -4 "$EV/check.out")"
 
 echo
 [ $fail = 0 ] && echo "test_v1420: PASS ($n checks)" || echo "test_v1420: FAIL"
