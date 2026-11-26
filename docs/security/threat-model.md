@@ -1,6 +1,6 @@
 # VAREK — Threat Model
 
-Version: current as of v1.41.0 (released November 2026) · MIT · github.com/kwdoug63/varek
+Version: current as of v1.41.0 (released November 2026); the v1.42.0 entries describe the release being built · MIT · github.com/kwdoug63/varek
 
 This document states what VAREK defends, against whom, and what it explicitly
 does not defend. It is deliberately conservative: where a guarantee is
@@ -213,6 +213,57 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
   alerts on it) is trusted as that tool's. Keys and secrets come from the
   environment, never the command line; the Splunk collector's
   certificate and name are always checked.
+- **Trust boundary 22 (v1.42.0):** the approvers. A `step_up` rule lets a
+  person approve a call the policy does not allow by itself; a `defer` rule
+  lets a marker file, or a plan extension, release one.
+  (`docs/security/v1.42-step-up-defer.md`.)
+  - *The approver is a principal who can be deceived or coerced.* VAREK
+    does not judge whether an approval is wise. It bounds what one can
+    authorise: a grant names one object, a count and a time, within the
+    `step_up` rule's envelope (its matchers), and the Warden allows a call
+    under it only when the decision procedure and the certificate checker
+    both hold, the policy plus the grant. An approver cannot widen a rule,
+    approve another run's call, or approve past the rule's `approvers=`
+    group.
+  - *Who approves* is the Unix user on the approvers' socket, from its
+    peer credentials (the kernel's word), never what the client says. A
+    rule without `approvers=` is approved by root alone; the agent's own
+    user is never an approver, even in the group. With `approver key=`
+    lines, a signature over the grant's text by a pinned key adds to that
+    (it never replaces it), and a standing grant or an approved plan is
+    taken only with a valid signature by a pinned key of the rule's group.
+    The private keys are the approvers'; their custody is trusted.
+  - *What the approver reads is the agent's.* A proposal names the object
+    the agent asked for, and `varek pending` shows the user's request
+    (`--intent`), which comes from the agent's framework. Both are
+    context, never part of the decision: no rule matches on the request,
+    and a grant is checked against the rule, not the request. From v1.42
+    step 8, `varek pending` writes control, format and bidirectional
+    characters as escapes, so neither can redraw the approver's terminal.
+  - *Markers* (`defer ... until=FILE`) are trusted as their owner's word:
+    a regular file reached without a symbolic link, owned by root or the
+    rule's `approvers=` group and never by the agent's user, writable by
+    its owner alone, at most 4 KiB, naming this run (or `*`). A policy
+    that lets the agent write a marker is refused at start. The record
+    holds the SHA-256 of the exact bytes checked.
+  - *The freeze* (`scope=run`) is the kernel's cgroup v2 freezer: the
+    run's control group stops while a call is held, the Warden and its
+    helpers outside it. It needs Linux 5.19's killable notification waits;
+    where the run cannot be frozen, a call that needs it is refused at
+    once, never held unfrozen.
+- **Trust boundary 23 (v1.42.0):** the approvers' webhook (`notify=URL`)
+  and what receives it (a chat, a ticketing system). It only tells: no
+  answer to it approves anything, and a failed post changes nothing but
+  its own record. The post goes from `warden-notify`, a helper of its own
+  (its own user, no capabilities, not the Warden's child), over TLS
+  verified against the host's trust store, or plain HTTP to a loopback
+  address only. It holds the grant's text and the run, rule, user and
+  expiry, never the call's data beyond the grant's object nor the user's
+  request. The URL can be its secret (Slack's is): the records and the
+  exports hold its host and SHA-256 only, and a policy whose webhook URL
+  is a secret must not be readable by the agent. From v1.42 step 8 the
+  chat's one line writes the object's `&`, `<` and `>` as Slack's mrkdwn
+  asks, so an object named like a link or a mention is neither.
 
 ## 3. Adversary models
 
@@ -845,6 +896,31 @@ Model-B techniques below, with the residual limits stated honestly.
   `require warden 1.27`: each names the programs an agent may launch, any
   other is refused and held by Landlock, and every directory a pack lets
   the agent write is mounted `noexec` for the run.
+- **Approvals and deferrals: STEP_UP and DEFER (v1.42.0).** A call a
+  `step_up` rule decides waits for a person, and one a `defer` rule (or
+  `on unknown defer escalate`, `on outside_plan defer`) decides waits for
+  its context (trust boundaries 22 and 23).
+  - *Nothing is allowed that the policy plus a checked grant does not
+    allow.* An approved call is decided again, with a certificate the
+    checker verifies against the policy and the grant; a call allowed
+    under a marker carries the `defer` rule's certificate and the
+    marker's SHA-256.
+  - *It fails closed.* A hold or proposal nobody answers is refused at its
+    timeout; at the run's end, and when its caller is gone, it ends
+    `abandoned`. A held call blocks only its own thread unless the rule
+    says `scope=run`, which freezes the whole run, or refuses where the run
+    cannot be frozen. `max_held` bounds the calls held at once.
+  - *Every step is a record,* chained and signed like the rest: the hold
+    or proposal, the grant (with its approver, its signature and its
+    text), the ending, each use, the freeze and the thaw, each webhook
+    post's outcome, and the user's request in `run_start`. The audit
+    replays them: each hold ends once, within its timeout; each grant is
+    within its rule and approved by one who may; each call under a grant
+    matches it within its count and time; a forged, widened, overused or
+    missing grant, signature, marker or ending fails the run's audit.
+  - *They reach the security tools* (v1.42 step 8): each of those records
+    is an OCSF event of its own, sent on by every export, and Sentinel
+    raises an incident for an approval nobody gave in time.
 
 The per-class status of every known bypass class is maintained in
 `docs/security/bypass-classes.md`.
@@ -1385,6 +1461,37 @@ are claimed as solved.
     state, against real instances (an OpenTelemetry collector, Splunk
     Enterprise, a Sentinel workspace), without a separate review pass. No
     human or third-party review has been made.
+- Approvals and deferrals (v1.42.0):
+  - *An approver can be deceived.* A proposal is exactly what it
+    authorises, but whether the object should be read or sent is the
+    approver's call, made on the agent's own naming of it and on a request
+    the agent's framework supplied. Approval fatigue is the usual failure:
+    plan approval and standing grants, ahead of time, are the main tools,
+    and `step_up` belongs on destructive writes, payments and data
+    leaving.
+  - *A held call is held, not paused.* Under `scope=thread` the run's
+    other threads go on; a dependency across threads is invisible to
+    VAREK, which `scope=run` covers by freezing the whole run. A kernel
+    before 5.19 cannot keep a held call waiting through a signal, so there
+    `scope=run` refuses instead of holding.
+  - *Markers are as good as their owners.* Whoever can write a marker as
+    root or as the approvers' group releases the deferred call; the
+    Warden checks who owns it, not who wrote it.
+  - *The webhook is best effort.* A post is tried twice; one that fails,
+    or that a short run ends first, is recorded and lost. Approvers who
+    rely on it should also watch `varek pending` or Sentinel's
+    expired-approval rule. Only Slack's mrkdwn is escaped in the chat's
+    line; another receiver that renders its text (Teams' Markdown) may
+    format an object's name.
+  - *The exports name the call from its decisions.* The Warden's v1.42
+    records name the call they are about but not its `obo`; the OCSF
+    export takes it from the call's own decision record (by its sequence
+    number, its process or its proxy connection). A held call whose
+    process has made no decision before is exported as the agent's.
+  - *Review.* Built and tested as the plan document's steps state, on
+    GitHub's runners and in local containers, not yet against a real
+    Slack, Teams or Sentinel workspace for these records. No human or
+    third-party review has been made.
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).
 - An agent may probe for SATISFIED-but-harmful actions near a policy boundary;
