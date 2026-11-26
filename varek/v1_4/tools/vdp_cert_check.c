@@ -190,9 +190,10 @@ int main(int argc, char **argv) {
                       strcmp(argv[2], "kinds") && strcmp(argv[2], "rules") && strcmp(argv[2], "proxy") &&
                       strcmp(argv[2], "launches") && strcmp(argv[2], "matches") &&
                       strcmp(argv[2], "openas") &&
-                      strcmp(argv[2], "credentials") && strcmp(argv[2], "identity"))) {
+                      strcmp(argv[2], "credentials") && strcmp(argv[2], "identity") &&
+                      strcmp(argv[2], "approvers"))) {
         fprintf(stderr, "usage: %s <policy> digest|batch [GRANT...]|grant GRANT|holds|openable|kinds|rules|matches|proxy|launches|"
-                "openas|credentials|identity\n", argv[0]);
+                "openas|credentials|identity|approvers\n", argv[0]);
         return 2;
     }
 args_ok:;
@@ -268,6 +269,26 @@ args_ok:;
 
     /* v1.28.1: the identities and the sub-agents (vdp_check's `identity`
      * prints the same lines from the decision procedure's reading) */
+    /* v1.42 step 6: the policy's approver keys, one line each ("approver KEY
+     * GROUP NAME|- LINE"), then the approvers= group of each rule a grant may
+     * be under ("rule LINE GROUP|-": a step_up rule, a defer rule with
+     * escalate) and of the `on unknown defer escalate` line ("unknown LINE
+     * GROUP|-"). varek_audit.py checks each signed approval against them. */
+    if (!strcmp(argv[2], "approvers")) {
+        for (size_t k = 0; k < pol.napprovers; k++)
+            printf("approver %s %s %s %d\n", pol.approvers[k].key, pol.approvers[k].group,
+                   pol.approvers[k].name[0] ? pol.approvers[k].name : "-", pol.approvers[k].line);
+        for (size_t i = 0; i < pol.n; i++) {
+            vdpc_rule_info_t ri;
+            vdpc_rule_info(&pol, i, &ri);
+            if (ri.step_up || (ri.defer && ri.su_escalate))
+                printf("rule %d %s\n", ri.line, ri.su_approvers && ri.su_approvers[0] ? ri.su_approvers : "-");
+        }
+        if (pol.unk_line) printf("unknown %d %s\n", pol.unk_line, pol.unk_approvers[0] ? pol.unk_approvers : "-");
+        vdpc_free(&pol);
+        return 0;
+    }
+
     if (!strcmp(argv[2], "identity")) {
         for (size_t k = 0; k < pol.nissuers; k++)
             printf("issuer %s %s %s\n", pol.issuers[k].iss, pol.issuers[k].aud,

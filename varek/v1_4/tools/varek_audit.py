@@ -416,6 +416,78 @@ def policy_rules(checker, policy):
     return out
 
 
+def policy_approvers(checker, policy):
+    """v1.42 step 6: the policy's approver keys, and the approvers= group of
+    each rule a grant may be under, as the checker reads the file (its
+    "approvers" mode): {"keys": {KEY: (group, name)}, "rules": {LINE: group},
+    "unknown": LINE}, a group "" where the rule names none."""
+    q = subprocess.run([checker, policy, "approvers"], capture_output=True, text=True)
+    if q.returncode != 0:
+        raise ValueError(q.stderr.strip() or "the checker failed")
+    out = {"keys": {}, "rules": {}, "unknown": 0}
+    for ln in q.stdout.splitlines():
+        f = ln.split()
+        if len(f) == 5 and f[0] == "approver":
+            out["keys"][f[1]] = (f[2], "" if f[3] == "-" else f[3])
+        elif len(f) == 3 and f[0] in ("rule", "unknown") and f[1].isdigit():
+            out["rules"][int(f[1])] = "" if f[2] == "-" else f[2]
+            if f[0] == "unknown":
+                out["unknown"] = int(f[1])
+        else:
+            raise ValueError(f"unexpected checker output {ln!r}")
+    return out
+
+
+APPROVAL_DOMAIN = b"varek-approval-v1\0"
+
+
+def approval_verify(kind, key, sig, body):
+    """v1.42 step 6: True if sig (DER hex) is key's (the uncompressed P-384
+    point, hex) signature of body as kind, over the domain-separated message
+    "varek-approval-v1" NUL KIND NUL BODY the Warden verifies"""
+    try:
+        kb, sb = bytes.fromhex(key), bytes.fromhex(sig)
+    except (TypeError, ValueError):
+        return False
+    return varek_ed25519.verify_p384(kb, APPROVAL_DOMAIN + kind.encode() + b"\0" + body, sb)
+
+
+def check_plan_approval(meta, apv, plan_file, problems):
+    """v1.42 step 6: run_start's plan_approved_by. Its key is one the policy
+    pins, its name and group the policy's for that key, its plan_sha256 the
+    plan the run decided; with --plan, its signature is verified over the
+    plan's bytes (without, it cannot be, and the report says so)."""
+    rs = meta.get("run_start", {})
+    pa = rs.get("plan_approved_by")
+    if pa is None:
+        return None
+    if not isinstance(pa, dict) or not all(isinstance(pa.get(x), str) for x in ("key", "group", "sig", "plan_sha256")):
+        problems.append("run_start's plan_approved_by is not a signed approval the Warden writes")
+        return None
+    pin = (apv or {}).get("keys", {}).get(pa["key"])
+    if pin is None:
+        problems.append("the plan's approval is signed by a key the policy does not pin")
+        return None
+    if (pa["group"], pa.get("name") or "") != pin:
+        problems.append(f"the plan's approval names its signer {pa.get('name')!r} of group {pa['group']!r}; the "
+                        f"policy pins that key as {pin[1]!r} of group {pin[0]!r}")
+    hold = rs.get("hold") or {}
+    if hold.get("plan_sha256") and hold["plan_sha256"] != pa["plan_sha256"]:
+        problems.append("the plan approved is not the plan the run is held to")
+    if plan_file is None:
+        return "not verified: give --plan to verify the plan approval's signature over the plan's bytes"
+    try:
+        with open(plan_file, "rb") as fh:
+            body = fh.read()
+    except OSError:
+        return None                          # check_plan_gate says so
+    if hashlib.sha256(body).hexdigest() != pa["plan_sha256"]:
+        problems.append(f"the plan {plan_file} is not the plan approved (SHA-256 {pa['plan_sha256']})")
+    elif not approval_verify("plan", pa["key"], pa["sig"], body):
+        problems.append("the plan's approval signature does not verify over the plan")
+    return None
+
+
 def check_shared_lists(meta, a, problems):
     """v1.25 review: the shared-domain lists. A wildcard allow rule over a
     shared domain must have been refused, whatever lists the Warden was given:
@@ -638,10 +710,20 @@ class GrantsCheck:
     before it whose verdict is SATISFIED), and its call, decided again after
     that ending, is allowed as any call the plan covers (no marker). Each
     plan_extended record names its text's SHA-256, its verdict and its
-    approver."""
+    approver.
 
-    def __init__(self, run, problems, rs=None):
+    v1.42 step 6 (signed approvals): a standing grant (`"standing":true`,
+    from --grants) approves no proposal; it is signed (signed_by, sig) by a
+    key the policy pins, whose group is the approvers= group of the rule it
+    is under (one that names none takes no standing grant), names no run=
+    and had not expired when recorded. A runtime grant that carries
+    signed_by is signed by a pinned key of the rule's approvers= group, if
+    it names one. Each signature is verified over the grant's text, as kind
+    grant: a forged or missing one is a problem."""
+
+    def __init__(self, run, problems, rs=None, apv=None):
         self.run, self.problems = run, problems
+        self.apv = apv if apv is not None else {"keys": {}, "rules": {}, "unknown": 0}
         sr = (rs or {}).get("scope_run")
         self.can_freeze = isinstance(sr, dict) and sr.get("freeze") is True
         self.frozen = False
@@ -676,6 +758,43 @@ class GrantsCheck:
                     if x.startswith("run="):
                         g["run"] = x[4:]
         return g
+
+    def _signed(self, gid, text, e, standing, g):
+        """v1.42 step 6: a grant's signature, as the Warden checked it"""
+        p, what = self.problems, ("standing grant" if standing else "grant")
+        sb, sig = e.get("signed_by"), e.get("sig")
+        if not isinstance(sb, dict) or not isinstance(sb.get("key"), str) or not isinstance(sig, str):
+            p.append(f"{what} {gid[:16]}: no signature")
+            return
+        pin = self.apv["keys"].get(sb["key"])
+        if pin is None:
+            p.append(f"{what} {gid[:16]}: signed by a key the policy does not pin")
+            return
+        if (sb.get("group"), sb.get("name") or "") != pin:
+            p.append(f"{what} {gid[:16]}: names its signer {sb.get('name')!r} of group {sb.get('group')!r}; the "
+                     f"policy pins that key as {pin[1]!r} of group {pin[0]!r}")
+        line = None
+        for ln in text.splitlines():
+            w = ln.split()
+            if len(w) == 3 and w[0] == "step_up" and w[1] == "line" and w[2].isdigit():
+                line = int(w[2])
+        grp = self.apv["rules"].get(line)
+        if grp is None:
+            p.append(f"{what} {gid[:16]}: under line {line}, which is no rule a grant may be under")
+        elif standing and not grp:
+            p.append(f"{what} {gid[:16]}: under line {line}, which names no approvers= group to sign for it")
+        elif grp and grp != pin[0]:
+            p.append(f"{what} {gid[:16]}: signed by an approver of group {pin[0]!r}; line {line}'s approvers "
+                     f"are {grp!r}")
+        if standing:
+            if g["run"]:
+                p.append(f"{what} {gid[:16]}: names a run (run=), which a standing grant does not")
+            ts = e.get("timestamp_ns")
+            if g["until"] and isinstance(ts, int) and g["until"] * 1_000_000_000 <= ts:
+                p.append(f"{what} {gid[:16]}: recorded after its until")
+        if not approval_verify("grant", sb["key"], sig,
+                               text.encode("utf-8", errors="surrogateescape")):
+            p.append(f"{what} {gid[:16]}: its signature does not verify over its text")
 
     def _freeze_due(self):
         if self.await_frz is not None and not self.frozen:
@@ -920,7 +1039,12 @@ class GrantsCheck:
                     hashlib.sha256(text.encode("utf-8", errors="surrogateescape")).hexdigest() != gid:
                 p.append(f"grant {gid!r}: its id is not the SHA-256 of its text")
                 return
-            if prop not in self.props or self.props[prop]["ended"]:
+            standing = e.get("standing") is True              # v1.42 step 6
+            if standing:
+                prop = None
+                if "proposal" in e or "approver_uid" in e:
+                    p.append(f"grant {gid[:16]}: a standing grant, which approves no proposal, names one")
+            elif prop not in self.props or self.props[prop]["ended"]:
                 p.append(f"grant {gid[:16]}: approves {prop!r}, which is not an open proposal")
             if gid in self.grants:
                 p.append(f"grant {gid[:16]} recorded twice")
@@ -929,8 +1053,10 @@ class GrantsCheck:
             if g is None:
                 p.append(f"grant {gid[:16]}: its until is not a time")
                 return
-            if not isinstance(e.get("approver_uid"), int):
+            if not standing and not isinstance(e.get("approver_uid"), int):
                 p.append(f"grant {gid[:16]}: no approver")
+            if standing or "signed_by" in e or "sig" in e:
+                self._signed(gid, text, e, standing, g)
             if self.dir is None:
                 self.dir = tempfile.TemporaryDirectory()
             path = os.path.join(self.dir.name, f"g{len(self.files)}.txt")
@@ -5254,7 +5380,13 @@ def start_checks(a, meta, rs, run, sec, res, prules, rules, names_policy, proxy_
     k["changes"] = ChangesCheck(openas_policy, sec["changes"])
     k["dry"] = DryCheck(rs, sec)
     k["hold"] = HoldCheck(rs, sec["hold_head"], sec["hold"])
-    k["grants"] = GrantsCheck(run, sec["grants"], rs)                     # v1.42
+    try:                                                                  # v1.42 step 6
+        apv = policy_approvers(a.checker, a.policy)
+    except (OSError, ValueError) as e:
+        sec["grants"].append(f"cannot read the policy's approver keys: {e}")
+        apv = None
+    k["apv"] = apv
+    k["grants"] = GrantsCheck(run, sec["grants"], rs, apv)                # v1.42
     try:                                                                  # v1.27.1
         nx = check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, Section(), quiet=True)
     except (OSError, ValueError):
@@ -5324,6 +5456,9 @@ def report(a, meta, sec, k, integrity, run, warden, complete, nrec, prules, rule
     k["dry"].head(meta, sec["dry_head"])
     dry_run = k["dry"].finish(meta, sec["dry_tail"])
     plan_gate = check_plan_gate(meta, Count(nrec), sec["plan"], a.plan, complete)    # v1.35 step 7
+    pa_note = check_plan_approval(meta, k.get("apv"), a.plan, sec["plan"])   # v1.42 step 6
+    if pa_note:
+        cnotes.append(f"plan approval: {pa_note}")
     try:
         check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, sec["noexec"])      # v1.27.1
         check_noexec_exec(meta, policy_rules(a.checker, a.policy), openas_policy, sec["noexec_exec"])  # v1.29
