@@ -158,6 +158,16 @@ enum { VDP_SCOPE_THREAD = 0, VDP_SCOPE_RUN = 1 };    /* su_scope */
 #define VDP_SU_NOTIFY_MAX      512                   /* notify= URL, bytes */
 #define VDP_DF_UNTIL_MAX       255                   /* until= path, bytes (v1.42 step 5) */
 
+/* v1.42 step 6: an approver's pinned key (`approver key=HEX group=G [name=N]`) */
+#define VDP_MAX_APPROVERS     16
+#define VDP_APPROVER_KEY_HEX  194          /* the uncompressed P-384 point 04||X||Y, as hex */
+typedef struct {
+    char key[VDP_APPROVER_KEY_HEX + 1];
+    char group[33];
+    char name[33];
+    int  line;
+} vdp_approver_t;
+
 typedef struct {
     vdp_verb_t     verb;
     vdp_kind_t     kind;
@@ -363,6 +373,13 @@ typedef struct {
     uint32_t     op_timeout;
     uint8_t      op_scope;
     char         op_approvers[33];
+    /* v1.42 step 6: `approver key=HEX group=GROUP [name=NAME]`: an
+     * approver's signing key, pinned by its value (the uncompressed P-384
+     * point, as varek_keygen writes KEY.pub), so the policy's digest covers
+     * it. Standing grants, plan approvals and signed runtime grants are
+     * checked against these. Not part of any decision. */
+    vdp_approver_t approvers[VDP_MAX_APPROVERS];
+    size_t       napprovers;
     /* v1.31: the confined subjects (subject k is subjects[k - 1]) and the
      * MCP resources trusted for the user's token */
     vdp_subject_t subjects[VDP_MAX_SUBJECTS];

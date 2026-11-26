@@ -589,6 +589,18 @@ static int policy_load(const char *path, struct policy *p) {
                 "`on unknown` line differently; refusing to start\n", path);
         return -1;
     }
+    /* v1.42 step 6: and the approvers' pinned keys */
+    bool apv_same = p->v.napprovers == p->c.napprovers;
+    for (size_t k = 0; apv_same && k < p->v.napprovers; k++)
+        apv_same = !strcmp(p->v.approvers[k].key, p->c.approvers[k].key) &&
+                   !strcmp(p->v.approvers[k].group, p->c.approvers[k].group) &&
+                   !strcmp(p->v.approvers[k].name, p->c.approvers[k].name) &&
+                   p->v.approvers[k].line == p->c.approvers[k].line;
+    if (!apv_same) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read the "
+                "approver lines differently; refusing to start\n", path);
+        return -1;
+    }
     /* v1.42 step 5b: and the `on outside_plan` line */
     if (p->v.op_line != p->c.op_line || p->v.op_timeout != p->c.op_timeout ||
         p->v.op_scope != (uint8_t)p->c.op_scope || strcmp(p->v.op_approvers, p->c.op_approvers)) {

@@ -1453,6 +1453,47 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
                     if (rc == 0 && op && esc) rc = fail(err, en, name, ln, "escalate on on outside_plan");
                     if (rc == 0) *line = ln;
                 }
+            } else if (!strcmp(tok[0], "approver")) {
+                /* v1.42 step 6: approver key=HEX group=GROUP [name=NAME], each once, any order */
+                int seen = 0;
+                char key[195] = "", grp[33] = "", nm[33] = "";
+                if (!ver_ge(req_maj, req_min, 1, 42)) rc = fail(err, en, name, ln, "approver before 1.42");
+                for (int i = 1; rc == 0 && i < nt; i++) {
+                    const char *o = tok[i];
+                    int k = !strncmp(o, "key=", 4) ? 1 : !strncmp(o, "group=", 6) ? 2 : !strncmp(o, "name=", 5) ? 4 : 0;
+                    if (!k || (seen & k)) { rc = fail(err, en, name, ln, "bad approver option"); break; }
+                    seen |= k;
+                    const char *v = strchr(o, '=') + 1;
+                    size_t vl = strlen(v);
+                    bool ok;
+                    if (k == 1) {
+                        ok = vl == 194 && v[0] == '0' && v[1] == '4';
+                        for (size_t j = 0; ok && j < vl; j++) ok = isdigit((unsigned char)v[j]) || (v[j] >= 'a' && v[j] <= 'f');
+                        if (ok) memcpy(key, v, vl + 1);
+                    } else if (k == 2) {
+                        ok = vl >= 1 && vl <= 32 && (islower((unsigned char)v[0]) || v[0] == '_');
+                        for (size_t j = 1; ok && j < vl; j++)
+                            ok = islower((unsigned char)v[j]) || isdigit((unsigned char)v[j]) || v[j] == '_' ||
+                                 v[j] == '-' || (v[j] == '$' && j + 1 == vl);
+                        if (ok) memcpy(grp, v, vl + 1);
+                    } else {
+                        ok = vl >= 1 && vl <= 32;
+                        for (size_t j = 0; ok && j < vl; j++)
+                            ok = isalnum((unsigned char)v[j]) || v[j] == '.' || v[j] == '_' || v[j] == '-';
+                        if (ok) memcpy(nm, v, vl + 1);
+                    }
+                    if (!ok) rc = fail(err, en, name, ln, "bad approver key=, group= or name=");
+                }
+                if (rc == 0 && (seen & 3) != 3) rc = fail(err, en, name, ln, "approver without key= and group=");
+                for (size_t j = 0; rc == 0 && j < p->napprovers; j++)
+                    if (!strcmp(p->approvers[j].key, key)) rc = fail(err, en, name, ln, "the same approver key twice");
+                if (rc == 0 && p->napprovers >= 16) rc = fail(err, en, name, ln, "more than 16 approvers");
+                if (rc == 0) {
+                    memcpy(p->approvers[p->napprovers].key, key, sizeof key);
+                    memcpy(p->approvers[p->napprovers].group, grp, sizeof grp);
+                    memcpy(p->approvers[p->napprovers].name, nm, sizeof nm);
+                    p->approvers[p->napprovers++].line = ln;
+                }
             } else if (!strcmp(tok[0], "max_held") || !strcmp(tok[0], "max_pending")) {
                 /* v1.42 */
                 uint32_t *slot = tok[0][4] == 'h' ? &p->max_held : &p->max_pending, x = 0;
