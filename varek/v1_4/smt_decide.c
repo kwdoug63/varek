@@ -1035,6 +1035,36 @@ static bool https_url_ok(const char *u, size_t max) {
     return true;
 }
 
+/* v1.42 step 7: notify= may also be http:// to a loopback address: a
+ * literal 127.0.0.0/8 address or [::1], with an optional :PORT (1 to
+ * 65535), then the end or '/', '?' or '#' (a local relay; a name such as
+ * localhost is not taken, since what it resolves to is the host's to say) */
+static bool loopback_http_url_ok(const char *u, size_t max) {
+    size_t l = strlen(u);
+    if (l < 8 || l > max || strncmp(u, "http://", 7)) return false;
+    for (size_t i = 0; i < l; i++)
+        if ((unsigned char)u[i] < 0x21 || (unsigned char)u[i] > 0x7e) return false;
+    const char *p = u + 7;
+    if (!strncmp(p, "[::1]", 5)) p += 5;
+    else {
+        for (int o = 0; o < 4; o++) {
+            if (o && *p++ != '.') return false;
+            unsigned v = 0;
+            int nd = 0;
+            while (nd < 4 && *p >= '0' && *p <= '9') { v = v * 10 + (unsigned)(*p++ - '0'); nd++; }
+            if (nd < 1 || nd > 3 || v > 255 || (o == 0 && v != 127)) return false;
+        }
+    }
+    if (*p == ':') {
+        p++;
+        unsigned v = 0;
+        int nd = 0;
+        while (nd < 6 && *p >= '0' && *p <= '9') { v = v * 10 + (unsigned)(*p++ - '0'); nd++; }
+        if (nd < 1 || nd > 5 || v < 1 || v > 65535) return false;
+    }
+    return !*p || *p == '/' || *p == '?' || *p == '#';
+}
+
 /* v1.42: a step_up or defer rule's option (and the `on unknown` line's):
  * its kind, or -1 when tok is none (a rule's own token) */
 enum { SUO_MODE, SUO_APPROVERS, SUO_TIMEOUT, SUO_SCOPE, SUO_NOTIFY, SUO_UNTIL, SUO_ESCALATE, SUO_N };
@@ -1103,7 +1133,8 @@ static const char *su_options(char *const *tok, int n, vdp_verb_t verb, vdp_rule
             else if (!strcmp(v, "run")) r->su_scope = VDP_SCOPE_RUN;
             else return "scope= is thread or run";
         } else if (k == SUO_NOTIFY) {
-            if (!https_url_ok(v, VDP_SU_NOTIFY_MAX)) return "notify= is an https:// URL of at most 512 bytes";
+            if (!https_url_ok(v, VDP_SU_NOTIFY_MAX) && !loopback_http_url_ok(v, VDP_SU_NOTIFY_MAX))
+                return "notify= is an https:// URL of at most 512 bytes (or http:// to 127.0.0.0/8 or [::1])";
             memcpy(r->su_notify, v, strlen(v) + 1);
         } else if (k == SUO_UNTIL) {
             if (!until_path_ok(v))

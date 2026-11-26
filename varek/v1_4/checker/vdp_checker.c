@@ -602,6 +602,50 @@ static bool https_with_host(const char *u, size_t hi) {
     return printable(u, 9, hi) && !strncmp(u, "https://", 8) && u[8] != '/' && u[8] != '?' && u[8] != '#';
 }
 
+/* v1.42 step 7: notify='s other form, http:// to a loopback address
+ * (127.0.0.0/8 written as four decimal parts, or [::1]), an optional port
+ * from 1 to 65535, then nothing, or '/', '?' or '#'. Written apart from
+ * the procedure's. */
+static bool http_loopback(const char *u, size_t hi) {
+    if (!printable(u, 8, hi) || strncmp(u, "http://", 7)) return false;
+    const char *h = u + 7, *e = h + strcspn(h, "/?#");
+    const char *colon = NULL;
+    if (*h == '[') {
+        if ((size_t)(e - h) < 5 || memcmp(h, "[::1]", 5)) return false;
+        colon = h + 5;
+    } else {
+        const char *c = memchr(h, ':', (size_t)(e - h));
+        colon = c ? c : e;
+        int parts = 0;
+        for (const char *q = h; q <= colon && parts < 5;) {
+            const char *d = q;
+            while (d < colon && *d != '.') d++;
+            size_t tl = (size_t)(d - q);
+            if (tl < 1 || tl > 3) return false;
+            int v = 0;
+            for (const char *x = q; x < d; x++) {
+                if (*x < '0' || *x > '9') return false;
+                v = v * 10 + (*x - '0');
+            }
+            if (v > 255 || (parts == 0 && v != 127)) return false;
+            parts++;
+            q = d + 1;
+            if (d == colon) break;
+        }
+        if (parts != 4) return false;
+    }
+    if (colon == e) return true;
+    if (*colon != ':') return false;
+    size_t pl = (size_t)(e - colon - 1);
+    if (pl < 1 || pl > 5) return false;
+    long port = 0;
+    for (const char *q = colon + 1; q < e; q++) {
+        if (*q < '0' || *q > '9') return false;
+        port = port * 10 + (*q - '0');
+    }
+    return port >= 1 && port <= 65535;
+}
+
 /* v1.31: an MCP server's URL in canonical form, "scheme://host:port/path"
  * (vdp_checker.h; smt_decide.h's vdp_mcp_url has the same form, written
  * separately). 0, or -1. host (254 bytes) and *port are set when given. */
@@ -1045,7 +1089,7 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
                 if (strcmp(v, "thread") && strcmp(v, "run")) return fail(err, en, name, ln, "bad scope=");
                 r->su_scope = v[0] == 'r';
             } else {
-                if (!https_with_host(v, 512)) return fail(err, en, name, ln, "bad notify=");
+                if (!https_with_host(v, 512) && !http_loopback(v, 512)) return fail(err, en, name, ln, "bad notify=");
                 memcpy(r->su_notify, v, vl + 1);
             }
             nt--;

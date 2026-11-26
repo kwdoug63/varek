@@ -140,6 +140,7 @@
 #include "shared_domains.h"     /* v1.25 wildcards over shared domains, refused at load */
 #include "warden_proxy.h"       /* v1.26 the egress proxy process */
 #include "warden_secrets.h"     /* v1.28 the credentials' helper, warden-secrets */
+#include "warden_notify.h"      /* v1.42 step 7: the webhook poster, warden-notify */
 #include "proxy_parse.h"        /* v1.26 what the proxy reads (pp_kind_name) */
 
 /* Kernel/libc compatibility shims --------------------------------- */
@@ -2339,6 +2340,21 @@ static bool g_waitkill;                 /* the kernel ends a held call's wait on
 static bool g_plan_apv;
 static char g_plan_apv_key[195], g_plan_apv_name[33], g_plan_apv_group[33], g_plan_apv_sig[VFIPS_SIG_HEX_MAX + 1];
 static char g_plan_apv_note[400];
+/* v1.42 step 7: the user's request (--intent FILE), as the agent framework
+ * received it: context for approvers, never for a decision (no rule
+ * matches on it). Its SHA-256 and length in run_start, with its text when
+ * it is UTF-8 of at most 4 KiB, else in a file beside the verdict stream. */
+#define INTENT_MAX        (1u << 20)
+#define INTENT_INLINE_MAX 4096u
+static unsigned char *g_intent;
+static size_t g_intent_len;
+static bool   g_intent_on, g_intent_utf8, g_intent_inline;
+static char   g_intent_sha[65];
+static char   g_intent_file[256];         /* the side file's name (in the stream's directory) */
+/* v1.42 step 7: warden-notify (warden_notify.inc.c), for run_start */
+static char   g_nt_bin_sha[65];           /* the SHA-256 of the warden-notify that runs */
+static uid_t  g_nt_uid;
+static gid_t  g_nt_gid;
 static void sub_obo(FILE *f, int s);
 static bool sub_cgroup_write(int fd, int flags);
 static char       g_cred_ph[WS_MAX_CREDS][WP_PH_MAX]; /* v1.28: each credential's placeholder (not a secret) */
@@ -2756,6 +2772,110 @@ static void emit_on_behalf_of(FILE *f, const struct policy *p) {
 }
 
 static void as_agent_record(FILE *f);   /* v1.29: warden_asagent.inc.c */
+/* v1.42 step 7: UTF-8, with no NUL, overlong form, surrogate or code
+ * point past U+10FFFF */
+static bool utf8_ok(const unsigned char *b, size_t n) {
+    for (size_t i = 0; i < n;) {
+        unsigned c = b[i];
+        size_t k;
+        unsigned cp;
+        if (c == 0) return false;
+        if (c < 0x80) { i++; continue; }
+        if (c >= 0xc2 && c <= 0xdf) { k = 1; cp = c & 0x1f; }
+        else if (c >= 0xe0 && c <= 0xef) { k = 2; cp = c & 0x0f; }
+        else if (c >= 0xf0 && c <= 0xf4) { k = 3; cp = c & 0x07; }
+        else return false;
+        if (i + k >= n) return false;
+        for (size_t j = 1; j <= k; j++) {
+            if ((b[i + j] & 0xc0) != 0x80) return false;
+            cp = (cp << 6) | (b[i + j] & 0x3f);
+        }
+        if ((k == 2 && (cp < 0x800 || (cp >= 0xd800 && cp <= 0xdfff))) || (k == 3 && (cp < 0x10000 || cp > 0x10ffff)))
+            return false;
+        i += k + 1;
+    }
+    return true;
+}
+
+/* v1.42 step 7: --intent FILE, read at the start: a regular file (not
+ * through a symlink at its last name) of at most 1 MiB. 0, or -1 with the
+ * reason on stderr. */
+static int intent_load(const char *path) {
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY | O_NONBLOCK);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size > (off_t)INTENT_MAX) {
+        fprintf(stderr, "[warden] --intent %s: %s; refusing to start\n", path,
+                fd < 0 ? (errno == ELOOP ? "a symbolic link" : strerror(errno))
+                       : !S_ISREG(st.st_mode) ? "not a regular file" : "over 1 MiB");
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    g_intent = malloc((size_t)st.st_size + 1);
+    size_t n = 0;
+    while (g_intent && n <= INTENT_MAX) {
+        ssize_t r = read(fd, g_intent + n, (size_t)st.st_size + 1 - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        n += (size_t)r;
+        if (n == (size_t)st.st_size + 1) break;          /* it grew: refused below */
+    }
+    close(fd);
+    if (!g_intent || n != (size_t)st.st_size) {
+        fprintf(stderr, "[warden] --intent %s: %s; refusing to start\n", path,
+                g_intent ? "it changed while it was read" : "out of memory");
+        return -1;
+    }
+    g_intent[n] = '\0';
+    g_intent_len = n;
+    unsigned char d[32];
+    if (vfips_sha256(g_intent, n, d) != 0) {
+        fprintf(stderr, "[warden] --intent: SHA-256 via the host crypto provider failed\n");
+        return -1;
+    }
+    vfips_bin2hex(g_intent_sha, sizeof g_intent_sha, d, sizeof d);
+    g_intent_utf8 = utf8_ok(g_intent, n);
+    g_intent_inline = g_intent_utf8 && n <= INTENT_INLINE_MAX;
+    g_intent_on = true;
+    return 0;
+}
+
+/* v1.42 step 7: a request not kept in run_start is written beside the
+ * verdict stream (the Warden's stderr, a regular file), as STREAM.intent:
+ * made anew (never over a file), root's, 0600. 0, or -1 with the reason on
+ * stderr. */
+static int intent_side_write(void) {
+    if (!g_intent_on || g_intent_inline) return 0;
+    char lp[PATH_MAX];
+    struct stat st;
+    ssize_t n = proc_readlinkf(lp, sizeof lp - 16, "self/fd/2");
+    if (n <= 0 || lp[0] != '/' || fstat(STDERR_FILENO, &st) < 0 || !S_ISREG(st.st_mode)) {
+        fprintf(stderr, "[warden] --intent: the request is %s, so it is kept beside the verdict stream, which is "
+                "not a file here; refusing to start\n", g_intent_utf8 ? "over 4 KiB" : "not UTF-8 text");
+        return -1;
+    }
+    memcpy(lp + n, ".intent", sizeof ".intent");      /* n < sizeof lp - 16 */
+    const char *bn = strrchr(lp, '/') + 1;
+    if (strlen(bn) >= sizeof g_intent_file) { fprintf(stderr, "[warden] --intent: the stream's name is too long\n"); return -1; }
+    int fd = open(lp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "[warden] --intent: cannot make %s: %s; refusing to start\n", lp, strerror(errno));
+        return -1;
+    }
+    for (size_t off = 0; off < g_intent_len;) {
+        ssize_t w = write(fd, g_intent + off, g_intent_len - off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) {
+            fprintf(stderr, "[warden] --intent: writing %s failed; refusing to start\n", lp);
+            close(fd);
+            return -1;
+        }
+        off += (size_t)w;
+    }
+    if (fsync(fd) < 0 || close(fd) < 0) { fprintf(stderr, "[warden] --intent: writing %s failed\n", lp); return -1; }
+    memcpy(g_intent_file, bn, strlen(bn) + 1);
+    return 0;
+}
+
 static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -2785,6 +2905,15 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
         fprintf(f, "\"plan_approved_by\":{\"key\":\"%s\",\"name\":\"%s\",\"group\":\"%s\",\"sig\":\"%s\","
                 "\"plan_sha256\":\"%s\"},", g_plan_apv_key, g_plan_apv_name, g_plan_apv_group, g_plan_apv_sig, g_plan_snap_sha);
     else if (g_plan_apv_note[0]) { fputs("\"plan_approval_note\":\"", f); json_escape(f, g_plan_apv_note); fputs("\",", f); }
+    /* v1.42 step 7: the user's request, and warden-notify */
+    if (g_intent_on) {
+        fprintf(f, "\"intent\":{\"sha256\":\"%s\",\"bytes\":%zu,", g_intent_sha, g_intent_len);
+        if (g_intent_inline) { fputs("\"text\":\"", f); json_escape(f, (const char *)g_intent); fputs("\"},", f); }
+        else { fputs("\"file\":\"", f); json_escape(f, g_intent_file); fputs("\"},", f); }
+    }
+    if (g_nt_bin_sha[0])
+        fprintf(f, "\"notify\":{\"helper_sha256\":\"%s\",\"uid\":%u,\"gid\":%u},", g_nt_bin_sha,
+                (unsigned)g_nt_uid, (unsigned)g_nt_gid);
     if (g_signing) {
         fprintf(f, "\"log_pubkey\":\"%s\",\"sigalg\":\"%s\",", g_pub_hex, VFIPS_SIGALG_P384);
     }
@@ -4288,6 +4417,7 @@ static void syn_hosts_view(const struct policy *p, FILE *f);
 #include "warden_subagent.inc.c"     /* v1.28.1: sub-agents' control groups and attribution */
 #include "warden_grant.inc.c"        /* v1.42 step 2: runtime grants */
 #include "warden_signed.inc.c"       /* v1.42 step 6: signed approvals */
+#include "warden_notify.inc.c"       /* v1.42 step 7: notify= */
 #include "warden_exec.inc.c"         /* v1.27: the launch set and its Landlock ruleset */
 #include "warden_noexec.inc.c"       /* v1.27.1: writable directories mounted noexec */
 #include "warden_change.inc.c"       /* v1.29: changes by name */
@@ -4327,7 +4457,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * finished for the agent (warden_net.inc.c). */
         /* v1.24: also on the resolver helper's results. */
         /* v1.25: and on the stub resolver's sockets (warden_stub.inc.c). */
-        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN + 1 + PX_MAX_DIAL + 4] = {
+        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN + 1 + PX_MAX_DIAL + 5] = {
             { .fd = notify_fd,    .events = POLLIN },
             { .fd = target_pidfd, .events = POLLIN },
             { .fd = agent_err_fd, .events = POLLIN },
@@ -4365,12 +4495,13 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         pfds[rvi + 1] = (struct pollfd){ .fd = g_secrets.ctl, .events = POLLIN };
         pfds[rvi + 2] = (struct pollfd){ .fd = g_cn, .events = POLLIN };     /* v1.28.1 review: process events */
         pfds[rvi + 3] = (struct pollfd){ .fd = g_apv_listen, .events = POLLIN };   /* v1.42: approvers */
+        pfds[rvi + 4] = (struct pollfd){ .fd = g_nt_ctl, .events = POLLIN };       /* v1.42 step 7: posts' outcomes */
         /* v1.28.1 step 4: and the user's token's expiry */
         int oto = obo_timeout_ms();
         if (oto >= 0 && (to < 0 || oto < to)) to = oto;
         int gto = grant_timeout_ms();                                        /* v1.42: proposals ending */
         if (gto >= 0 && (to < 0 || gto < to)) to = gto;
-        int pr = poll(pfds, (nfds_t)(rvi + 4), to);
+        int pr = poll(pfds, (nfds_t)(rvi + 5), to);
         if (pr >= 0) obo_check(notify_fd);
         if (pr >= 0) grant_expire();
         if (pr >= 0) held_check();                  /* v1.42 step 3: a held call's caller gone */
@@ -4388,6 +4519,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         px_service(p, &pfds[pxi + 1], npx);
         if (g_ctl_listen >= 0 && (pfds[rvi].revents & POLLIN)) ctl_service(notify_fd);   /* v1.28 step 4 */
         if (g_apv_listen >= 0 && (pfds[rvi + 3].revents & POLLIN)) apv_service();          /* v1.42 */
+        if (g_nt_ctl >= 0 && (pfds[rvi + 4].revents & (POLLIN | POLLHUP | POLLERR))) notify_service();   /* v1.42 step 7 */
         if (g_secrets.ctl >= 0 && (pfds[rvi + 1].revents & (POLLIN | POLLHUP | POLLERR)) && secrets_service(p) < 0) {
             log_line_start();
             fprintf(g_log, "[warden] warden-secrets has gone: leased secrets will not be renewed or revoked\n");
@@ -6035,7 +6167,8 @@ static void usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s <policy.txt> [--plan <plan.txt> [--hold-to-plan] [--flow-policy <cfg>\n"
         "              [--session <id>] [--breaker-state <file>] [--gate-status <file>]]]\n"
-        "              [--sign-key <key>] [--grants <dir>] [--require-approved-plan]\n"
+        "              [--sign-key <key>] [--grants <dir>] [--require-approved-plan] [--intent <file>]\n"
+        "              [--notify-as <user>] [--notify-bin <warden-notify>]\n"
         "              [--anchor <path>] [--checkpoint-every <n>] [--run-as <user>]\n"
         "              [--dns-server <a.b.c.d[:port]>] [--dns-ttl-min <s>] [--dns-ttl-max <s>]\n"
         "              [--dns-grace-max <s>] [--psl <file>] [--shared-domains <file>]\n              [--proxy-as <user>] [--proxy-bin <warden-proxy>] [--trust-bundle <pem>]\n"
@@ -6130,6 +6263,13 @@ static void usage(const char *argv0) {
         "      run_start records what was verified (never the token). When the token expires during\n"
         "      the run it is recorded (on_behalf_of_expired) and the run revoked, as by varek revoke;\n"
         "      --on-behalf-of-expiry record lets the run go on.\n"
+        "\n"
+        "  --intent FILE (v1.42): the user's request, recorded in run_start (its SHA-256 and length,\n"
+        "      its text when UTF-8 of at most 4 KiB, else STREAM.intent beside the stream) and shown\n"
+        "      to approvers (varek pending); no rule matches on it. At most 1 MiB.\n"
+        "  notify=URL on a step_up rule (v1.42): each proposal is posted to the webhook by\n"
+        "      warden-notify (--notify-bin; beside this binary by default), run as its own user\n"
+        "      (--notify-as; varek-notify, else 65530:65530); its outcome is a notify record.\n"
         "\n"
         , stderr);
     fputs(
@@ -6233,6 +6373,8 @@ int main(int argc, char **argv) {
     const char *proxy_as_arg = NULL;    /* v1.26: the egress proxy's user */
     const char *proxy_bin_arg = NULL;   /* v1.26.1: the warden-proxy binary */
     const char *secrets_bin_arg = NULL, *secrets_as_arg = NULL, *secrets_conf_arg = NULL;   /* v1.28 */
+    const char *notify_bin_arg = NULL, *notify_as_arg = NULL;   /* v1.42 step 7 */
+    const char *intent_arg = NULL;                              /* v1.42 step 7: --intent FILE */
     const char *obo_arg = NULL, *svid_arg = NULL, *obo_exp_arg = NULL;                  /* v1.28.1 */
     const char *node_kubelet_arg = NULL;                                                 /* v1.36 step 6 */
     const char *flow_path   = NULL;     /* v1.18.0 */
@@ -6327,6 +6469,12 @@ int main(int argc, char **argv) {
             proxy_as_arg = argv[++i];
         } else if (strcmp(argv[i], "--proxy-bin") == 0 && !proxy_bin_arg) { /* v1.26.1 */
             proxy_bin_arg = argv[++i];
+        } else if (strcmp(argv[i], "--notify-bin") == 0 && !notify_bin_arg && i + 1 < argc) {   /* v1.42 step 7 */
+            notify_bin_arg = argv[++i];
+        } else if (strcmp(argv[i], "--notify-as") == 0 && !notify_as_arg && i + 1 < argc) {     /* v1.42 step 7 */
+            notify_as_arg = argv[++i];
+        } else if (strcmp(argv[i], "--intent") == 0 && !intent_arg && i + 1 < argc) {           /* v1.42 step 7 */
+            intent_arg = argv[++i];
         } else if (strcmp(argv[i], "--secrets-bin") == 0 && !secrets_bin_arg) { /* v1.28 */
             secrets_bin_arg = argv[++i];
         } else if (strcmp(argv[i], "--secrets-as") == 0 && !secrets_as_arg) {   /* v1.28 */
@@ -6621,6 +6769,11 @@ int main(int argc, char **argv) {
         if (g_nr.on) node_fail("the policy needs a step_up option not built yet");
         return 2;
     }
+    /* v1.42 step 7: notify= and the user's request are not taken under the node agent */
+    if (g_nr.on && (nt_policy_wants(&p) || intent_arg))
+        node_fail(intent_arg ? "--intent is not taken under the node agent"
+                             : "notify= is not taken under the node agent (v1.42)");
+    if (intent_arg && intent_load(intent_arg) < 0) return 1;
     /* v1.42 step 6: standing grants and the plan's approval, checked before anything runs */
     if ((grants_dir || require_apv_plan) && g_nr.on) {
         fprintf(stderr, "[warden] --grants and --require-approved-plan are not taken under the node agent\n");
@@ -7056,6 +7209,58 @@ int main(int argc, char **argv) {
             }
         }
     }
+    /* v1.42 step 7: warden-notify, which posts each proposal of a notify=
+     * rule to its webhook: from a sealed copy hashed for run_start, as its
+     * own user (not the agent's, the proxy's or warden-secrets'), before the
+     * agent starts. A check finds and hashes it without starting it. */
+    if (nt_policy_wants(&p) && !g_nr.on) {
+        char nb[PATH_MAX], why[PATH_MAX + 256];
+        if (notify_bin_arg) snprintf(nb, sizeof nb, "%s", notify_bin_arg);
+        else {
+            ssize_t n = proc_readlinkf(nb, sizeof nb - 16, "self/exe");
+            if (n <= 0) { fprintf(stderr, "[warden] cannot find this binary's directory\n"); return 1; }
+            nb[n] = '\0';
+            char *sl = strrchr(nb, '/');
+            snprintf(sl ? sl + 1 : nb, sizeof nb - (size_t)(sl ? sl + 1 - nb : 0), "warden-notify");
+        }
+        int nfd = wp_load(nb, g_nt_bin_sha, why, sizeof why);
+        if (nfd < 0) {
+            fprintf(stderr, "[warden] warden-notify (the policy has notify=): %s; build it (make warden-notify) or "
+                    "name it with --notify-bin; refusing to start\n", why);
+            return 1;
+        }
+        fprintf(stderr, "[warden] notifications' helper %s, SHA-256 %s\n", nb, g_nt_bin_sha);
+        if (!g_check_only) {
+            if (geteuid() != 0) {
+                close(nfd);
+                fprintf(stderr, "[warden] notify= needs the Warden to run as root (warden-notify runs as its own "
+                        "user); refusing to start\n");
+                return 2;
+            }
+            struct run_as nta = { .drop = false };
+            const char *nas = notify_as_arg ? notify_as_arg : getpwnam("varek-notify") ? "varek-notify" : "65530:65530";
+            if (parse_run_as(nas, &nta) < 0 || !nta.drop) {
+                close(nfd);
+                fprintf(stderr, "[warden] --notify-as %s: give an unprivileged user (name, uid or uid:gid) with a "
+                        "non-root group\n", nas);
+                return 2;
+            }
+            if ((ra.drop && nta.uid == ra.uid) || (p.v.proxy && nta.uid == pxa.uid) ||
+                (g_secrets.ctl >= 0 && nta.uid == g_secrets.uid)) {
+                close(nfd);
+                fprintf(stderr, "[warden] --notify-as %s: warden-notify may not run as the agent's user, the "
+                        "proxy's or warden-secrets'; give it its own\n", nas);
+                return 2;
+            }
+            if (nt_start(nfd, nta.uid, nta.gid) < 0) {
+                int e = errno;
+                close(nfd);
+                fprintf(stderr, "[warden] cannot start warden-notify (%s); refusing to start\n", strerror(e));
+                return 1;
+            }
+        }
+        close(nfd);
+    }
     /* v1.27: with `require warden 1.27`, the files the agent may launch and
      * the Landlock ruleset that holds it to them (warden_exec.inc.c). v1.34
      * step 3: under the node agent, in the container's view (node_supervise) */
@@ -7183,6 +7388,7 @@ int main(int argc, char **argv) {
         if (g_key) vfips_key_free(g_key);
         return 1;
     }
+    if (intent_side_write() < 0) return 1;                                 /* v1.42 step 7 */
     if (!g_nr.on) emit_run_start(policy_path, &p);     /* v1.34 step 3: node_supervise's, after the launch set */
     if (!g_nr.on) standing_start();                                        /* v1.42 step 6 */
     ctl_open();                                                            /* v1.28 step 4 */

@@ -534,6 +534,22 @@ def credential_parse(toks, names, where):
     return (name, CRED_STORES[store], ref)
 
 
+def notify_ok(v):
+    """v1.42: notify=, an https:// URL with a host; v1.42 step 7: or http://
+    to a loopback address (127.0.0.0/8 in four decimal parts, or [::1]),
+    with an optional port 1 to 65535, then the end or / ? #"""
+    if not 8 <= len(v) <= 512 or any(not 0x21 <= ord(ch) <= 0x7e for ch in v):
+        return False
+    if v.startswith("https://"):
+        return len(v) >= 9 and v[8] not in "/?#"
+    m = re.fullmatch(r"http://(\[::1\]|127\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::(\d{1,5}))?([/?#].*)?", v, re.S)
+    if not m:
+        return False
+    if not m.group(1).startswith("[") and any(int(x) > 255 for x in m.group(1).split(".")):
+        return False
+    return m.group(2) is None or 1 <= int(m.group(2)) <= 65535
+
+
 def https_with_host(u, hi):
     """v1.28.1: an https:// URL of at most hi bytes, printable, with a host."""
     return 9 <= len(u) <= hi and u.startswith("https://") and u[8] not in "/?#" and \
@@ -904,8 +920,7 @@ def parse_lines(raw_lines, path):
                          (k == "scope" and v_ in ("thread", "run")) or \
                          (k == "timeout" and re.fullmatch(r"[1-9][0-9]{0,3}", v_) is not None and int(v_) <= 3600) or \
                          (k == "approvers" and re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}|[a-z_][a-z0-9_-]{0,30}\$", v_) is not None) or \
-                         (k == "notify" and 9 <= len(v_) <= 512 and v_.startswith("https://") and
-                          v_[8] not in "/?#" and all(0x21 <= ord(ch) <= 0x7e for ch in v_))
+                         (k == "notify" and notify_ok(v_))
                     if not ok:
                         raise PolicyError(f"{path}:{lineno}: bad step_up option")
                     su_opts[k] = v_
@@ -1726,9 +1741,13 @@ def fuzz_line(rng, prior, strings, wide):
     if verb == "step_up" and rng.random() < 0.6:
         # v1.42: a step_up rule's options, valid and not
         opts = ["mode=grant", "mode=hold", "approvers=varek-approvers", "approvers=_x$", "timeout=1",
-                "timeout=3600", "timeout=300", "scope=thread", "scope=run", "notify=https://h.example/x"]
+                "timeout=3600", "timeout=300", "scope=thread", "scope=run", "notify=https://h.example/x",
+                "notify=http://127.0.0.1:8080/hook", "notify=http://[::1]/x", "notify=http://127.255.0.9"]
         bad = ["mode=x", "timeout=0", "timeout=3601", "timeout=01", "approvers=Ops", "approvers=",
-               "scope=all", "notify=http://h.example/x", "notify=https:///x", "mode=hold"]
+               "scope=all", "notify=http://h.example/x", "notify=https:///x", "mode=hold",
+               "notify=http://128.0.0.1/x", "notify=http://127.0.0.256/", "notify=http://127.0.0.1:0/",
+               "notify=http://127.0.0.1:65536/", "notify=http://localhost/x", "notify=http://127.0.0.1@h.example/",
+               "notify=http://127.0.0/x", "notify=http://[::2]/", "notify=http://127.0.0.1.5/"]
         clauses += rng.sample(opts, rng.randint(1, 3))
         if rng.random() < 0.15:
             clauses.append(rng.choice(bad))
