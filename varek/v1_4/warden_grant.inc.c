@@ -1256,8 +1256,32 @@ static int grant_timeout_ms(void) {
     return best > 3600000 ? 3600000 : (int)best;
 }
 
+/* v1.42 step 9: a live grant that can allow nothing more (its count used,
+ * or past its until) leaves the run's live grants, so a long run's
+ * approvals (the soak's one a turn) never fill them: GRANT_MAX bounds the
+ * grants live at once, not a run's whole. Done here, between decisions:
+ * a decision's grant index (action.grant) is used only until its
+ * certificate is checked, within the same call. The records keep each
+ * grant's uses; the audit counts them against its count and until. */
+static void grant_retire(void) {
+    time_t ts = time(NULL);
+    size_t k = 0;
+    for (size_t i = 0; i < g_nlive; i++) {
+        struct live_grant *g = g_live[i];
+        if ((g->v.count && g->used >= g->v.count) || (g->v.until && (long long)ts >= g->v.until)) {
+            vdp_grant_free(&g->v);
+            vdpc_grant_free(&g->c);
+            free(g);
+        } else {
+            g_live[k++] = g;
+        }
+    }
+    g_nlive = k;
+}
+
 /* Each round: a proposal past its time ends `timeout` */
 static void grant_expire(void) {
+    grant_retire();
     long long now = gr_now_ms();
     for (size_t i = g_nprop; i-- > 0;)
         if (g_prop[i].expires_ms <= now) {

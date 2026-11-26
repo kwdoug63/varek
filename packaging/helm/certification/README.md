@@ -62,7 +62,7 @@ The run, for the release (both charts pulled from
 `oci://ghcr.io/kwdoug63/charts`; or `--chart` and `--crds` for local ones):
 
 ```sh
-packaging/helm/certification/verify_on_openshift.sh --version 1.41.0 --out ~/chart-verifier-1.41.0 # end
+packaging/helm/certification/verify_on_openshift.sh --version 1.42.0 --out ~/chart-verifier-1.42.0 # end
 ```
 
 Before it changes anything it refuses a cluster that is not OpenShift, a

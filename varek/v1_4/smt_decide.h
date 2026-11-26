@@ -834,8 +834,9 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * signature through the host's OpenSSL 3 provider (the FIPS provider on a
  * host in FIPS mode), the verdict stream in format chain-2 (SHA-384, ECDSA
  * P-384), libsodium no longer used, and the Defense build (make DEFENSE=1);
- * the grammar stays 1.35) */
-#define VDP_WARDEN_REL_MINOR 41
+ * the grammar stays 1.35; v1.42.0: STEP_UP and DEFER, approvals as grants,
+ * the grammar 1.42 with it) */
+#define VDP_WARDEN_REL_MINOR 42
 #define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's
                                  * (v1.36.1: packaging for Red Hat's certification;
                                  * v1.36.2: the node key published again, a test

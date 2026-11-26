@@ -140,6 +140,15 @@ jobs:
           ! grep -q 'the code adapters under the Warden: not tried' "$RUNNER_TEMP/v1350.log"
       - name: v1.42 approvals as grants (the grammar, grants and the two-part certificate; runtime grants in mode=grant)
         run: sudo make -C varek/v1_4 test-v1420
+      - name: v1.42 the shared soak's harness, for six minutes (runs A to C, and D, v1.42's approvals)
+        timeout-minutes: 20
+        run: |
+          # the 24-hour soak's own trial (tests/soak_shared/README.md), a turn
+          # every 3 s: it must end soak_check: PASS. Its output is in /var/tmp,
+          # not $RUNNER_TEMP: the agents run as nobody, who cannot reach
+          # /home/runner (git init in b/work refused)
+          make -C varek/v1_4 tests/v1281_sub
+          sudo varek/v1_4/tests/soak_shared/soak.sh --hours 0.1 --interval 3 --out /var/tmp/varek-soak-shared-ci
       - name: v1.34 steps 3 and 5 the NRI plugin and the admission webhook (gofmt, go vet, their unit tests)
         run: |
           go version

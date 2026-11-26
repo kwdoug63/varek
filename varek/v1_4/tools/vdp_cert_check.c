@@ -181,8 +181,11 @@ static int load_grant_file(const vdpc_policy_t *pol, const char *path, vdpc_gran
 }
 
 int main(int argc, char **argv) {
-    /* v1.42: batch GRANT..., and grant GRANT */
-    bool gbatch = argc > 3 && argc <= 3 + 64 && !strcmp(argv[2], "batch");
+    /* v1.42: batch GRANT..., and grant GRANT. v1.42 step 9: or batch @LIST, a
+     * file naming the grant files one a line (a long run's grants, which a
+     * command line may not hold: the live grants are at most 64 at once,
+     * not a run's whole) */
+    bool gbatch = argc > 3 && !strcmp(argv[2], "batch");
     bool gcheck = argc == 4 && !strcmp(argv[2], "grant");
     if (gbatch || gcheck) goto args_ok;
     if (argc != 3 || (strcmp(argv[2], "digest") && strcmp(argv[2], "batch") &&
@@ -192,7 +195,7 @@ int main(int argc, char **argv) {
                       strcmp(argv[2], "openas") &&
                       strcmp(argv[2], "credentials") && strcmp(argv[2], "identity") &&
                       strcmp(argv[2], "approvers") && strcmp(argv[2], "notify"))) {
-        fprintf(stderr, "usage: %s <policy> digest|batch [GRANT...]|grant GRANT|holds|openable|kinds|rules|matches|proxy|launches|"
+        fprintf(stderr, "usage: %s <policy> digest|batch [GRANT...|@LIST]|grant GRANT|holds|openable|kinds|rules|matches|proxy|launches|"
                 "openas|credentials|identity|approvers|notify\n", argv[0]);
         return 2;
     }
@@ -454,13 +457,53 @@ args_ok:;
         vdpc_free(&pol);
         return 0;
     }
-    /* v1.42: the grants the batch's certificates may name */
-    static vdpc_grant_t grants[64];
-    size_t ngrants = 0;
+    /* v1.42: the grants the batch's certificates may name, in order: the
+     * files on the command line, or those LIST names (batch @LIST) */
+    vdpc_grant_t *grants = NULL;
+    size_t ngrants = 0, gcap = 0;
     if (gcheck || gbatch) {
-        for (int i = 3; i < argc; i++) {
-            if (load_grant_file(&pol, argv[i], &grants[ngrants]) < 0) { vdpc_free(&pol); return 2; }
+        char **names = NULL;
+        size_t nn = 0, ncap = 0;
+        bool listed = gbatch && argc == 4 && argv[3][0] == '@';
+        if (listed) {
+            FILE *lf = fopen(argv[3] + 1, "r");
+            if (!lf) { fprintf(stderr, "%s: cannot open the grant list %s\n", argv[0], argv[3] + 1); vdpc_free(&pol); return 2; }
+            char *ln = NULL;
+            size_t lc = 0;
+            ssize_t ll;
+            while ((ll = getline(&ln, &lc, lf)) >= 0) {
+                while (ll > 0 && (ln[ll - 1] == '\n' || ln[ll - 1] == '\r')) ln[--ll] = '\0';
+                if (ll == 0) continue;
+                if (nn == ncap) {
+                    ncap = ncap ? ncap * 2 : 64;
+                    char **nx = realloc(names, ncap * sizeof *names);
+                    if (!nx) { fprintf(stderr, "%s: out of memory\n", argv[0]); fclose(lf); vdpc_free(&pol); return 2; }
+                    names = nx;
+                }
+                names[nn] = strdup(ln);
+                if (!names[nn]) { fprintf(stderr, "%s: out of memory\n", argv[0]); fclose(lf); vdpc_free(&pol); return 2; }
+                nn++;
+            }
+            free(ln);
+            fclose(lf);
+        } else {
+            names = argv + 3;
+            nn = (size_t)(argc - 3);
+        }
+        for (size_t i = 0; i < nn; i++) {
+            if (ngrants == gcap) {
+                gcap = gcap ? gcap * 2 : 64;
+                vdpc_grant_t *ng = realloc(grants, gcap * sizeof *grants);
+                if (!ng) { fprintf(stderr, "%s: out of memory\n", argv[0]); vdpc_free(&pol); return 2; }
+                grants = ng;
+            }
+            memset(&grants[ngrants], 0, sizeof grants[ngrants]);
+            if (load_grant_file(&pol, names[i], &grants[ngrants]) < 0) { vdpc_free(&pol); return 2; }
             ngrants++;
+        }
+        if (listed) {
+            for (size_t i = 0; i < nn; i++) free(names[i]);
+            free(names);
         }
         if (gcheck) { printf("{\"grant\":\"ok\"}\n"); return 0; }
     }

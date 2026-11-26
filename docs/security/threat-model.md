@@ -1,6 +1,6 @@
 # VAREK — Threat Model
 
-Version: current as of v1.41.0 (released November 2026); the v1.42.0 entries describe the release being built · MIT · github.com/kwdoug63/varek
+Version: current as of v1.42.0 (released November 2026) · MIT · github.com/kwdoug63/varek
 
 This document states what VAREK defends, against whom, and what it explicitly
 does not defend. It is deliberately conservative: where a guarantee is
@@ -647,11 +647,11 @@ Model-B techniques below, with the residual limits stated honestly.
   `subagent=` in the policy:
   - *The user is verified, not asserted.* The token given with
     `--on-behalf-of` (a root-owned file) is checked by `warden-secrets`:
-    a signature by the trusted issuer's key (RS256, PS256, ES256 or EdDSA;
-    `none`, every HMAC algorithm, `crit`, and keys the token carries or
-    points to refused), the issuer, the audience, at least 60 s before
-    its expiry, `nbf` and `iat`, a canonical encoding, an `act` chain at
-    most 8 deep. Only the verified claims reach the Warden; the token
+    a signature by the trusted issuer's key (RS256, PS256, ES256, RS384,
+    PS384, ES384 or EdDSA; `none`, every HMAC algorithm, `crit`, and keys
+    the token carries or points to refused), the issuer, the audience, at
+    least 60 s before its expiry, `nbf` and `iat`, a canonical encoding,
+    an `act` chain at most 8 deep. Only the verified claims reach the Warden; the token
     itself reaches no output, stream, export or agent environment. With
     `require on-behalf-of`, a run without a verified user does not start.
   - *The agent is verified.* An X.509-SVID given with `--agent-svid` must
