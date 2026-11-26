@@ -1681,7 +1681,7 @@ for l in open(sys.argv[1]):
         print({k: r.get(k) for k in ("event", "resolved", "decision_final", "held", "unheld", "unknown", "ending", "state", "scope") if k in r})' "$1" 2>&1 | head -14 | tr '\n' ' '
 }
 # adump LOG: every record (without its chain and signature) and every line of the Warden's own
-# from the start of the run's verdicts, each cut short, for a failure the brief one does not explain
+# from the start of the run's verdicts, one a line and each cut short, for a failure the brief one does not explain
 adump() {
     python3 -c 'import json,sys
 for l in open(sys.argv[1], errors="replace"):
@@ -1690,7 +1690,7 @@ for l in open(sys.argv[1], errors="replace"):
         for k in ("intent", "policy", "env"): r.pop(k, None)
         print(json.dumps(r, separators=(",", ":"))[:260])
     elif l.strip():
-        print(l.strip()[:260])' "$1" 2>&1 | head -60 | tr '\n' ' '
+        print(l.strip()[:260])' "$1" 2>&1 | head -60 | sed 's/^/  INFO   /'
 }
 AFLAGS=(--sign-key "$W/ak" --intent "$W/aarm-intent.txt")
 astart "$W/a1.txt" "$W/a1" aarm.sh "$W/bin/free.txt" "$W/data/secret.csv" "$W/data/r.csv" "$W/dd/x.csv" "$W/other/u.csv"
@@ -1831,7 +1831,7 @@ wait "$WPID"
 grep -q "r.csv: no" "$W/a2.out" && grep -q "x.csv: no" "$W/a2.out" && \
   recs "$W/a2.log" "[r for r in rs if r.get('event') == 'step_up_end' and r['ending'] == 'timeout'] and [r for r in rs if r.get('event') == 'defer_end' and r['ending'] == 'timeout'] and len([r for r in rs if r.get('held') is True and r.get('decision_final') == 'DENY']) == 2" \
   && pass "R4: STEP_UP and DEFER timing out give DENY (each held read refused at its timeout, its ending timeout)" \
-  || flunk "aarm timeouts: $(cat "$W/a2.out" | tr '\n' ' ')/ $(adump "$W/a2.log")"
+  || { adump "$W/a2.log"; flunk "aarm timeouts: $(cat "$W/a2.out" | tr '\n' ' ')(its stream above, INFO)"; }
 audit_ok "$W/a2.txt" "$W/a2.log" && pass "... the audit passes it" || flunk "audit a2: $(grep PROBLEM "$W/a2.log.audit" | head -2)"
 
 # R1: the control plane unavailable, the action fails
