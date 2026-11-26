@@ -1,6 +1,6 @@
 # VAREK and the AARM specification: a mapping
 
-Status: draft, current as of v1.41.0 (November 2026), with v1.42.0's STEP_UP and DEFER as built (`docs/security/v1.42-step-up-defer.md`, steps 1 to 8; not yet released, and their conformance tests in `mode=hold` are step 9's). **VAREK does not claim AARM conformance.** This page maps each AARM requirement to what VAREK does today, with the code and the test behind each claim. It also names what is missing.
+Status: draft, current as of v1.42.0 (November 2026): STEP_UP and DEFER built (`docs/security/v1.42-step-up-defer.md`), and AARM's conformance tests for R1 to R6 run in `mode=hold` (`make test-v1420`, section 15; the results below). **VAREK does not claim AARM conformance.** This page maps each AARM requirement to what VAREK does today, with the code and the test behind each claim. It also names what is missing.
 
 ## The specification, and the version checked
 
@@ -30,7 +30,7 @@ This page is none of those. It is VAREK's own reading, so that a reader can chec
 
 ## Summary
 
-| | Requirement | Level | VAREK v1.41.0, and v1.42.0 as built |
+| | Requirement | Level | VAREK v1.41.0, and v1.42.0 |
 |---|---|---|---|
 | R1 | Pre-execution interception | MUST | **Met for ALLOW and DENY.** v1.42.0: STEP_UP and DEFER held at the kernel or the proxy (`mode=hold`). |
 | R2 | Context accumulation | MUST | **Partly.** v1.42.0 records the original request. |
@@ -42,7 +42,9 @@ This page is none of those. It is VAREK's own reading, so that a reader can chec
 | R8 | Telemetry export | SHOULD | **Met;** v1.42.0 exports STEP_UP and DEFER events. |
 | R9 | Least privilege enforcement | SHOULD | **Largely met.** |
 
-**Partial conformance, as the paper allows a claim of it (v1.41.0):** R1 (ALLOW and DENY), R5, R6, R8 and R9 met or largely met; R2 and R3 in part; R4 and R7 not met. v1.42.0 (`docs/security/v1.42-step-up-defer.md`) adds STEP_UP and DEFER, the largest gap. They are built (steps 1 to 8) but not released, and AARM's conformance tests for them, in `mode=hold`, are recorded here in step 9; until then this page claims nothing for them beyond what `make test-v1420` checks.
+**Partial conformance, as the paper allows a claim of it (v1.41.0):** R1 (ALLOW and DENY), R5, R6, R8 and R9 met or largely met; R2 and R3 in part; R4 and R7 not met.
+
+**v1.42.0** (`docs/security/v1.42-step-up-defer.md`) adds STEP_UP and DEFER, the largest gap, and runs AARM's minimum test for each of R1 to R6 in `mode=hold` (`make test-v1420`, section 15; [the results](#against-aarms-conformance-tests)). Every one passes but those two the table marks: R3's "an allowed action denied after sensitive data was read" (no data flow across runtime calls), and R2's "all prior actions and data classifications" (in part). R4 stays four of five decisions: MODIFY is only the credential swap. So v1.42.0 still makes a claim of partial conformance only, now R1, R4 but for MODIFY, R5 and R6 met or largely met, and R2 and R3 in part. It is VAREK's own reading, as above: not the CSA's evidence package.
 
 ## How VAREK is built, against AARM's four architectures
 
@@ -79,10 +81,10 @@ VAREK is also designed to keep the human out of the loop at run time (HOOTL). Pe
 - **Fail-closed:** there is no fail-open mode. UNKNOWN is refused, and an agent whose Warden stops is killed with its descendants (`v1_7/warden_lifecycle.c`).
 - **Network and tools:** calls are mediated by the egress proxy and, for MCP, by tool name and arguments.
 
-**v1.42.0 (built):** a call a `step_up` rule decides in `mode=hold`, or a `defer` rule decides, is held: at the kernel (the seccomp notification is not answered) or at the egress proxy (the request is not forwarded), until it is approved, released by its context, denied or timed out. It is decided again before it is carried out. `scope=run` freezes the whole run meanwhile. Nothing held is carried out by default: a timeout refuses it.
+**v1.42.0:** a call a `step_up` rule decides in `mode=hold`, or a `defer` rule decides, is held: at the kernel (the seccomp notification is not answered) or at the egress proxy (the request is not forwarded), until it is approved, released by its context, denied or timed out. It is decided again before it is carried out. `scope=run` freezes the whole run meanwhile. Nothing held is carried out by default: a timeout refuses it.
 
 **Tests:**
-- `make test-v1420`: holds at the kernel and the proxy, their endings, the freeze (step 9 records AARM's test);
+- `make test-v1420`: holds at the kernel and the proxy, their endings, the freeze; section 15 runs AARM's tests in `mode=hold` (below);
 - `make test-lifecycle`: the Warden stopped, its agent and descendants gone;
 - `make test-v1121`, `test-v1122` and `test-v1160`: decisions, refusals and their records;
 - `make test-v1260` and `test-v1310`: network and MCP calls.
@@ -123,7 +125,7 @@ VAREK is also designed to keep the human out of the loop at run time (HOOTL). Pe
 
 ### R4: Five authorization decisions (MUST)
 
-**v1.41.0: not met. v1.42.0 (built): four of five.**
+**v1.41.0: not met. v1.42.0: four of five.**
 
 | Decision | VAREK |
 |---|---|
@@ -140,7 +142,7 @@ v1.42.0 adds STEP_UP and DEFER (`docs/security/v1.42-step-up-defer.md`), with ap
 - **People approve ahead of time where they can.** That means a plan approved before the run, or standing grants. At run time the default is `mode=grant`: the call is refused at once, and its retry passes once the grant is approved, so the agent never waits on a person.
 - **AARM's hold mode** (`mode=hold`) keeps the call held at the kernel (seccomp user-notify) until the approver answers. AARM's conformance test uses that mode.
 
-**Tests:** `make test-v1280` (the credential swap); `make test-v1420` (STEP_UP and DEFER; AARM's conformance tests in step 9).
+**Tests:** `make test-v1280` (the credential swap); `make test-v1420` (STEP_UP and DEFER; AARM's conformance tests, section 15).
 
 ### R5: Tamper-evident receipts (MUST)
 
@@ -209,38 +211,38 @@ v1.42.0 adds STEP_UP and DEFER (`docs/security/v1.42-step-up-defer.md`), with ap
 
 ## Against AARM's conformance tests
 
-The conformance page lists a minimum test per requirement. VAREK v1.41.0, and v1.42.0 as built. The v1.42.0 entries are what `make test-v1420` checks; AARM's own tests, in `mode=hold`, are recorded here in step 9 (pending).
+The conformance page lists a minimum test per requirement. VAREK v1.41.0, and v1.42.0. For R1 to R6, each v1.42.0 result is a check in `make test-v1420`'s section 15, run in `mode=hold`, named by its requirement (`R1: ...`). One run makes all the decisions but MODIFY in turn: an allowed read, a denied one, one a `step_up` rule holds until it is approved, one a `defer` rule holds until its marker comes, and one no rule names, deferred and escalated (`on unknown defer escalate`). It is signed, with the user's request (`--intent`). Two shorter runs time out a STEP_UP and a DEFER, and kill the Warden while a call is held. Results recorded at the release, November 26, 2026 (Linux 6.18, x86-64), and in CI on each run of the suite.
 
-| Test | VAREK |
-|---|---|
-| R1: a DENY policy's action doesn't execute; a denial receipt | Yes |
-| R1: a DEFER condition suspends the action | v1.42.0: built (held at the kernel or the proxy); AARM's test pending (step 9) |
-| R1: the control plane unavailable, the action fails | Yes (the agent is killed with its Warden) |
-| R2: the policy engine receives all prior actions and data classifications | Partly (the plan's progress, the session's refusals; no runtime classification) |
-| R2: tampering with a prior context entry detected | Yes (the hash chain) |
-| R3: a forbidden action denied at once | Yes |
-| R3: an allowed action denied after sensitive data was read | No (data flow is checked on the plan, not across runtime calls) |
-| R3: a context-dependent allow gives STEP_UP or ALLOW | Partly (ALLOW through the plan); v1.42.0: STEP_UP built, AARM's test pending (step 9) |
-| R3: ambiguous context gives DEFER | v1.42.0: built (`on unknown defer escalate`, `defer ... until=`); AARM's test pending (step 9) |
-| R4: each of five decisions | v1.41.0: no (two, and a narrow MODIFY). v1.42.0: four, and a narrow MODIFY |
-| R4: STEP_UP or DEFER timing out gives DENY | v1.42.0: built (a timeout refuses the call); AARM's test pending (step 9) |
-| R5: receipts with requester context, delegation chain and policy hash | Yes (ALLOW and DENY) |
-| R5: a receipt's signature verifies offline; tampering fails it | Yes |
-| R5: a deferral receipt's reason and resolution | v1.42.0: built (`defer`, `defer_end`); AARM's test pending (step 9) |
-| R6: identity attributed per principal and session | Yes |
-| R6: identity preserved across deferral | v1.42.0: built (the same process and `obo`); AARM's test pending (step 9) |
-| R8: SIEM export with the right schema, DEFER events included | Yes; DEFER and STEP_UP events from v1.42.0 (`make test-v1420` section 13) |
-| R9: a read credential cannot write | Not tested |
+| Test | VAREK v1.41.0 | v1.42.0, `make test-v1420` section 15 (`mode=hold`) |
+|---|---|---|
+| R1: a DENY policy's action doesn't execute; a denial receipt | Yes | PASS: the read refused; its record names the deny rule and line, and the audit verifies it |
+| R1: a DEFER condition suspends the action | No | PASS: the read under the `defer` rule waits in the kernel, nothing decided for it, until its marker comes |
+| R1: the control plane unavailable, the action fails | Yes (the agent is killed with its Warden) | PASS: the Warden killed while the call is held; the call is not carried out |
+| R2: the policy engine receives all prior actions and data classifications | Partly (the plan's progress, the session's refusals; no runtime classification) | Partly, as before; the approver also sees the user's original request (`--intent`) beside the held call: PASS |
+| R2: tampering with a prior context entry detected | Yes (the hash chain) | PASS: a record before the hold edited in place breaks the chain; with the chain made again, the signatures fail |
+| R3: a forbidden action denied at once | Yes | PASS: no proposal, no hold |
+| R3: an allowed action denied after sensitive data was read | No (data flow is checked on the plan, not across runtime calls) | No, as before (v1.11's candidate) |
+| R3: a context-dependent allow gives STEP_UP or ALLOW | Partly (ALLOW through the plan) | PASS: STEP_UP, held; approved, ALLOW under the grant |
+| R3: ambiguous context gives DEFER | No | PASS: a read no rule names (UNKNOWN) is deferred and escalated to a person; approved, it is allowed under the `on unknown` line |
+| R4: each of five decisions | No (two, and a narrow MODIFY) | Four in one run (ALLOW, DENY, STEP_UP, DEFER): PASS; MODIFY only for credentials (`make test-v1280`) |
+| R4: STEP_UP or DEFER timing out gives DENY | No | PASS: each held read refused at its timeout, its ending `timeout` |
+| R5: receipts with requester context, delegation chain and policy hash | Yes (ALLOW and DENY) | PASS for approvals: the run, the process and `obo`, the approver and their reason, the grant, the policy's SHA-256 and the request |
+| R5: a receipt's signature verifies offline; tampering fails it | Yes | PASS: `varek_audit --pubkey` verifies the signed run; the approver changed, or a deferral's resolution, and the signatures fail |
+| R5: a deferral receipt's reason and resolution | No | PASS: `defer` names the rule and the marker it waits for; `defer_end` its resolution and the marker's SHA-256; the allow names both |
+| R6: identity attributed per principal and session | Yes | PASS: every call one run's and one process's, with its `obo` |
+| R6: identity preserved across deferral | No | PASS: the same process and `obo` before and after the hold and the deferral |
+| R8: SIEM export with the right schema, DEFER events included | Yes, but no DEFER events | Yes: STEP_UP, DEFER and grants as OCSF events (`make test-v1420` section 13) |
+| R9: a read credential cannot write | Not tested | Not tested |
 
 ## What would close the gaps
 
-1. **v1.42.0, STEP_UP and DEFER** (`docs/security/v1.42-step-up-defer.md`), built in steps 1 to 8:
+1. **v1.42.0, STEP_UP and DEFER** (`docs/security/v1.42-step-up-defer.md`), released:
    - approvals as scoped grants, signed where the policy pins keys, that the machine checks and the audit replays;
    - plan approval and standing grants ahead of time;
    - `mode=grant` by default, and `mode=hold` for AARM's test;
    - approvers from a Unix group, with a webhook carrying each proposed grant.
 
-   This closes, once step 9 records AARM's conformance tests, R4 but for a general MODIFY, and the DEFER parts of R1, R3, R5 and R6.
+   With AARM's conformance tests recorded above, this closes R4 but for a general MODIFY, and the DEFER parts of R1, R3, R5 and R6.
 2. **Recording the original request** (R2): `varek run --intent`, recorded in `run_start` and shown to approvers. Built in v1.42.0.
 3. **Context across runtime calls** (R2, R3): labels on what the agent reads, and a rule that refuses or steps up a later send. This is VAREK's cross-action data-flow candidate (v1.11).
 4. **A general MODIFY,** for example narrowing an MCP call's arguments, kept to transformations the checker can verify.

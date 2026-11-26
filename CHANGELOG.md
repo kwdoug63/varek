@@ -7,9 +7,99 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased]
+## [1.42.0] - 2026-11-26 — STEP UP and DEFER: approvals as grants
+
+A call a policy cannot settle on its own can now wait: for a person
+(STEP_UP: its narrowest grant proposed, answered on the run's approvers'
+socket) or for the context it needs (DEFER: a root-owned marker, or a
+person). An approval is a grant, precise and limited in count, time and
+scope, that the decision procedure and the independent checker check like
+any authorization; every proposal, grant, use and ending is recorded in the
+signed stream and replayed by the audit. Calls are refused and proposed
+(`mode=grant`, the default) or held at the kernel or the egress proxy
+(`mode=hold`), with `scope=run` freezing the run meanwhile. Approvals may be
+signed by pinned keys, standing grants and plans approved ahead of time,
+the user's request recorded (`--intent`) and each proposal posted to a
+webhook (`notify=`). The policy grammar moves to 1.42. AARM's conformance
+tests for R1 to R6 run in `mode=hold` (`make test-v1420`, section 15). The
+24-hour soak's results follow when it ends.
+
+### Added
+
+- **`step_up` rules** (`require warden 1.42`), with the matchers of `allow`
+  and `deny` and the options `mode=grant|hold`, `approvers=GROUP`,
+  `timeout=N`, `scope=thread|run` and `notify=URL`; `max_held` and
+  `max_pending`. Grants, read by both parsers; the two-part certificate
+  (the policy's half and the grant's), checked by the checker (#241).
+- **Runtime grants** (`mode=grant`, #242): a refused call's narrowest grant
+  proposed; `varek pending`, `varek approve` (as proposed, or narrowed) and
+  `varek deny` on the run's approvers' socket; approvers by the kernel's
+  peer credentials, of the rule's `approvers=` group or root, never the
+  agent's own user.
+- **Held calls** (`mode=hold`, #243, #244): at the kernel and at the egress
+  proxy (requests and MCP tool calls), decided again when approved;
+  `max_held`; `abandoned` when the caller is gone; killable waits on Linux
+  5.19 and later, also with libseccomp before 2.6.
+- **`scope=run`** (#245): the run's control group frozen while a call is
+  held, or the call refused at once where the run cannot be frozen.
+- **DEFER** (#246, #247): `defer KIND ... until=FILE [escalate]`, released
+  by a root-owned marker naming the run; `on unknown defer escalate`;
+  `on outside_plan defer` with `varek plan extend` through the plan gate.
+- **Signed approvals** (#248): `approver key=HEX group=GROUP`; standing
+  grants (`varek run --grants DIR`); `varek plan approve` and
+  `--require-approved-plan`; `varek approve --sign-key`;
+  `varek_keygen --sign` and `--verify`.
+- **The user's request and a webhook** (#250): `varek run --intent FILE` or
+  `--intent-text TEXT`, recorded in `run_start` and shown to approvers;
+  `notify=URL`, posted by the new helper `warden-notify` (its own user,
+  notification only, retried once; the URL never recorded).
+- **The exports** (#251): every v1.42 record an OCSF event (Application
+  Lifecycle), through OpenTelemetry, Splunk (fields, the macro
+  `varek_approval_expired`), Sentinel (a fourth rule: an approval nobody
+  gave in time) and Falcon.
+- **`make test-v1420`** complete: section 14 (order, `max_pending`, a signal,
+  the caller killed and the Warden stopped or killed during a hold, 70
+  approvals in one run, the audit's remaining forgeries) and section 15
+  (AARM's conformance tests for R1 to R6, in `mode=hold`).
+- **`make latency-v1420`** (`tests/latency_v1420.sh`, recorded in
+  `tests/latency_v1.42.0.txt`): calls not held under v1.41.0's Warden,
+  built from its tag, and under v1.42.0's, with and without `step_up` and
+  `defer` rules.
+- **The shared soak's run D** (`tests/soak_shared`): each turn a held read
+  approved by a script and a read under a signed standing grant, every
+  tenth a deferral timing out.
+
+### Changed
+
+- The Warden is 1.42.0, and the grammar 1.42.
+- The threat model (trust boundaries 22, the approvers, and 23, the
+  webhook), the trusted computing base and the AARM mapping, current as of
+  v1.42.0; the mapping records AARM's conformance tests.
+
+### Fixed
+
+- **A run's live grants never shrank,** so its 65th approval would have been
+  refused ("the run holds as many grants as it may"): a grant whose count is
+  used or whose time has passed now leaves them, between decisions. Found by
+  the soak's run D, one approval a turn.
+- **The certificate checker read at most 64 grant files a batch,** so a run
+  with more grants could not be audited: `vdp_cert_check POLICY batch @LIST`
+  names them in a file, without a limit, and the audit uses it past 64.
+- **The audit refused two approvals of the same grant text** ("recorded
+  twice"), which two proposals of one call made within a second give (a
+  grant's id is the SHA-256 of its text). A second approval of the same
+  text for another open proposal is one grant, its counts summed; one
+  repeated for its own proposal is still refused.
+- `varek pending` escapes control, format and bidirectional characters in
+  what the agent supplies; the webhook's line escapes Slack's mrkdwn; an
+  exported policy line names a `notify=` URL by its host only; a run whose
+  request is over 4 KiB exports (#251).
 
 ### Fixed (documentation)
+
+- **The threat model's token algorithms.** It listed the user's token as
+  RS256, PS256, ES256 or EdDSA; since v1.41 RS384, PS384 and ES384 are
+  accepted too (#237).
 
 - **The 510 TOCTOU figure has a record.** Since v1.18.0 the README said the
   harness's "510 leaks in 20,000 attempts" had no recorded run. It was
