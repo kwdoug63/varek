@@ -1400,6 +1400,30 @@ static void apv_end(int c) {
 
 /* The open proposals this peer may answer (others' objects are not shown) */
 static void op_suggest(const struct held_call *h, char *out, size_t n);
+/* apv_pending's line: append at *k, never past n - 1 (*k is clamped there,
+ * so a full line stays a full, NUL-terminated line) */
+static void apv_cat(char *b, size_t n, size_t *k, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static void apv_cat(char *b, size_t n, size_t *k, const char *fmt, ...) {
+    if (*k >= n - 1) { *k = n - 1; return; }
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(b + *k, n - *k, fmt, ap);
+    va_end(ap);
+    *k = w < 0 ? *k : (*k + (size_t)w >= n - 1 ? n - 1 : *k + (size_t)w);
+}
+
+/* a JSON string's body, escaped, appended (as apv_cat) */
+static void apv_cat_json(char *b, size_t n, size_t *k, const char *s) {
+    for (const char *q = s; *q && *k + 8 < n; q++) {
+        unsigned char u = (unsigned char)*q;
+        if (u == '"' || u == '\\') { b[(*k)++] = '\\'; b[(*k)++] = (char)u; }
+        else if (u == '\n') { b[(*k)++] = '\\'; b[(*k)++] = 'n'; }
+        else if (u < 0x20 || u >= 0x7f) apv_cat(b, n, k, "\\u%04x", u);
+        else b[(*k)++] = (char)u;
+    }
+    b[*k] = '\0';
+}
+
 static void apv_pending(int c, const struct ucred *cr) {
     char line[PROP_TEXT_MAX * 2 + 512];
     long long now = gr_now_ms();
@@ -1408,16 +1432,11 @@ static void apv_pending(int c, const struct ucred *cr) {
         const vdp_rule_t *su = prop_su(pp);
         char who[64];
         if (apv_may(cr->uid, cr->gid, su, who)) continue;
-        int k = snprintf(line, sizeof line, "{\"id\":\"%s\",\"rule_line\":%d,\"approvers\":\"%s\",\"expires_in\":%lld,\"proposal\":\"",
-                         pp->id, su->line, su->su_approvers, (pp->expires_ms - now + 999) / 1000);
-        for (const char *q = pp->text; *q && (size_t)k + 8 < sizeof line; q++) {
-            unsigned char u = (unsigned char)*q;
-            if (u == '"' || u == '\\') { line[k++] = '\\'; line[k++] = (char)u; }
-            else if (u == '\n') { line[k++] = '\\'; line[k++] = 'n'; }
-            else if (u < 0x20 || u >= 0x7f) k += snprintf(line + k, sizeof line - (size_t)k, "\\u%04x", u);
-            else line[k++] = (char)u;
-        }
-        snprintf(line + k, sizeof line - (size_t)k, "\"}\n");
+        size_t k = 0;
+        apv_cat(line, sizeof line, &k, "{\"id\":\"%s\",\"rule_line\":%d,\"approvers\":\"%s\",\"expires_in\":%lld,\"proposal\":\"",
+                pp->id, su->line, su->su_approvers, (pp->expires_ms - now + 999) / 1000);
+        apv_cat_json(line, sizeof line, &k, pp->text);
+        apv_cat(line, sizeof line, &k, "\"}\n");
         apv_send(c, line);
     }
     /* v1.42 step 5b: the outside_plan deferrals, to approvers of the
@@ -1428,21 +1447,14 @@ static void apv_pending(int c, const struct ucred *cr) {
         if (h->dkind != 2 || apv_may(cr->uid, cr->gid, &g_op_rule, who)) continue;
         char sug[PATH_MAX + 64];
         op_suggest(h, sug, sizeof sug);
-        int k = snprintf(line, sizeof line, "{\"id\":\"%s\",\"defer\":\"outside_plan\",\"rule_line\":%d,"
-                         "\"expires_in\":%lld,\"action\":\"%s\",\"resolved\":\"", h->did, g_op_rule.line,
-                         (h->df_deadline_ms - now + 999) / 1000, action_kind_name(h->act->kind));
-        const char *parts[2] = { h->act->resolved, sug };
-        for (int pi = 0; pi < 2; pi++) {
-            if (pi) k += snprintf(line + k, sizeof line - (size_t)k, "\",\"extension\":\"");
-            for (const char *q = parts[pi]; *q && (size_t)k + 8 < sizeof line; q++) {
-                unsigned char u = (unsigned char)*q;
-                if (u == '"' || u == '\\') { line[k++] = '\\'; line[k++] = (char)u; }
-                else if (u == '\n') { line[k++] = '\\'; line[k++] = 'n'; }
-                else if (u < 0x20 || u >= 0x7f) k += snprintf(line + k, sizeof line - (size_t)k, "\\u%04x", u);
-                else line[k++] = (char)u;
-            }
-        }
-        snprintf(line + k, sizeof line - (size_t)k, "\"}\n");
+        size_t k = 0;
+        apv_cat(line, sizeof line, &k, "{\"id\":\"%s\",\"defer\":\"outside_plan\",\"rule_line\":%d,"
+                "\"expires_in\":%lld,\"action\":\"%s\",\"resolved\":\"", h->did, g_op_rule.line,
+                (h->df_deadline_ms - now + 999) / 1000, action_kind_name(h->act->kind));
+        apv_cat_json(line, sizeof line, &k, h->act->resolved);
+        apv_cat(line, sizeof line, &k, "\",\"extension\":\"");
+        apv_cat_json(line, sizeof line, &k, sug);
+        apv_cat(line, sizeof line, &k, "\"}\n");
         apv_send(c, line);
     }
     apv_send(c, "end\n");
