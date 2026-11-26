@@ -2210,6 +2210,19 @@ def apv_run(arg):
     return run
 
 
+def _shown(text):
+    """v1.42 step 8: text an approver reads (the user's request, a proposal,
+    the object it names) with its control and format characters written as
+    escapes: the request comes from the agent's framework and an object's
+    name from the agent, and neither may move the cursor, recolour or hide
+    the text, or reorder it (bidirectional controls) on the approver's
+    terminal"""
+    import unicodedata
+    return "".join(c if c == "\t" or unicodedata.category(c) not in ("Cc", "Cf", "Co", "Cs", "Zl", "Zp")
+                   else (f"\\x{ord(c):02x}" if ord(c) < 0x100 else f"\\u{ord(c):04x}" if ord(c) < 0x10000
+                         else f"\\U{ord(c):08x}") for c in str(text))
+
+
 def cmd_pending(args):
     run = apv_run(args.run)
     ans = apv_ask(run, "pending")
@@ -2240,7 +2253,7 @@ def cmd_pending(args):
         info(f"the user's request ({intent['bytes']} bytes, SHA-256 {intent['sha256'][:16]}"
              + (", the first part shown" if intent.get("truncated") else "") + "):")
         for ln in intent["text"].splitlines() or [""]:
-            info(f"    {ln}")
+            info(f"    {_shown(ln)}")
         info("")
     defers = [p for p in props if p.get("defer") == "outside_plan"]
     for p in props:
@@ -2249,15 +2262,15 @@ def cmd_pending(args):
         info(f"proposal {p['id']} (policy line {p['rule_line']}, ends in {p['expires_in']} s)"
              + (f", approvers {p['approvers']}" if p.get("approvers") else ""))
         for ln in p["proposal"].splitlines():
-            info(f"    {ln}")
+            info(f"    {_shown(ln)}")
     # v1.42 step 5b: calls outside the run's plan, waiting for a plan extension
     for p in defers:
         info(f"outside the plan: {p['id']} (policy line {p['rule_line']}, ends in {p['expires_in']} s): "
-             f"{p['action']} {p['resolved']}")
+             f"{p['action']} {_shown(p['resolved'])}")
         if p.get("extension"):
             info("    an extension that covers it:")
             for ln in p["extension"].splitlines():
-                info(f"        {ln}")
+                info(f"        {_shown(ln)}")
     if len(defers) < len(props):
         info(f"\nAnswer with `varek approve {run} ID` (or --narrow FILE) or `varek deny {run} ID`.")
     if defers:

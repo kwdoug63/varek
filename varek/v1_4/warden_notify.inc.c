@@ -138,8 +138,21 @@ static size_t nt_body(char *b, size_t n, const struct proposal *pp, const vdp_ru
     gr_utc(pp->until, ut);
     gr_utc((int64_t)(pp->expires_ms / 1000), ex);
     size_t k = 0;
+    /* v1.42 step 8: the one line a chat shows, its &, < and > written as
+     * Slack's mrkdwn asks (&amp; &lt; &gt;): the rule's object is the
+     * agent's, and a name such as <https://x|Approve> or <!channel> must
+     * not become a link or a mention in the approvers' channel. The
+     * grant's own text, below, is exact. */
+    static char shown[sizeof rule * 5];
+    size_t sk = 0;
+    for (const char *c = rule; *c && sk + 6 < sizeof shown; c++) {
+        const char *e = *c == '&' ? "&amp;" : *c == '<' ? "&lt;" : *c == '>' ? "&gt;" : NULL;
+        if (e) { memcpy(shown + sk, e, strlen(e)); sk += strlen(e); }
+        else shown[sk++] = *c;
+    }
+    shown[sk] = '\0';
     apv_cat(b, n, &k, "{\"text\":\"VAREK run %s asks for approval: ", g_run_id);
-    apv_cat_json(b, n, &k, rule);
+    apv_cat_json(b, n, &k, shown);
     apv_cat(b, n, &k, " (proposal %s, policy line %d, ", pp->id, su->line);
     if (su->su_approvers[0]) apv_cat(b, n, &k, "approvers %s", su->su_approvers);
     else apv_cat(b, n, &k, "root approves");
