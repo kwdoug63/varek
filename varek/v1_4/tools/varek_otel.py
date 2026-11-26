@@ -102,7 +102,8 @@ def _get(d, *path):
 
 def _object(ev):
     """what the event was about, for the body: a file, a process, an
-    endpoint, an MCP call, a URL"""
+    endpoint, an MCP call, a URL, or (v1.42) the call an approval, a
+    deferral or a webhook post is about"""
     for path in (("file", "path"), ("process", "file", "path"), ("process", "cmd_line"),
                  ("http_request", "url", "url_string"), ("api", "operation"),
                  ("query", "hostname")):
@@ -114,6 +115,9 @@ def _object(ev):
         host = dst.get("hostname") or dst.get("ip")
         if host:
             return f"{host}:{dst['port']}" if dst.get("port") else str(host)
+    v = _get(ev, "unmapped", "varek", "object")       # v1.42: the call an approval or a deferral is about
+    if v:
+        return str(v)
     v = _get(ev, "unmapped", "varek", "event")
     return str(v) if v else ""
 
