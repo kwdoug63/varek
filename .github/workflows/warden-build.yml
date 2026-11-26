@@ -144,9 +144,11 @@ jobs:
         timeout-minutes: 20
         run: |
           # the 24-hour soak's own trial (tests/soak_shared/README.md), a turn
-          # every 3 s: it must end soak_check: PASS
+          # every 3 s: it must end soak_check: PASS. Its output is in /var/tmp,
+          # not $RUNNER_TEMP: the agents run as nobody, who cannot reach
+          # /home/runner (git init in b/work refused)
           make -C varek/v1_4 tests/v1281_sub
-          sudo varek/v1_4/tests/soak_shared/soak.sh --hours 0.1 --interval 3 --out "$RUNNER_TEMP/soak-shared"
+          sudo varek/v1_4/tests/soak_shared/soak.sh --hours 0.1 --interval 3 --out /var/tmp/varek-soak-shared-ci
       - name: v1.34 steps 3 and 5 the NRI plugin and the admission webhook (gofmt, go vet, their unit tests)
         run: |
           go version
