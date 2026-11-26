@@ -317,7 +317,7 @@ test-v1410: all
 # and DEFER. Step 1: the grammar, grants and the two-part certificate, in the
 # decision procedure and the certificate checker; step 2: runtime grants in
 # mode=grant, the approvers' socket, the audit (as root).
-test-v1420: warden tools/vdp_check tools/vdp_cert_check
+test-v1420: warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen
 	@sudo ./tests/test_v1420.sh
 
 # v1.41: the Defense build's acceptance on RHEL 9 in FIPS mode (run there, as

@@ -104,7 +104,29 @@
 #      extension with a step the policy refuses adds nothing, and the call is
 #      refused at its timeout. Without --hold-to-plan the line is inert.
 #
-# Usage: sudo ./test_v1420.sh   (from varek/v1_4, after `make warden tools/vdp_check tools/vdp_cert_check`;
+# Step 6, signed approvals (sections 1 and 11):
+#   1. approver lines (key=HEX group=GROUP [name=NAME], the key pinned by
+#      value) read the same by both parsers and the Warden, each malformed
+#      form refused (a short, upper-case or non-point key, a key given as a
+#      file, no group, a key twice, seventeen lines); the checker lists the
+#      keys and each rule's approvers= group for the audit.
+#  11. varek_keygen makes two approvers' keys, one per group, and signs and
+#      verifies (another key or kind refused). A standing grant (--grants)
+#      signed by an approver of its rule's group allows from the start,
+#      within its count, recorded with its signer; the start is refused for
+#      a grant unsigned, signed by the other group's or an unpinned key,
+#      changed after signing, naming a run, expired, or under a rule with no
+#      approvers=, and for a --grants directory it cannot read. varek plan
+#      approve signs a plan: --require-approved-plan runs it (run_start's
+#      plan_approved_by) and refuses one unapproved, changed or signed by an
+#      unpinned key; without the flag a failing approval is a note. At the
+#      socket, an approval signed by the other group's key, or over other
+#      text, is refused; varek approve --sign-key is recorded with signed_by.
+#      The audit passes each run and refuses each forgery: a signature
+#      altered or dropped, a signer swapped for an unpinned key or named of
+#      another group, a plan approval's signature, key or name changed.
+#
+# Usage: sudo ./test_v1420.sh   (from varek/v1_4, after `make warden tools/vdp_check tools/vdp_cert_check tools/varek_keygen`;
 #        sections 1 to 4 need no root, and run without it)
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -180,6 +202,28 @@ refused "until= on the on outside_plan line"     'require warden 1.42\non outsid
 refused "on outside_plan allow"                  'require warden 1.42\non outside_plan allow\n'
 refused "on outside_plan twice"                  'require warden 1.42\non outside_plan deny\non outside_plan defer\n'  "given twice"
 refused "on outside_plan before 1.42"            'require warden 1.35\non outside_plan deny\n'
+# v1.42 step 6: approver lines, each key pinned by value (as varek_keygen writes KEY.pub)
+KA="04$(printf 'a1%.0s' $(seq 1 96))"; KB="04$(printf 'b2%.0s' $(seq 1 96))"
+accepted "approver lines: key= and group=, name= optional, in any order" "require warden 1.42\napprover key=$KA group=ops name=alice.1\napprover group=sec key=$KB\nstep_up path /s/ approvers=ops\n"
+refused "approver before 1.42"              "require warden 1.35\napprover key=$KA group=ops\n"             "needs \`require warden 1.42\`"
+refused "an approver key too short"         "require warden 1.42\napprover key=04a1 group=ops\n"            "194 lowercase"
+refused "an approver key in upper case"     "require warden 1.42\napprover key=$(tr a-f A-F <<<"$KA") group=ops\n" "194 lowercase"
+refused "an approver key not a point (03...)" "require warden 1.42\napprover key=03${KA#04} group=ops\n"     "194 lowercase"
+refused "an approver key given as a file"   "require warden 1.42\napprover /etc/varek/ops.pub group=ops\n"
+refused "an approver without group="        "require warden 1.42\napprover key=$KA\n"                       "need: approver key=HEX group=GROUP"
+refused "an approver group=Ops"             "require warden 1.42\napprover key=$KA group=Ops\n"             "group= is a Unix group name"
+refused "an approver name with a space"     "require warden 1.42\napprover key=$KA group=ops name=a/b\n"    "name= is 1 to 32"
+refused "key= twice on one line"            "require warden 1.42\napprover key=$KA key=$KB group=ops\n"     "each once"
+refused "the same approver key twice"       "require warden 1.42\napprover key=$KA group=ops\napprover key=$KA group=sec\n" "the same approver key given twice"
+MANY="require warden 1.42\n"; for i in $(seq 10 26); do MANY="${MANY}approver key=04$(printf "$i%.0s" $(seq 1 96)) group=ops\n"; done
+refused "seventeen approver lines"          "$MANY"                                                          "more than 16 approver lines"
+printf "require warden 1.42\napprover key=$KA group=ops name=alice\napprover key=$KB group=sec\nallow path /tmp/\nstep_up path /srv/data/ approvers=ops\n" > "$T/w6.txt"
+o="$("$WARDEN" "$T/w6.txt" --check-startup 2>&1)"
+grep -q "startup checks passed" <<<"$o" && ! grep -q "approver lines differently" <<<"$o" \
+  && pass "the Warden loads approver lines, its two parsers agreeing on each key, group and name" || flunk "the Warden on approver lines: $o"
+o="$("$CERT" "$T/w6.txt" approvers)"
+[ "$o" = "$(printf 'approver %s ops alice 2\napprover %s sec - 3\nrule 5 ops' "$KA" "$KB")" ] \
+  && pass "the checker lists them for the audit (approvers): the keys, and each rule's approvers= group" || flunk "checker approvers: $o"
 printf 'require warden 1.42\nallow path /tmp/\nstep_up path /srv/data/ mode=hold timeout=60 approvers=ops notify=https://h.example/x\nstep_up path /srv/data/x\n' > "$T/w.txt"
 o="$("$WARDEN" "$T/w.txt" --check-startup 2>&1)"
 grep -q "read this rule differently" <<<"$o" && flunk "the Warden's two parsers disagree on a step_up rule: $o" \
@@ -908,6 +952,136 @@ dstart "$W/o1.txt" "$W/o3" one.sh "$W/data/r.csv"
 wait "$WPID"
 grep -q "r.csv: ok a,b" "$W/o3.out" && grep -q "holds nothing: the run is not held to a plan" "$W/o3.log" && pass "without --hold-to-plan the line is inert (a note), the read allowed" \
     || flunk "inert: $(cat "$W/o3.out") / $(grep -c 'holds nothing' "$W/o3.log")"
+
+echo "== 11. step 6: signed approvals (as root) =="
+KG="$HERE/tools/varek_keygen"
+groupadd -f vk1420s 2>/dev/null; GS="$(getent group vk1420s | cut -d: -f3)"
+mkdir -p "$W/k" "$W/g" "$W/k43"; chmod 700 "$W/k"
+for k in ops sec odd; do "$KG" "$W/k/$k" > /dev/null; done
+KO="$(cat "$W/k/ops.pub")"; KS="$(cat "$W/k/sec.pub")"
+[ ${#KO} = 194 ] && [ ${#KS} = 194 ] && pass "varek_keygen makes the approvers' keys (KEY, and KEY.pub: the point pinned in the policy)" || flunk "keygen: $KO"
+AP="approver key=$KO group=vk1420 name=ops1\napprover key=$KS group=vk1420s name=sec1\n"
+SL=$((HB + 3))                       # the step_up rule's line, after the two approver lines
+printf "${BASE}${AP}step_up path $W/data/ approvers=vk1420 timeout=20\n" > "$W/s6.txt"
+printf "${BASE}${AP}step_up path $W/data/ timeout=20\n" > "$W/s6n.txt"
+U2="$(date -u -d '+2 hours' +%Y-%m-%dT%H:%M:%SZ)"; UP="$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ)"
+sgrant() {   # sgrant NAME KEY TEXT: $W/g/NAME.grant, signed with $W/k/KEY (KEY "": unsigned)
+    printf '%b' "$3" > "$W/g/$1.grant"; rm -f "$W/g/$1.grant.sig"
+    if [ -n "$2" ]; then "$KG" --sign grant "$W/k/$2" "$W/g/$1.grant" > /dev/null; fi
+}
+GT="grant\nstep_up line $SL\nallow path exact $W/data/r.csv readonly\ncount 2\nuntil $U2\n"
+sgrant a ops "$GT"
+grep -q "^kind grant$" "$W/g/a.grant.sig" && grep -q "^key $KO$" "$W/g/a.grant.sig" \
+  && pass "varek_keygen --sign: a detached signature (varek-approval 1, kind, key, sig)" || flunk "--sign: $(cat "$W/g/a.grant.sig")"
+"$KG" --verify grant "$KO" "$W/g/a.grant" > /dev/null 2>&1 && pass "--verify: it holds under the signer's key" || flunk "--verify"
+! "$KG" --verify grant "$KS" "$W/g/a.grant" > /dev/null 2>&1 && ! "$KG" --verify plan "$KO" "$W/g/a.grant" > /dev/null 2>&1 \
+  && pass "... and not under another key, nor as another kind (plan)" || flunk "--verify accepts another key or kind"
+grun() { local pol="$1" out="$2"; shift 2; "$WARDEN" "$pol" "$@" > "$out.out" 2> "$out.log"; }
+grun "$W/s6.txt" "$W/s1" --grants "$W/g" -- /bin/bash "$W/bin/one.sh" "$W/data/r.csv" "$W/data/r.csv" "$W/data/r.csv"
+[ "$(grep -c 'r.csv: ok' "$W/s1.out")" = 2 ] && [ "$(grep -c 'r.csv: no' "$W/s1.out")" = 1 ] \
+  && pass "a standing grant (count 2) signed by an approver of its rule's group: two reads allowed from the start, the third refused" \
+  || flunk "standing grant: $(cat "$W/s1.out") / $(grep warden "$W/s1.log" | tail -2)"
+SGID="$(sha256sum "$W/g/a.grant" | cut -c1-64)"
+check "... recorded before any decision: standing, signed_by (its key, ops1, vk1420), sig, its text; no proposal" recs "$W/s1.log" \
+  "[r for r in rs if r.get('event') == 'grant' and r.get('standing') is True and r['id'] == '$SGID' and r['signed_by'] == {'key': '$KO', 'name': 'ops1', 'group': 'vk1420'} and len(r.get('sig', '')) > 16 and 'proposal' not in r and 'approver_uid' not in r] and next(k for k, r in enumerate(rs) if r.get('event') == 'grant') < next(k for k, r in enumerate(rs) if 'decision_final' in r)"
+check "... the two reads allowed under it (cert_grant, checked), the third a proposal" recs "$W/s1.log" \
+  "len([r for r in rs if r.get('cert_grant') == '$SGID' and r.get('decision_final') == 'ALLOW' and r.get('check') == 'ok']) == 2 and [r for r in rs if r.get('step_up') and r.get('decision_final') == 'DENY']"
+audit_ok "$W/s6.txt" "$W/s1.log" && pass "the audit passes it, the grant's signature verified" || flunk "audit s1: $(grep PROBLEM "$W/s1.log.audit" | head -2)"
+
+refuse_start() {   # refuse_start LABEL POLICY WORDS: a start with --grants $W/g refused, for its reason
+    "$WARDEN" "$2" --grants "$W/g" -- /bin/true > "$W/rf.out" 2>&1
+    if grep -q "refusing to start" "$W/rf.out" && grep -qF -- "$3" "$W/rf.out"; then pass "refused at start: $1"
+    else flunk "refused at start: $1: $(grep warden "$W/rf.out" | tail -2)"; fi
+}
+mv "$W/g" "$W/g1"; mkdir "$W/g"
+sgrant b "" "$GT";  refuse_start "an unsigned standing grant" "$W/s6.txt" "b.grant.sig: No such file"
+sgrant b sec "$GT"; refuse_start "a grant signed by an approver of another group" "$W/s6.txt" "signed by a key of group vk1420s, and its rule (line $SL) is approved by group vk1420"
+sgrant b odd "$GT"; refuse_start "a grant signed by a key the policy does not pin" "$W/s6.txt" "pins as no approver's"
+sgrant b ops "$GT"; sed -i 's/count 2/count 9/' "$W/g/b.grant"
+refuse_start "a grant changed after it was signed" "$W/s6.txt" "the signature does not verify"
+sgrant b ops "grant\nstep_up line $SL\nallow path exact $W/data/r.csv readonly\nfor run=0123456789abcdef0123456789abcdef\ncount 1\n"
+refuse_start "a signed grant naming a run" "$W/s6.txt" "a standing grant names no run"
+sgrant b ops "grant\nstep_up line $SL\nallow path exact $W/data/r.csv readonly\ncount 1\nuntil $UP\n"
+refuse_start "a signed grant whose until has passed" "$W/s6.txt" "its until has passed"
+sgrant b ops "$GT"; refuse_start "a signed grant under a rule that names no approvers=" "$W/s6n.txt" "names no approvers= group"
+rm -f "$W/g/b.grant" "$W/g/b.grant.sig"; rmdir "$W/g"; mv "$W/g1" "$W/g"
+"$WARDEN" "$W/s6.txt" --grants "$W/nogrants" -- /bin/true > "$W/rf.out" 2>&1
+grep -q "\-\-grants $W/nogrants" "$W/rf.out" && ! grep -q '"event":"run_start"' "$W/rf.out" && pass "refused at start: a --grants directory that cannot be read" || flunk "no grants dir: $(tail -2 "$W/rf.out")"
+
+sforge() {   # sforge LABEL LOG POLICY PYTHON WORDS [AUDIT ARGS...]: the audit fails the forged stream for its reason
+    local lab="$1" log="$2" pol="$3" py="$4" words="$5"; shift 5
+    (cd "$HERE/tests" && python3 v1270_forge.py "$log" "$W/f.log" "$py") > /dev/null 2>&1
+    if python3 "$HERE/tools/varek_audit.py" --policy "$pol" --checker "$CERT" "$@" "$W/f.log" > "$W/f.out" 2>&1; then
+        flunk "forged: $lab (the audit passed it)"
+    elif grep -qF -- "$words" "$W/f.out"; then pass "forged: $lab"
+    else flunk "forged: $lab (not for its own reason: $(grep '^  PROBLEM' "$W/f.out" | head -2 | tr '\n' ' '))"; fi
+}
+SG="[r for r in recs if isinstance(r, dict) and r.get('event') == 'grant'][0]"
+sforge "a standing grant's signature altered" "$W/s1.log" "$W/s6.txt" "$SG['sig'] = $SG['sig'][:-6] + ('000000' if $SG['sig'][-6:] != '000000' else '111111')" "its signature does not verify over its text"
+sforge "a standing grant's signer swapped for a key the policy does not pin" "$W/s1.log" "$W/s6.txt" "$SG['signed_by']['key'] = '$KA'" "signed by a key the policy does not pin"
+sforge "a standing grant's signer named of another group" "$W/s1.log" "$W/s6.txt" "$SG['signed_by']['group'] = 'vk1420s'" "names its signer"
+sforge "a standing grant's signature dropped" "$W/s1.log" "$W/s6.txt" "$SG.pop('sig'); $SG.pop('signed_by')" "standing grant $(cut -c1-16 <<<"$SGID"): no signature"
+sforge "a standing grant signed by the other group's approver" "$W/s1.log" "$W/s6.txt" "$SG['signed_by'] = {'key': '$KS', 'name': 'sec1', 'group': 'vk1420s'}" "line $SL's approvers are 'vk1420'"
+
+# plans: varek plan approve, and --require-approved-plan
+printf "plan 1.35\naction r1 file_open /usr/ open=read\naction r2 file_open /lib/ open=read\naction r3 file_open /lib64/ open=read\naction r4 file_open /etc/ open=read\naction r5 file_open $W/bin/ open=read\naction r6 file_open $W/data/ open=read\n" > "$W/ap.plan"
+printf "${BASE}${AP}allow path $W/data/ readonly\n" > "$W/s6p.txt"
+python3 "$HERE/tools/varek" plan approve "$W/ap.plan" --key "$W/k/sec" > "$W/pa.out" 2>&1
+grep -q "^kind plan$" "$W/ap.plan.sig" 2>/dev/null && pass "varek plan approve signs the plan (PLAN.sig, kind plan)" || flunk "plan approve: $(cat "$W/pa.out")"
+grun "$W/s6p.txt" "$W/pl1" --plan "$W/ap.plan" --require-approved-plan -- /bin/bash "$W/bin/one.sh" "$W/data/r.csv"
+grep -q "r.csv: ok a,b" "$W/pl1.out" && grep -q "the plan is approved by sec1 (group vk1420s)" "$W/pl1.log" \
+  && pass "--require-approved-plan: a plan an approver signed runs" || flunk "approved plan: $(cat "$W/pl1.out") / $(grep warden "$W/pl1.log" | tail -2)"
+check "... run_start's plan_approved_by: sec1's key and group, the signature, the plan's SHA-256" recs "$W/pl1.log" \
+  "[r for r in rs if r.get('event') == 'run_start' and r['plan_approved_by']['key'] == '$KS' and r['plan_approved_by']['name'] == 'sec1' and r['plan_approved_by']['group'] == 'vk1420s' and r['plan_approved_by']['plan_sha256'] == '$(sha256sum "$W/ap.plan" | cut -c1-64)' and len(r['plan_approved_by']['sig']) > 16]"
+python3 "$HERE/tools/varek_audit.py" --policy "$W/s6p.txt" --checker "$CERT" --plan "$W/ap.plan" "$W/pl1.log" > "$W/pl1.audit" 2>&1 \
+  && pass "the audit passes it with --plan, the signature verified over the plan's bytes" || flunk "audit pl1: $(grep PROBLEM "$W/pl1.audit" | head -2)"
+audit_ok "$W/s6p.txt" "$W/pl1.log" && grep -q "note: plan approval: not verified: give --plan" "$W/pl1.log.audit" \
+  && pass "... without --plan it passes, and says the signature could not be verified" || flunk "audit pl1 without --plan: $(grep 'PROBLEM\|note' "$W/pl1.log.audit" | head -2)"
+cp "$W/ap.plan" "$W/up.plan"
+grun "$W/s6p.txt" "$W/pl2" --plan "$W/up.plan" --require-approved-plan -- /bin/bash "$W/bin/one.sh" "$W/data/r.csv"
+grep -q "has no approval" "$W/pl2.log" && ! grep -q '"event":"run_start"' "$W/pl2.log" && pass "an unapproved plan is refused at start" || flunk "unapproved plan: $(tail -2 "$W/pl2.log")"
+cp "$W/ap.plan" "$W/tp.plan"; cp "$W/ap.plan.sig" "$W/tp.plan.sig"; echo "action r7 file_open /usr/lib/ open=read" >> "$W/tp.plan"
+grun "$W/s6p.txt" "$W/pl3" --plan "$W/tp.plan" --require-approved-plan -- /bin/bash "$W/bin/one.sh" "$W/data/r.csv"
+grep -q "approval $W/tp.plan.sig fails: the signature does not verify" "$W/pl3.log" && ! grep -q '"event":"run_start"' "$W/pl3.log" \
+  && pass "a plan changed after it was approved is refused at start" || flunk "tampered plan: $(tail -2 "$W/pl3.log")"
+"$KG" --sign plan "$W/k/odd" "$W/up.plan" > /dev/null
+grun "$W/s6p.txt" "$W/pl4" --plan "$W/up.plan" --require-approved-plan -- /bin/bash "$W/bin/one.sh" "$W/data/r.csv"
+grep -q "pins as no approver's" "$W/pl4.log" && ! grep -q '"event":"run_start"' "$W/pl4.log" && pass "a plan signed by a key the policy does not pin is refused at start" || flunk "unpinned plan: $(tail -2 "$W/pl4.log")"
+grun "$W/s6p.txt" "$W/pl5" --plan "$W/tp.plan" -- /bin/bash "$W/bin/one.sh" "$W/data/r.csv"
+grep -q "r.csv: ok a,b" "$W/pl5.out" && recs "$W/pl5.log" "[r for r in rs if r.get('event') == 'run_start' and 'plan_approved_by' not in r and 'does not verify' in r.get('plan_approval_note', '')]" \
+  && pass "without the flag, a plan whose approval fails runs unapproved, with a note in run_start" || flunk "without the flag: $(cat "$W/pl5.out") / $(grep warden "$W/pl5.log" | tail -2)"
+PA="[r for r in recs if isinstance(r, dict) and r.get('event') == 'run_start'][0]['plan_approved_by']"
+sforge "the plan approval's signature altered" "$W/pl1.log" "$W/s6p.txt" "$PA['sig'] = $PA['sig'][:-6] + ('000000' if $PA['sig'][-6:] != '000000' else '111111')" "the plan's approval signature does not verify" --plan "$W/ap.plan"
+sforge "the plan approval's key swapped for one the policy does not pin" "$W/pl1.log" "$W/s6p.txt" "$PA['key'] = '$KA'" "signed by a key the policy does not pin"
+sforge "the plan approval's signer renamed" "$W/pl1.log" "$W/s6p.txt" "$PA['name'] = 'ops1'" "names its signer"
+
+# runtime grants signed at the approvers' socket (varek approve --sign-key)
+AU=4243; AG="$GG"
+start "$W/s6.txt" "$W/s2" 40
+ID6="$(wait_prop)"
+[ -n "$ID6" ] && pass "under the same rule with no standing grant, a read proposes a grant ($ID6)" || flunk "no proposal (s2)"
+apv "$AU" "$AG" pending | python3 -c 'import json,sys
+for l in sys.stdin:
+    if l.startswith("{") and json.loads(l)["id"] == sys.argv[1]: open(sys.argv[2], "w").write(json.loads(l)["proposal"])' "$ID6" "$W/pt.txt"
+cp "$W/pt.txt" "$W/pt2.txt"; echo "#" >> "$W/pt2.txt"
+"$KG" --sign grant "$W/k/sec" "$W/pt.txt" > /dev/null; "$KG" --sign grant "$W/k/ops" "$W/pt2.txt" > /dev/null
+o="$(apv "$AU" "$AG" "approve $ID6\nsig $(sed -n 's/^sig //p' "$W/pt.txt.sig") key $KS\n$(cat "$W/pt.txt")\n")"
+grep -q "refused: signed by a key of group vk1420s; the rule is approved by group vk1420" <<<"$o" \
+  && pass "an approval signed by the other group's approver is refused" || flunk "wrong group's signature: $o"
+o="$(apv "$AU" "$AG" "approve $ID6\nsig $(sed -n 's/^sig //p' "$W/pt2.txt.sig") key $KO\n$(cat "$W/pt.txt")\n")"
+grep -q "refused: the signature does not verify" <<<"$o" && pass "... and one whose signature is over other text" || flunk "bad signature: $o"
+cp "$W/k/ops" "$W/k43/ops"; chown -R 4243 "$W/k43"; chmod 700 "$W/k43"; chmod 600 "$W/k43/ops"
+o="$(cd "$W/k43" && setpriv --reuid=4243 --regid="$GG" --clear-groups env HOME="$W/k43" python3 "$HERE/tools/varek" approve "$RUN" "$ID6" --sign-key "$W/k43/ops" --reason signed 2>&1)"
+grep -q "approved [0-9a-f]\{64\}" <<<"$o" && pass "varek approve --sign-key, by a member of the rule's group with ops1's key: approved" || flunk "approve --sign-key: $o"
+for k in $(seq 1 40); do grep -q ' ok$' "$W/s2.out" && break; sleep 0.25; done
+grep -q ' ok$' "$W/s2.out" && pass "... the agent's next read is allowed" || flunk "no read after the signed approval: $(tail -2 "$W/s2.out")"
+wait "$WPID"
+check "... its grant record: approver_uid 4243, signed_by ops1 (vk1420), the signature" recs "$W/s2.log" \
+  "[r for r in rs if r.get('event') == 'grant' and r.get('proposal') == '$ID6' and r['approver_uid'] == 4243 and r['signed_by'] == {'key': '$KO', 'name': 'ops1', 'group': 'vk1420'} and len(r.get('sig', '')) > 16 and r.get('reason') == 'signed']"
+audit_ok "$W/s6.txt" "$W/s2.log" && pass "the audit passes it, the signature verified" || flunk "audit s2: $(grep PROBLEM "$W/s2.log.audit" | head -2)"
+RG="[r for r in recs if isinstance(r, dict) and r.get('event') == 'grant' and 'signed_by' in r][0]"
+sforge "a signed runtime grant's signature altered" "$W/s2.log" "$W/s6.txt" "$RG['sig'] = $RG['sig'][:-6] + ('000000' if $RG['sig'][-6:] != '000000' else '111111')" "its signature does not verify over its text"
+sforge "a signed runtime grant's signer swapped for a key the policy does not pin" "$W/s2.log" "$W/s6.txt" "$RG['signed_by']['key'] = '$KA'" "signed by a key the policy does not pin"
 
 fi
 
