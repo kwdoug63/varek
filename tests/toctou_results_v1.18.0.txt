@@ -16,4 +16,7 @@ mitigated (resolve, decide, inject the descriptor):
 
 The leak count depends on the host's scheduling; what is stable is that the
 naive supervisor leaks and the mitigated one does not. The "510 leaks in 20,000
-attempts" quoted through v1.17.0 has no recorded run in the repository.
+attempts" quoted through v1.17.0 had no record in the repository when this was
+written. It was measured: one run in GitHub Codespaces for v1.9.1, whose output
+was kept only in the build session; it is committed as
+tests/toctou_results_v1.9.1.txt (2026-09-30).
