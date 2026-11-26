@@ -589,6 +589,13 @@ static int policy_load(const char *path, struct policy *p) {
                 "`on unknown` line differently; refusing to start\n", path);
         return -1;
     }
+    /* v1.42 step 5b: and the `on outside_plan` line */
+    if (p->v.op_line != p->c.op_line || p->v.op_timeout != p->c.op_timeout ||
+        p->v.op_scope != (uint8_t)p->c.op_scope || strcmp(p->v.op_approvers, p->c.op_approvers)) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read the "
+                "`on outside_plan` line differently; refusing to start\n", path);
+        return -1;
+    }
     /* v1.26: and the proxy directives */
     bool proxy_same = p->v.proxy == (p->c.proxy != 0) && p->v.proxy_nports == p->c.proxy_nports;
     for (size_t k = 0; proxy_same && k < p->v.proxy_nports; k++)
@@ -2159,9 +2166,13 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
 /* v1.35 step 4c: a plan read already (parsed, or NULL with err): under the
  * node agent it is read in the node's view and decided in the container's
  * (node_supervise); it is freed here */
+static plan_decision_t g_plan_last_pd;   /* v1.42 step 5b: the last plan gate's verdict (an extension's) */
+static size_t g_plan_last_n;             /* ... and its steps */
 static int warden_verify_plan_parsed(plan_parsed_t *parsed, const char *err, const char *plan_path,
                                      const struct policy *policy, bool records)
 {
+    g_plan_last_pd = PLAN_DEC_UNKNOWN;
+    g_plan_last_n = 0;
     if (!parsed) {
         fprintf(stderr, "[warden] plan load failed: %s\n", err);
         if (records) emit_plan_gate_basic(plan_path, 0, 0, PLAN_DEC_UNKNOWN, err, NULL);
@@ -2187,6 +2198,8 @@ static int warden_verify_plan_parsed(plan_parsed_t *parsed, const char *err, con
     /* v1.21.1: read the count before the plan is freed (spec points into it;
      * through v1.21.0 it was read after plan_parser_free). */
     size_t n_actions = spec->n_actions, n_edges = spec->n_edges;
+    g_plan_last_pd = pd;
+    g_plan_last_n = n_actions;
     pathology_sink_free(sink);
     plan_parser_free(parsed);
     char why[32] = "";
@@ -7180,7 +7193,14 @@ int main(int argc, char **argv) {
         g_hold_collect = false;
         g_hold_on = true;
         fprintf(stderr, "[warden] the run is held to its plan: %zu entries; a call the policy allows "
-                "outside them is refused (outside_plan)\n", g_nhold);
+                "outside them is %s\n", g_nhold,
+                p.v.op_line ? "deferred until a plan extension covers it (on outside_plan defer)" : "refused (outside_plan)");
+        if (p.v.op_line && g_flow_cfg)
+            fprintf(stderr, "[warden] note: a plan extension (varek plan extend) is decided by the basic plan "
+                    "gate; the flow policy (--flow-policy) is not consulted for it\n");
+    } else if (p.v.op_line && !g_nr.on) {
+        fprintf(stderr, "[warden] note: `on outside_plan defer` (policy line %d) holds nothing: the run is not "
+                "held to a plan (--plan PLAN --hold-to-plan)\n", p.v.op_line);
     }
 
     struct sigaction sa = { .sa_handler = on_term };

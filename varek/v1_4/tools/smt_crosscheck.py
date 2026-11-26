@@ -680,7 +680,7 @@ def parse_lines(raw_lines, path):
     issuers, spiffe, require_obo = [], [], False   # v1.28.1
     require_plan = False                           # v1.35 step 4
     max_seen = set()                               # v1.42: max_held, max_pending
-    unknown_seen = [False]                         # v1.42 step 5: an `on unknown` line
+    unknown_seen = [False, False]                  # v1.42 step 5 (5b): an `on unknown` (`on outside_plan`) line
     if True:
         for lineno, raw in enumerate(raw_lines, 1):
             if b"\0" in raw:
@@ -709,11 +709,14 @@ def parse_lines(raw_lines, path):
                     raise PolicyError(f"{path}:{lineno}: bad require plan")
                 require_plan = True
                 continue
-            if toks[0] == "on" and len(toks) >= 2 and toks[1] == "unknown":
-                # v1.42 step 5: on unknown deny | on unknown defer escalate [timeout=] [scope=] [approvers=]
-                if req < (1, 42) or unknown_seen[0]:
+            if toks[0] == "on" and len(toks) >= 2 and toks[1] in ("unknown", "outside_plan"):
+                # v1.42 step 5: on unknown deny | on unknown defer escalate [timeout=] [scope=] [approvers=];
+                # v1.42 step 5b: on outside_plan deny | on outside_plan defer [...] (escalate refused)
+                op = toks[1] == "outside_plan"
+                slot = 1 if op else 0
+                if req < (1, 42) or unknown_seen[slot]:
                     raise PolicyError(f"{path}:{lineno}: bad on unknown")
-                unknown_seen[0] = True
+                unknown_seen[slot] = True
                 if toks[2:] == ["deny"]:
                     continue
                 if len(toks) < 3 or toks[2] != "defer":
@@ -729,8 +732,10 @@ def parse_lines(raw_lines, path):
                     if not ok:
                         raise PolicyError(f"{path}:{lineno}: bad on unknown option")
                     seen_o.add(k)
-                if "escalate" not in seen_o:
+                if not op and "escalate" not in seen_o:
                     raise PolicyError(f"{path}:{lineno}: on unknown defer without escalate")
+                if op and "escalate" in seen_o:
+                    raise PolicyError(f"{path}:{lineno}: escalate on on outside_plan")
                 continue
             if toks[0] in ("max_held", "max_pending"):
                 # v1.42: max_held N, max_pending N (1 to 1024, each once)
@@ -2062,6 +2067,14 @@ def fuzz_policy(rng, path, v142=False):
                                     ([] if valid else ["on unknown defer", "on unknown allow",
                                                        "on unknown defer escalate until=/m",
                                                        "on unknown deny\non unknown deny"])))
+        if rng.random() < 0.2:
+            # v1.42 step 5b: the `on outside_plan` line, valid and not
+            lines.append(rng.choice(["on outside_plan deny", "on outside_plan defer",
+                                     "on outside_plan defer timeout=4 scope=thread approvers=ops"] +
+                                    ([] if valid else ["on outside_plan defer escalate", "on outside_plan allow",
+                                                       "on outside_plan defer escalate=1",
+                                                       "on outside_plan defer until=/m",
+                                                       "on outside_plan deny\non outside_plan defer"])))
     elif rng.random() < 0.3:
         lines.append(rng.choice(["require warden 1.14", "require warden 1.13", "require warden 01.14",
                                  "require warden 1.15", "require warden 1.16", "require warden 1.21",

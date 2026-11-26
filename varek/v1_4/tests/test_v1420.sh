@@ -93,6 +93,17 @@
 #      allow before its ending, a timed-out refusal dropped, an
 #      escalation's proposal dropped).
 #
+# Step 5b, on outside_plan defer (section 10, as root):
+#  10. Under --hold-to-plan with `on outside_plan defer`, a read the policy
+#      allows but the plan does not cover is held; pending lists it with a
+#      one-step extension; the agent's own user and another user may not
+#      extend; root sends the suggestion back as it is and the plan gate
+#      authorizes it: the read is decided again and allowed, the records in
+#      order and the audit passing, which refuses a resolved ending naming an
+#      extension never recorded or one the gate did not authorize. An
+#      extension with a step the policy refuses adds nothing, and the call is
+#      refused at its timeout. Without --hold-to-plan the line is inert.
+#
 # Usage: sudo ./test_v1420.sh   (from varek/v1_4, after `make warden tools/vdp_check tools/vdp_cert_check`;
 #        sections 1 to 4 need no root, and run without it)
 set -u
@@ -160,6 +171,15 @@ refused "on unknown allow"                  'require warden 1.42\non unknown all
 refused "on unknown twice"                  'require warden 1.42\non unknown deny\non unknown deny\n'  "given twice"
 refused "on unknown before 1.42"            'require warden 1.35\non unknown deny\n'                     "needs \`require warden 1.42\`"
 refused "until= on the on unknown line"     'require warden 1.42\non unknown defer escalate until=/m\n'
+# v1.42 step 5b: the on outside_plan line (escalate refused: a plan extension resolves it)
+accepted "on outside_plan deny" 'require warden 1.42\non outside_plan deny\nallow path /tmp/\n'
+accepted "on outside_plan defer, with its options" 'require warden 1.42\non outside_plan defer timeout=30 scope=thread approvers=ops\nallow path /tmp/\n'
+refused "escalate on the on outside_plan line"   'require warden 1.42\non outside_plan defer escalate\n'   "resolved by a plan extension"
+refused "escalate=1 on the on outside_plan line" 'require warden 1.42\non outside_plan defer escalate=1\n'
+refused "until= on the on outside_plan line"     'require warden 1.42\non outside_plan defer until=/m\n'
+refused "on outside_plan allow"                  'require warden 1.42\non outside_plan allow\n'
+refused "on outside_plan twice"                  'require warden 1.42\non outside_plan deny\non outside_plan defer\n'  "given twice"
+refused "on outside_plan before 1.42"            'require warden 1.35\non outside_plan deny\n'
 printf 'require warden 1.42\nallow path /tmp/\nstep_up path /srv/data/ mode=hold timeout=60 approvers=ops notify=https://h.example/x\nstep_up path /srv/data/x\n' > "$T/w.txt"
 o="$("$WARDEN" "$T/w.txt" --check-startup 2>&1)"
 grep -q "read this rule differently" <<<"$o" && flunk "the Warden's two parsers disagree on a step_up rule: $o" \
@@ -832,6 +852,62 @@ else
     wait "$WPID"
 fi
 rm -f "$W/m/ok"
+
+echo "== 10. step 5b: on outside_plan defer, varek plan extend (as root) =="
+# the run held to a plan that covers what bash reads, not the data
+printf "plan 1.35\naction r1 file_open /usr/ open=read\naction r2 file_open /lib/ open=read\naction r3 file_open /lib64/ open=read\naction r4 file_open /etc/ open=read\naction r5 file_open $W/bin/ open=read\n" > "$W/hp.plan"
+pstart() {   # pstart POLICY OUT SCRIPT ARGS...: as dstart, held to $W/hp.plan
+    local pol="$1" out="$2" scr="$3"; shift 3
+    "$WARDEN" "$pol" --plan "$W/hp.plan" --hold-to-plan -- /bin/bash "$W/bin/$scr" "$@" > "$out.out" 2> "$out.log" &
+    WPID=$!
+    RUN=""; local k
+    for k in $(seq 1 40); do
+        RUN="$(grep -o '"event":"run_start","run":"[0-9a-f]*"' "$out.log" 2>/dev/null | head -1 | sed 's/.*"run":"//; s/"$//')"
+        [ -n "$RUN" ] && break
+        sleep 0.25
+    done
+    SOCK="$(grep -o '/run/varek-approve/[0-9a-f]*\.sock' "$out.log" 2>/dev/null | head -1)"
+}
+printf "${BASE}allow path $W/data/ readonly\non outside_plan defer timeout=20 scope=thread\n" > "$W/o1.txt"
+pstart "$W/o1.txt" "$W/o1" one.sh "$W/data/r.csv"
+wait_ev "$W/o1.log" defer && sleep 0.5
+[ ! -s "$W/o1.out" ] && grep -q '"outside_plan":true' "$W/o1.log" && pass "a read the policy allows but the plan does not cover is deferred: held, a defer record (outside_plan)" \
+    || flunk "no outside_plan deferral: $(cat "$W/o1.out") / $(tail -3 "$W/o1.log")"
+o="$(apv 0 0 pending)"
+EXT="$(python3 -c 'import json,sys
+for l in sys.stdin:
+    if l.startswith("{") and json.loads(l).get("defer") == "outside_plan": print(json.loads(l)["extension"], end="")' <<<"$o")"
+grep -q "action ext1 file_open $W/data/r.csv open=read" <<<"$EXT" && pass "pending lists it, with a one-step extension that covers it" || flunk "pending: $o"
+o="$(apv 65534 65534 "extend\n$EXT")"
+grep -q "^refused" <<<"$o" && pass "the agent's own user may not extend the plan" || flunk "agent extend: $o"
+o="$(apv 4242 4242 "extend\n$EXT")"
+grep -q "^refused" <<<"$o" && pass "nor another user, where the line names no approvers= (root alone)" || flunk "outsider extend: $o"
+o="$(apv 0 0 "extend\n$EXT")"
+grep -q "^extended [0-9a-f]\{64\}" <<<"$o" && pass "root sends the suggested extension back as it is: the plan gate authorizes it" || flunk "extend: $o"
+wait "$WPID"
+grep -q "r.csv: ok a,b" "$W/o1.out" && pass "... and the held read is decided again and allowed" || flunk "after the extension: $(cat "$W/o1.out")"
+check "... records in order: defer (outside_plan), plan_extended (SATISFIED), defer_end resolved (the extension), the read allowed" recs "$W/o1.log" \
+  "(lambda i: i[0] < i[1] < i[2] < i[3])([next(k for k, r in enumerate(rs) if c(r)) for c in (lambda r: r.get('event') == 'defer' and r.get('outside_plan') is True, lambda r: r.get('event') == 'plan_extended' and r.get('verdict') == 'SATISFIED' and r.get('entries') == 1 and r.get('approver_uid') == 0, lambda r: r.get('event') == 'defer_end' and r.get('ending') == 'resolved' and len(r.get('plan_extension', '')) == 64, lambda r: r.get('resolved') == '$W/data/r.csv' and r.get('decision_final') == 'ALLOW' and r.get('defer'))])"
+audit_ok "$W/o1.txt" "$W/o1.log" && pass "the audit passes the run" || flunk "audit o1: $(grep PROBLEM "$W/o1.log.audit" | head -2)"
+cp "$W/o1.log" "$W/r1.log"; cp "$W/o1.txt" "$W/p1.txt"
+qforge "a resolved ending naming an extension never recorded" "[r.__setitem__('plan_extension', 'f' * 64) for r in recs if isinstance(r, dict) and r.get('event') == 'defer_end']" "no plan_extended record before it holds"
+qforge "an extension the gate did not authorize, then a resolved ending" "[r.__setitem__('verdict', 'UNSATISFIED') for r in recs if isinstance(r, dict) and r.get('event') == 'plan_extended']" "did not authorize"
+
+printf "${BASE}allow path $W/data/ readonly\non outside_plan defer timeout=3 scope=thread\n" > "$W/o2.txt"
+pstart "$W/o2.txt" "$W/o2" one.sh "$W/data/r.csv"
+wait_ev "$W/o2.log" defer && sleep 0.3
+o="$(apv 0 0 "extend\nplan 1.35\naction x1 file_open /root/.ssh/id_rsa open=read\n")"
+grep -q "^refused" <<<"$o" && pass "an extension with a step the policy refuses is refused by the plan gate" || flunk "refused extension: $o"
+wait "$WPID"
+grep -q "r.csv: no" "$W/o2.out" && pass "... it adds nothing: the call stays held, and is refused at its timeout" || flunk "after a refused extension: $(cat "$W/o2.out")"
+check "... plan_extended (not SATISFIED, no entries), then the refusal (held) before defer_end timeout" recs "$W/o2.log" \
+  "(lambda i: i[0] < i[1] < i[2])([next(k for k, r in enumerate(rs) if c(r)) for c in (lambda r: r.get('event') == 'plan_extended' and r.get('verdict') != 'SATISFIED' and r.get('entries') == 0, lambda r: r.get('held') is True and r.get('decision_final') == 'DENY' and r.get('rule') == 'outside_plan', lambda r: r.get('event') == 'defer_end' and r.get('ending') == 'timeout')])"
+audit_ok "$W/o2.txt" "$W/o2.log" && pass "the audit passes it" || flunk "audit o2: $(grep PROBLEM "$W/o2.log.audit" | head -2)"
+
+dstart "$W/o1.txt" "$W/o3" one.sh "$W/data/r.csv"
+wait "$WPID"
+grep -q "r.csv: ok a,b" "$W/o3.out" && grep -q "holds nothing: the run is not held to a plan" "$W/o3.log" && pass "without --hold-to-plan the line is inert (a note), the read allowed" \
+    || flunk "inert: $(cat "$W/o3.out") / $(grep -c 'holds nothing' "$W/o3.log")"
 
 fi
 

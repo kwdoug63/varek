@@ -1306,6 +1306,7 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
     int req_maj = 0, req_min = 0;
     int legacy_name = 0;              /* v1.24: line of a host name read before `require warden 1.24` */
     bool unk_seen = false;            /* v1.42 step 5: an `on unknown` line */
+    bool op_seen = false;             /* v1.42 step 5b: an `on outside_plan` line */
     size_t glob_total = 0;
     int ln = 0;
     size_t pos = 0;
@@ -1402,22 +1403,30 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
                     }
                 } else
                     rc = fail(err, en, name, ln, "bad proxy directive");
-            } else if (!strcmp(tok[0], "on") && nt >= 2 && !strcmp(tok[1], "unknown")) {
-                /* v1.42 step 5: on unknown deny | on unknown defer escalate [timeout=] [scope=] [approvers=] */
-                if (!ver_ge(req_maj, req_min, 1, 42)) rc = fail(err, en, name, ln, "on unknown before 1.42");
-                else if (p->unk_line || unk_seen) rc = fail(err, en, name, ln, "on unknown twice");
-                else if (nt == 3 && !strcmp(tok[2], "deny")) unk_seen = true;
-                else if (nt < 3 || strcmp(tok[2], "defer")) rc = fail(err, en, name, ln, "bad on unknown");
+            } else if (!strcmp(tok[0], "on") && nt >= 2 && (!strcmp(tok[1], "unknown") || !strcmp(tok[1], "outside_plan"))) {
+                /* v1.42 step 5: on unknown deny | on unknown defer escalate [timeout=] [scope=] [approvers=];
+                 * v1.42 step 5b: on outside_plan deny | on outside_plan defer [timeout=] [scope=] [approvers=]
+                 * (no escalate: a plan extension resolves it) */
+                bool op = tok[1][0] == 'o';
+                int *line = op ? &p->op_line : &p->unk_line;
+                bool *seenl = op ? &op_seen : &unk_seen;
+                uint32_t *tmo = op ? &p->op_timeout : &p->unk_timeout;
+                int *scope = op ? &p->op_scope : &p->unk_scope;
+                char *apv = op ? p->op_approvers : p->unk_approvers;
+                if (!ver_ge(req_maj, req_min, 1, 42)) rc = fail(err, en, name, ln, "on unknown/outside_plan before 1.42");
+                else if (*line || *seenl) rc = fail(err, en, name, ln, "on unknown/outside_plan twice");
+                else if (nt == 3 && !strcmp(tok[2], "deny")) *seenl = true;
+                else if (nt < 3 || strcmp(tok[2], "defer")) rc = fail(err, en, name, ln, "bad on unknown/outside_plan");
                 else {
-                    unk_seen = true;
+                    *seenl = true;
                     int seen = 0;
                     bool esc = false;
-                    p->unk_scope = 1;
+                    *scope = 1;
                     for (int i = 3; rc == 0 && i < nt; i++) {
                         const char *o = tok[i], *v = strchr(o, '=');
                         int k = !strncmp(o, "approvers=", 10) ? 2 : !strncmp(o, "timeout=", 8) ? 4
                               : !strncmp(o, "scope=", 6) ? 8 : !strcmp(o, "escalate") ? 64 : 0;
-                        if (!k || (seen & k)) { rc = fail(err, en, name, ln, "bad on unknown option"); break; }
+                        if (!k || (seen & k)) { rc = fail(err, en, name, ln, "bad on unknown/outside_plan option"); break; }
                         seen |= k;
                         if (k == 64) { esc = true; continue; }
                         v++;
@@ -1428,20 +1437,21 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
                                 ok = islower((unsigned char)v[j]) || isdigit((unsigned char)v[j]) || v[j] == '_' ||
                                      v[j] == '-' || (v[j] == '$' && j + 1 == vl);
                             if (!ok) rc = fail(err, en, name, ln, "bad approvers=");
-                            else memcpy(p->unk_approvers, v, vl + 1);
+                            else memcpy(apv, v, vl + 1);
                         } else if (k == 4) {
                             uint32_t x = 0;
                             bool ok = vl >= 1 && vl <= 4 && v[0] != '0';
                             for (size_t j = 0; ok && j < vl; j++) { ok = isdigit((unsigned char)v[j]); x = x * 10 + (uint32_t)(v[j] - '0'); }
                             if (!ok || x < 1 || x > 3600) rc = fail(err, en, name, ln, "bad timeout=");
-                            else p->unk_timeout = x;
+                            else *tmo = x;
                         } else {
                             if (strcmp(v, "thread") && strcmp(v, "run")) rc = fail(err, en, name, ln, "bad scope=");
-                            else p->unk_scope = v[0] == 'r';
+                            else *scope = v[0] == 'r';
                         }
                     }
-                    if (rc == 0 && !esc) rc = fail(err, en, name, ln, "on unknown defer without escalate");
-                    if (rc == 0) p->unk_line = ln;
+                    if (rc == 0 && !op && !esc) rc = fail(err, en, name, ln, "on unknown defer without escalate");
+                    if (rc == 0 && op && esc) rc = fail(err, en, name, ln, "escalate on on outside_plan");
+                    if (rc == 0) *line = ln;
                 }
             } else if (!strcmp(tok[0], "max_held") || !strcmp(tok[0], "max_pending")) {
                 /* v1.42 */

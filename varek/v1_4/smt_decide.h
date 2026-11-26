@@ -354,6 +354,15 @@ typedef struct {
     uint32_t     unk_timeout;
     uint8_t      unk_scope;
     char         unk_approvers[33];
+    /* v1.42 step 5b: `on outside_plan defer [timeout=N] [scope=thread|run]
+     * [approvers=GROUP]` (op_line its line; 0: `on outside_plan deny`, the
+     * default): under --hold-to-plan, a call the policy allows but no plan
+     * step covers is held until a plan extension covers it. Not part of any
+     * decision. */
+    int          op_line;
+    uint32_t     op_timeout;
+    uint8_t      op_scope;
+    char         op_approvers[33];
     /* v1.31: the confined subjects (subject k is subjects[k - 1]) and the
      * MCP resources trusted for the user's token */
     vdp_subject_t subjects[VDP_MAX_SUBJECTS];
