@@ -1822,14 +1822,16 @@ aforge "R5: tampering with a receipt fails its verification (the approval's appr
 aforge "R5: ... and with a deferral's (its resolution changed to a timeout)" \
   "[r.__setitem__('ending', 'timeout') for r in recs if isinstance(r, dict) and r.get('event') == 'defer_end' and r.get('ending') == 'resolved']"
 
-# R4: STEP_UP or DEFER timing out gives DENY
+# R4: STEP_UP or DEFER timing out gives DENY. Each hold and deferral ends timeout, each one's
+# read refused: bash on some distributions (Amazon Linux 2023, Rocky 9) opens a file again
+# after the refusal, a second hold or deferral of its own, so they are counted, not fixed at 2
 printf "${BASE}step_up path $W/data/ mode=hold timeout=2\ndefer path $W/dd/ until=$W/m/ok timeout=2 scope=thread\n" > "$W/a2.txt"
 rm -f "$W/m/ok"
 AFLAGS=()
 astart "$W/a2.txt" "$W/a2" aarm.sh "$W/data/r.csv" "$W/dd/x.csv"
 wait "$WPID"
 grep -q "r.csv: no" "$W/a2.out" && grep -q "x.csv: no" "$W/a2.out" && \
-  recs "$W/a2.log" "[r for r in rs if r.get('event') == 'step_up_end' and r['ending'] == 'timeout'] and [r for r in rs if r.get('event') == 'defer_end' and r['ending'] == 'timeout'] and len([r for r in rs if r.get('held') is True and r.get('decision_final') == 'DENY']) == 2" \
+  recs "$W/a2.log" "(lambda ends, hd: ends and {e['event'] for e in ends} == {'step_up_end', 'defer_end'} and all(e['ending'] == 'timeout' for e in ends) and {r['resolved'] for r in hd} == {'$W/data/r.csv', '$W/dd/x.csv'} and len(hd) == len(ends))([r for r in rs if r.get('event') in ('step_up_end', 'defer_end')], [r for r in rs if r.get('held') is True and r.get('decision_final') == 'DENY'])" \
   && pass "R4: STEP_UP and DEFER timing out give DENY (each held read refused at its timeout, its ending timeout)" \
   || { adump "$W/a2.log"; flunk "aarm timeouts: $(cat "$W/a2.out" | tr '\n' ' ')(its stream above, INFO)"; }
 audit_ok "$W/a2.txt" "$W/a2.log" && pass "... the audit passes it" || flunk "audit a2: $(grep PROBLEM "$W/a2.log.audit" | head -2)"
