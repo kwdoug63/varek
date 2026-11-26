@@ -1653,11 +1653,38 @@ astart() {   # astart POLICY OUT SCRIPT ARGS... (the Warden's flags in AFLAGS): 
     done
     RUN="$(basename "$SOCK" .sock)"
 }
+# aprop FILE: as prop_for, the open proposal naming FILE, denying on the way any other: a call
+# of bash's own that no rule names, escalated by the on unknown line (its directories, on
+# some distributions, as in section 5), is answered at once rather than held to its timeout
+aprop() {
+    local k o id ln
+    for k in $(seq 1 60); do
+        o="$(apv 0 0 pending)"
+        while read -r ln; do
+            case "$ln" in "{"*) ;; *) continue ;; esac
+            id="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("id", ""))' "$ln" 2>/dev/null)"
+            [ -n "$id" ] || continue
+            if grep -qF "$1" <<<"$ln"; then echo "$id"; return 0; fi
+            echo "$ln" >> "$W/aprop.denied"; apv 0 0 "deny $id" > /dev/null
+        done <<<"$o"
+        sleep 0.25
+    done
+    return 1
+}
+# asum LOG: the run's holds, deferrals and refusals in brief, for a failure's message
+asum() {
+    python3 -c 'import json,sys
+for l in open(sys.argv[1]):
+    if not l.startswith("{"): continue
+    r = json.loads(l)
+    if r.get("event") in ("step_up", "step_up_end", "defer", "defer_end") or r.get("held") or r.get("unheld") or r.get("decision_final") == "DENY":
+        print({k: r.get(k) for k in ("event", "resolved", "decision_final", "held", "unheld", "unknown", "ending", "state", "scope") if k in r})' "$1" 2>&1 | head -14 | tr '\n' ' '
+}
 AFLAGS=(--sign-key "$W/ak" --intent "$W/aarm-intent.txt")
 astart "$W/a1.txt" "$W/a1" aarm.sh "$W/bin/free.txt" "$W/data/secret.csv" "$W/data/r.csv" "$W/dd/x.csv" "$W/other/u.csv"
-A1="$(prop_for "$W/data/r.csv")"; sleep 0.5
+A1="$(aprop "$W/data/r.csv")"; sleep 0.5
 grep -q "free.txt: ok" "$W/a1.out" && grep -q "secret.csv: no" "$W/a1.out" && ! grep -q "r.csv:" "$W/a1.out" && [ -n "$A1" ] \
-  && pass "R4 (ALLOW, DENY, STEP_UP): an allowed read done, a denied one refused, a stepped-up one held, its grant proposed" || flunk "aarm a1: $(cat "$W/a1.out")"
+  && pass "R4 (ALLOW, DENY, STEP_UP): an allowed read done, a denied one refused, a stepped-up one held, its grant proposed" || flunk "aarm a1: $(cat "$W/a1.out" | tr '\n' ' ')/ $(asum "$W/a1.log")"
 check "R1: a DENY policy's action does not execute, and its denial has a receipt (DENY, the deny rule and its line)" recs "$W/a1.log" \
   "[r for r in rs if r.get('resolved') == '$W/data/secret.csv' and r.get('decision_final') == 'DENY' and r.get('rule') == 'policy_match' and r.get('policy_line', 0) > 0 and not r.get('step_up')]"
 check "R3: a forbidden action is denied at once: no proposal, no hold" recs "$W/a1.log" \
@@ -1673,9 +1700,11 @@ check "R1: a DEFER condition suspends the action: the read under the defer rule 
 marker "$RUN"
 A2=""; for k in $(seq 1 40); do grep -q "x.csv: ok" "$W/a1.out" && break; sleep 0.25; done
 grep -q "x.csv: ok" "$W/a1.out" && pass "R4 (DEFER): the context arrives (a root-owned marker naming the run), the deferred read goes on" || flunk "aarm defer: $(cat "$W/a1.out")"
-A3="$(prop_for "$W/other/u.csv")"
+A3="$(aprop "$W/other/u.csv")"
 [ -n "$A3" ] && ! grep -q "u.csv:" "$W/a1.out" && pass "R3: ambiguous context (a read no rule names: UNKNOWN) gives DEFER, escalated to a person (on unknown defer escalate)" || flunk "aarm unknown: ${A3:-none} / $(cat "$W/a1.out")"
 apv 0 0 "approve $A3" > /dev/null; wait "$WPID"
+[ -s "$W/aprop.denied" ] && echo "  NOTE   denied on the way, a call of bash's own no rule names: $(python3 -c 'import json,sys
+print(" | ".join(sorted({l.strip()[:160] for l in open(sys.argv[1])})))' "$W/aprop.denied" 2>&1 | head -c 600)"
 grep -q "u.csv: ok" "$W/a1.out" && pass "... approved, it goes on under the on unknown line (cert_rule -1)" || flunk "aarm unknown, after: $(cat "$W/a1.out")"
 python3 - "$W/a1.log" "$W" > "$W/a1.chk" 2>&1 <<'PY'
 import json, sys
@@ -1789,7 +1818,8 @@ astart "$W/a2.txt" "$W/a2" aarm.sh "$W/data/r.csv" "$W/dd/x.csv"
 wait "$WPID"
 grep -q "r.csv: no" "$W/a2.out" && grep -q "x.csv: no" "$W/a2.out" && \
   recs "$W/a2.log" "[r for r in rs if r.get('event') == 'step_up_end' and r['ending'] == 'timeout'] and [r for r in rs if r.get('event') == 'defer_end' and r['ending'] == 'timeout'] and len([r for r in rs if r.get('held') is True and r.get('decision_final') == 'DENY']) == 2" \
-  && pass "R4: STEP_UP and DEFER timing out give DENY (each held read refused at its timeout, its ending timeout)" || flunk "aarm timeouts: $(cat "$W/a2.out")"
+  && pass "R4: STEP_UP and DEFER timing out give DENY (each held read refused at its timeout, its ending timeout)" \
+  || flunk "aarm timeouts: $(cat "$W/a2.out" | tr '\n' ' ')/ $(asum "$W/a2.log")"
 audit_ok "$W/a2.txt" "$W/a2.log" && pass "... the audit passes it" || flunk "audit a2: $(grep PROBLEM "$W/a2.log.audit" | head -2)"
 
 # R1: the control plane unavailable, the action fails
