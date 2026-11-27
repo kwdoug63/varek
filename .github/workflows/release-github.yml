@@ -126,6 +126,9 @@ jobs:
       actions: read        # the workflow run's details
       id-token: write      # the provenance's signature (Sigstore, keyless)
       contents: write      # the generator's declared need; it uploads nothing (upload-assets: false)
+    # by its release tag, not a commit hash: the generator checks the tag it
+    # was called by and fails otherwise (OpenSSF Scorecard's Pinned-Dependencies
+    # flags it; dismissed in code scanning as won't fix)
     uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
     with:
       base64-subjects: ${{ needs.files.outputs.hashes }}
