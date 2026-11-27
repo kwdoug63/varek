@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: MIT
+// VAREK for Google Security Operations (v1.43; integrations/secops/README.md).
+// A run's audit failed: its verdict stream doesn't verify (a record edited,
+// dropped or forged, a signature that fails, a decision its certificate
+// doesn't support). One detection per failed audit. Sentinel's "VAREK: a
+// run's audit failed" (High).
+rule varek_audit_failed {
+  meta:
+    author = "Sober Agentic Infrastructure, Inc."
+    description = "A VAREK run's audit failed: its verdict stream does not verify"
+    severity = "High"
+    priority = "High"
+    reference = "https://github.com/kwdoug63/varek/tree/main/varek/v1_4/integrations/secops"
+
+  events:
+    $e.metadata.vendor_name = "Sober Agentic Infrastructure"
+    $e.metadata.product_name = "VAREK"
+    $e.additional.fields["varek_event"] = "audit"
+    $e.additional.fields["varek_audit_passed"] = "false"
+
+  outcome:
+    $risk_score = 80
+    $run = $e.additional.fields["varek_run"]
+    $host = $e.principal.hostname
+    $audit_mode = $e.additional.fields["varek_audit_mode"]
+    $problems = $e.additional.fields["varek_audit_problems"]
+
+  condition:
+    $e
+}

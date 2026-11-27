@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: MIT
+// VAREK for Google Security Operations (v1.43; integrations/secops/README.md).
+// An agent's action refused: one detection per run, host and deciding
+// policy line within the hour, naming the line and its text. Sentinel's
+// "VAREK: an agent's action refused" (Medium). A dry run's let-through is
+// ALLOW, so it is not counted here (varek_dry_run_let_through).
+rule varek_action_refused {
+  meta:
+    author = "Sober Agentic Infrastructure, Inc."
+    description = "An agent's action VAREK refused, with the policy line that decided it"
+    severity = "Medium"
+    priority = "Medium"
+    reference = "https://github.com/kwdoug63/varek/tree/main/varek/v1_4/integrations/secops"
+
+  events:
+    $e.metadata.vendor_name = "Sober Agentic Infrastructure"
+    $e.metadata.product_name = "VAREK"
+    $e.security_result.action = "BLOCK"
+    $e.additional.fields["varek_mode"] != "dry_run"
+    $run = $e.additional.fields["varek_run"]
+    $host = $e.principal.hostname
+    $decided_by = $e.security_result.rule_name
+
+  match:
+    $run, $host, $decided_by over 1h
+
+  outcome:
+    $risk_score = 50
+    $refused = count_distinct($e.metadata.product_log_id)
+    $agent = array_distinct($e.principal.application)
+    $policy_text = array_distinct($e.security_result.summary)
+    $policy_name = array_distinct($e.additional.fields["varek_policy_name"])
+    $verdicts = array_distinct($e.additional.fields["varek_verdict"])
+    $files = array_distinct($e.target.file.full_path)
+    $hosts_reached = array_distinct($e.target.hostname)
+    $first_seen = min($e.metadata.event_timestamp.seconds)
+    $last_seen = max($e.metadata.event_timestamp.seconds)
+
+  condition:
+    $e
+}

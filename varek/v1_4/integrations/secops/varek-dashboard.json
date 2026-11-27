@@ -1,0 +1,50 @@
+{
+  "_comment": "A draft of the VAREK dashboard for Google Security Operations' native dashboards (v1.43, step 2; integrations/secops/README.md). Its panels are YARA-L 2.0 queries over what varek_secops.py writes (tests/test_varek_secops_content.py checks each field). It is imported and drawn in the development instance at the ship gate, then exported from there, and that export replaces this file.",
+  "dashboard": {
+    "displayName": "VAREK: the Warden's decisions",
+    "description": "Refusals by policy line, agent and run; dry runs; failed audits; approvals nobody gave in time",
+    "timeRange": "LAST_7_DAYS",
+    "charts": [
+      {
+        "displayName": "Refusals by policy line",
+        "visualization": "TABLE",
+        "query": "$e.metadata.vendor_name = \"Sober Agentic Infrastructure\"\n$e.metadata.product_name = \"VAREK\"\n$e.security_result.action = \"BLOCK\"\n$decided_by = $e.security_result.rule_name\n$text = $e.security_result.summary\nmatch:\n  $decided_by, $text\noutcome:\n  $refusals = count($e.metadata.product_log_id)\n  $runs = count_distinct($e.additional.fields[\"varek_run\"])\norder:\n  $refusals desc\nlimit:\n  25"
+      },
+      {
+        "displayName": "Refusals by agent",
+        "visualization": "BAR",
+        "query": "$e.metadata.vendor_name = \"Sober Agentic Infrastructure\"\n$e.metadata.product_name = \"VAREK\"\n$e.security_result.action = \"BLOCK\"\n$agent = $e.principal.application\nmatch:\n  $agent\noutcome:\n  $refusals = count($e.metadata.product_log_id)\norder:\n  $refusals desc\nlimit:\n  25"
+      },
+      {
+        "displayName": "Refusals by run",
+        "visualization": "TABLE",
+        "query": "$e.metadata.vendor_name = \"Sober Agentic Infrastructure\"\n$e.metadata.product_name = \"VAREK\"\n$e.security_result.action = \"BLOCK\"\n$run = $e.additional.fields[\"varek_run\"]\n$host = $e.principal.hostname\nmatch:\n  $run, $host\noutcome:\n  $refusals = count($e.metadata.product_log_id)\n  $last = max($e.metadata.event_timestamp.seconds)\norder:\n  $last desc\nlimit:\n  25"
+      },
+      {
+        "displayName": "Refusals over time",
+        "visualization": "LINE",
+        "query": "$e.metadata.vendor_name = \"Sober Agentic Infrastructure\"\n$e.metadata.product_name = \"VAREK\"\n$e.security_result.action = \"BLOCK\"\n$hour = timestamp.get_timestamp($e.metadata.event_timestamp.seconds, \"%Y-%m-%d %H:00\")\nmatch:\n  $hour\noutcome:\n  $refusals = count($e.metadata.product_log_id)\norder:\n  $hour asc"
+      },
+      {
+        "displayName": "The latest refusals",
+        "visualization": "TABLE",
+        "query": "$e.metadata.vendor_name = \"Sober Agentic Infrastructure\"\n$e.metadata.product_name = \"VAREK\"\n$e.security_result.action = \"BLOCK\"\n$id = $e.metadata.product_log_id\nmatch:\n  $id\noutcome:\n  $time = max($e.metadata.event_timestamp.seconds)\n  $host = array_distinct($e.principal.hostname)\n  $agent = array_distinct($e.principal.application)\n  $decided_by = array_distinct($e.security_result.rule_name)\n  $file = array_distinct($e.target.file.full_path)\n  $reached = array_distinct($e.target.hostname)\norder:\n  $time desc\nlimit:\n  50"
+      },
+      {
+        "displayName": "Dry runs: let through, not enforced",
+        "visualization": "TABLE",
+        "query": "$e.metadata.vendor_name = \"Sober Agentic Infrastructure\"\n$e.metadata.product_name = \"VAREK\"\n$e.additional.fields[\"varek_mode\"] = \"dry_run\"\n$e.additional.fields[\"varek_decision\"] = \"DENY\"\n$run = $e.additional.fields[\"varek_run\"]\n$decided_by = $e.security_result.rule_name\nmatch:\n  $run, $decided_by\noutcome:\n  $let_through = count($e.metadata.product_log_id)\norder:\n  $let_through desc\nlimit:\n  25"
+      },
+      {
+        "displayName": "Failed audits",
+        "visualization": "TABLE",
+        "query": "$e.metadata.vendor_name = \"Sober Agentic Infrastructure\"\n$e.metadata.product_name = \"VAREK\"\n$e.additional.fields[\"varek_event\"] = \"audit\"\n$e.additional.fields[\"varek_audit_passed\"] = \"false\"\n$run = $e.additional.fields[\"varek_run\"]\nmatch:\n  $run\noutcome:\n  $time = max($e.metadata.event_timestamp.seconds)\n  $host = array_distinct($e.principal.hostname)\n  $mode = array_distinct($e.additional.fields[\"varek_audit_mode\"])\n  $problems = array_distinct($e.additional.fields[\"varek_audit_problems\"])\norder:\n  $time desc"
+      },
+      {
+        "displayName": "Approvals nobody gave in time",
+        "visualization": "TABLE",
+        "query": "$e.metadata.vendor_name = \"Sober Agentic Infrastructure\"\n$e.metadata.product_name = \"VAREK\"\n($e.additional.fields[\"varek_event\"] = \"step_up_end\" or $e.additional.fields[\"varek_event\"] = \"defer_end\")\n$e.additional.fields[\"varek_ending\"] = \"timeout\"\n$run = $e.additional.fields[\"varek_run\"]\n$line = $e.additional.fields[\"varek_policy_line\"]\nmatch:\n  $run, $line\noutcome:\n  $expired = count($e.metadata.product_log_id)\n  $waits = array_distinct($e.additional.fields[\"varek_event\"])\norder:\n  $expired desc\nlimit:\n  25"
+      }
+    ]
+  }
+}
