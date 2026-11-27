@@ -18,6 +18,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `cryptography`), never the command line. Built against a stand-in
   (`tests/test_varek_secops.py`); the fields and limits are checked in
   Google's development instance before v1.43.0 ships.
+- `integrations/secops/` (v1.43.0 step 2): four YARA-L rules, Sentinel's four
+  (an agent's action refused, a run's audit failed, a dry run's let-through,
+  an approval nobody gave in time), a draft of the dashboard, and the README.
+  `tests/test_varek_secops_content.py` checks that they read only what the
+  export writes. The export adds `varek_ending`, `varek_audit_mode` and
+  `varek_audit_problems` to `additional` for them.
 
 ### Changed
 
