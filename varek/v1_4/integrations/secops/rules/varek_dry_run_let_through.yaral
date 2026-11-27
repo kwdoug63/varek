@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: MIT
+// VAREK for Google Security Operations (v1.44; integrations/secops/README.md).
+// A dry run let through what its policy refuses: the call went ahead, so the
+// export writes it ALLOW at INFORMATIONAL, with varek_mode dry_run and
+// varek_decision DENY. One detection per run, host and line within the hour,
+// to read before the policy is enforced. Sentinel's "VAREK: a dry run let
+// through what its policy refuses" (Informational, no incident).
+rule varek_dry_run_let_through {
+  meta:
+    author = "Sober Agentic Infrastructure, Inc."
+    description = "A VAREK dry run let through calls its policy refuses"
+    severity = "Informational"
+    priority = "Informational"
+    reference = "https://github.com/kwdoug63/varek/tree/main/varek/v1_4/integrations/secops"
+
+  events:
+    $e.metadata.vendor_name = "Sober Agentic Infrastructure"
+    $e.metadata.product_name = "VAREK"
+    $e.additional.fields["varek_mode"] = "dry_run"
+    $e.additional.fields["varek_decision"] = "DENY"
+    $run = $e.additional.fields["varek_run"]
+    $host = $e.principal.hostname
+    $decided_by = $e.security_result.rule_name
+
+  match:
+    $run, $host, $decided_by over 1h
+
+  outcome:
+    $risk_score = 10
+    $let_through = count_distinct($e.metadata.product_log_id)
+    $agent = array_distinct($e.principal.application)
+    $policy_text = array_distinct($e.security_result.summary)
+    $files = array_distinct($e.target.file.full_path)
+    $hosts_reached = array_distinct($e.target.hostname)
+
+  condition:
+    $e
+}
