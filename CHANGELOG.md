@@ -9,6 +9,16 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- `varek export --format secops` (`tools/varek_secops.py`, v1.43.0 step 1):
+  a run's OCSF events, audited, sent to a Google Security Operations
+  instance as UDM events through the Chronicle API's `events:import`, the
+  credential the VM's service account or a key file's (signed through
+  `cryptography`), never the command line. Built against a stand-in
+  (`tests/test_varek_secops.py`); the fields and limits are checked in
+  Google's development instance before v1.43.0 ships.
+
 ### Changed
 
 - `tests/arm64_sweep.sh --deps` installs its Python packages with
