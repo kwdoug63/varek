@@ -10,8 +10,9 @@ dropping and moving records; from the v1.26.1 review by AI review agents).
 holding TEXT; --move puts the first record holding A just after the first
 holding B. Exits 1 if an edit found no record to apply to.
 """
-import hashlib
 import sys
+
+import varek_logfmt
 
 a = sys.argv[3:]
 subs, drops, moves = [], [], []
@@ -35,7 +36,8 @@ for ma, mb in moves:
     if ib is None:
         raise SystemExit(f"v1261_forge: no record holds {mb[:60]}")
     lines.insert(ib + 1, la)
-head = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
+fmt = varek_logfmt.of_lines(lines)       # v1.41: chain-2 (SHA-384) or chain-1
+head = fmt["iv"]
 out = []
 for line in lines:
     if line.startswith("{") and ',"chain":"' in line:
@@ -49,8 +51,8 @@ for line in lines:
         for s in subs:
             if not s[2] and s[0] in body:
                 body = body.replace(s[0], s[1]); s[2] = True
-        head = hashlib.sha256(head + body.encode("utf-8", "surrogateescape")).digest()
-        line = body + ',"chain":"' + head.hex() + line[cut + 10 + 64:]
+        head = fmt["hash"](head + body.encode("utf-8", "surrogateescape")).digest()
+        line = body + ',"chain":"' + head.hex() + line[cut + 10 + fmt["chain_hex"]:]
     out.append(line)
 open(sys.argv[2], "w", encoding="utf-8", errors="surrogateescape").write("".join(out))
 missed = [s[0] for s in subs if not s[2]] + [d[0] for d in drops if not d[1]]

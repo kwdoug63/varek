@@ -81,6 +81,7 @@
 #include <unistd.h>
 #include <grp.h>
 
+#include "varek_fips.h"          /* v1.41: provider selection and the FIPS check */
 #include <openssl/core_names.h>
 #include <openssl/ec.h>
 #include <openssl/err.h>
@@ -1011,16 +1012,25 @@ static void hexs(const unsigned char *d, size_t n, char *out) {
     out[2 * n] = '\0';
 }
 
+/* v1.41: a digest or MAC the provider cannot compute ends the helper (the
+ * Warden then refuses to start the run): through v1.40 the result was not
+ * checked, and an uncomputed digest left uninitialised bytes to be signed. */
 static void sha256_hex(const void *d, size_t n, char out[65]) {
     unsigned char h[32];
     unsigned int hl = 0;
-    EVP_Digest(d, n, h, &hl, EVP_sha256(), NULL);
+    if (EVP_Digest(d, n, h, &hl, EVP_sha256(), NULL) != 1 || hl != 32) {
+        fprintf(stderr, "[secrets] SHA-256 via the host crypto provider failed\n");
+        abort();
+    }
     hexs(h, 32, out);
 }
 
 static void hmac(const void *k, size_t kl, const void *d, size_t dl, unsigned char out[32]) {
     size_t ol = 0;
-    EVP_Q_mac(NULL, "HMAC", NULL, "SHA256", NULL, k, kl, d, dl, out, 32, &ol);
+    if (!EVP_Q_mac(NULL, "HMAC", NULL, "SHA256", NULL, k, kl, d, dl, out, 32, &ol) || ol != 32) {
+        fprintf(stderr, "[secrets] HMAC-SHA256 via the host crypto provider failed\n");
+        abort();
+    }
 }
 
 /* The instance's role credentials, through IMDSv2. 0, or -1 with why. */
@@ -1417,7 +1427,8 @@ static int leases_wait(void) {
  *
  * The user's token: one JWT (compact form) in a file held as a file store.
  * Its header names the algorithm: RS256, PS256 (salt the hash's length),
- * ES256 or EdDSA (Ed25519); `none` and every HMAC algorithm are refused, as
+ * ES256, EdDSA (Ed25519), or (v1.41, CNSA's) RS384, PS384 or ES384; `none`
+ * and every HMAC algorithm are refused, as
  * is any other, and a `crit` header. Keys a token carries or points to (jwk,
  * jku, x5c, x5u) are never used: the keys are the issuer's, fetched over
  * verified HTTPS from the `jwks` URL the policy names or the issuer's
@@ -1602,7 +1613,13 @@ static int get_json(const char *url, char **out, size_t *ol, char *why, size_t w
     return 0;
 }
 
-enum { ALG_RS256 = 1, ALG_PS256, ALG_ES256, ALG_EDDSA };
+/* v1.41: the SHA-384 forms too (RS384, PS384; ES384 on P-384), the ones a
+ * CNSA-aligned identity provider signs with */
+enum { ALG_RS256 = 1, ALG_PS256, ALG_ES256, ALG_EDDSA, ALG_RS384, ALG_PS384, ALG_ES384 };
+#define ALG_IS_RSA(a) ((a) == ALG_RS256 || (a) == ALG_PS256 || (a) == ALG_RS384 || (a) == ALG_PS384)
+#define ALG_IS_PSS(a) ((a) == ALG_PS256 || (a) == ALG_PS384)
+#define ALG_IS_EC(a)  ((a) == ALG_ES256 || (a) == ALG_ES384)
+#define ALG_IS_384(a) ((a) == ALG_RS384 || (a) == ALG_PS384 || (a) == ALG_ES384)
 
 /* the key a JWK describes, for alg; NULL with why */
 static EVP_PKEY *jwk_key(const char *k, const char *e, int alg, char *why, size_t wn) {
@@ -1610,7 +1627,7 @@ static EVP_PKEY *jwk_key(const char *k, const char *e, int alg, char *why, size_
     unsigned char ab[1024], bb[1024];
     EVP_PKEY *pk = NULL;
     if (jgets(k, e, "kty", kty, sizeof kty) != 1) { snprintf(why, wn, "the issuer's key has no kty"); return NULL; }
-    if (alg == ALG_RS256 || alg == ALG_PS256) {
+    if (ALG_IS_RSA(alg)) {
         if (strcmp(kty, "RSA")) { snprintf(why, wn, "the issuer's key for the token is not an RSA key"); return NULL; }
         long nl = jgets(k, e, "n", a, sizeof a) == 1 ? b64url(a, strlen(a), ab, sizeof ab) : -1;
         long el = jgets(k, e, "e", b, sizeof b) == 1 ? b64url(b, strlen(b), bb, sizeof bb) : -1;
@@ -1633,20 +1650,24 @@ static EVP_PKEY *jwk_key(const char *k, const char *e, int alg, char *why, size_
             EVP_PKEY_free(pk);
             return NULL;
         }
-    } else if (alg == ALG_ES256) {
-        if (strcmp(kty, "EC") || jgets(k, e, "crv", crv, sizeof crv) != 1 || strcmp(crv, "P-256")) {
-            snprintf(why, wn, "the issuer's key for the token is not a P-256 key");
+    } else if (ALG_IS_EC(alg)) {
+        /* ES256 on P-256, ES384 on P-384 (RFC 7518, 3.4): the curve is the algorithm's */
+        const bool p384 = alg == ALG_ES384;
+        const char *cname = p384 ? "P-384" : "P-256";
+        const size_t cl = p384 ? 48 : 32;
+        if (strcmp(kty, "EC") || jgets(k, e, "crv", crv, sizeof crv) != 1 || strcmp(crv, cname)) {
+            snprintf(why, wn, "the issuer's key for the token is not a %s key", cname);
             return NULL;
         }
-        unsigned char pub[65] = { 4 };
-        long xl = jgets(k, e, "x", a, sizeof a) == 1 ? b64url(a, strlen(a), pub + 1, 32) : -1;
-        long yl = jgets(k, e, "y", b, sizeof b) == 1 ? b64url(b, strlen(b), pub + 33, 32) : -1;
-        if (xl != 32 || yl != 32) { snprintf(why, wn, "the issuer's P-256 key is malformed"); return NULL; }
+        unsigned char pub[97] = { 4 };
+        long xl = jgets(k, e, "x", a, sizeof a) == 1 ? b64url(a, strlen(a), pub + 1, cl) : -1;
+        long yl = jgets(k, e, "y", b, sizeof b) == 1 ? b64url(b, strlen(b), pub + 1 + cl, cl) : -1;
+        if (xl != (long)cl || yl != (long)cl) { snprintf(why, wn, "the issuer's %s key is malformed", cname); return NULL; }
         OSSL_PARAM_BLD *bld = OSSL_PARAM_BLD_new();
         OSSL_PARAM *ps = NULL;
         EVP_PKEY_CTX *c = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
-        if (bld && c && OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME, "prime256v1", 0) &&
-            OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY, pub, sizeof pub) &&
+        if (bld && c && OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME, p384 ? "secp384r1" : "prime256v1", 0) &&
+            OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY, pub, 1 + 2 * cl) &&
             (ps = OSSL_PARAM_BLD_to_param(bld)) && EVP_PKEY_fromdata_init(c) == 1)
             (void)EVP_PKEY_fromdata(c, &pk, EVP_PKEY_PUBLIC_KEY, ps);
         OSSL_PARAM_free(ps);
@@ -1673,10 +1694,11 @@ static EVP_PKEY *jwk_key(const char *k, const char *e, int alg, char *why, size_
 
 /* the signature over the signing input, by alg; 1 good, 0 not */
 static int jws_verify(EVP_PKEY *pk, int alg, const char *in, size_t inl, const unsigned char *sig, size_t sl) {
-    unsigned char der[80];
-    if (alg == ALG_ES256) {                               /* JOSE's r || s, as DER */
-        if (sl != 64) return 0;
-        BIGNUM *r = BN_bin2bn(sig, 32, NULL), *s = BN_bin2bn(sig + 32, 32, NULL);
+    unsigned char der[112];                               /* P-384's DER at most 104 */
+    if (ALG_IS_EC(alg)) {                                 /* JOSE's r || s, as DER */
+        const size_t cl = alg == ALG_ES384 ? 48 : 32;
+        if (sl != 2 * cl) return 0;
+        BIGNUM *r = BN_bin2bn(sig, (int)cl, NULL), *s = BN_bin2bn(sig + cl, (int)cl, NULL);
         ECDSA_SIG *es = ECDSA_SIG_new();
         if (!r || !s || !es || ECDSA_SIG_set0(es, r, s) != 1) { BN_free(r); BN_free(s); ECDSA_SIG_free(es); return 0; }
         unsigned char *q = der;
@@ -1689,12 +1711,15 @@ static int jws_verify(EVP_PKEY *pk, int alg, const char *in, size_t inl, const u
     }
     EVP_MD_CTX *mc = EVP_MD_CTX_new();
     EVP_PKEY_CTX *pc = NULL;
-    int ok = mc && EVP_DigestVerifyInit(mc, &pc, alg == ALG_EDDSA ? NULL : EVP_sha256(), NULL, pk) == 1;
-    if (ok && alg == ALG_RS256) ok = EVP_PKEY_CTX_set_rsa_padding(pc, RSA_PKCS1_PADDING) == 1;
-    if (ok && alg == ALG_PS256)
+    /* the digest by name, so it is fetched as every other (the FIPS provider's
+     * when it is active) */
+    const char *md = alg == ALG_EDDSA ? NULL : ALG_IS_384(alg) ? "SHA384" : "SHA256";
+    int ok = mc && EVP_DigestVerifyInit_ex(mc, &pc, md, NULL, NULL, pk, NULL) == 1;
+    if (ok && ALG_IS_RSA(alg) && !ALG_IS_PSS(alg)) ok = EVP_PKEY_CTX_set_rsa_padding(pc, RSA_PKCS1_PADDING) == 1;
+    if (ok && ALG_IS_PSS(alg))
         ok = EVP_PKEY_CTX_set_rsa_padding(pc, RSA_PKCS1_PSS_PADDING) == 1 &&
              EVP_PKEY_CTX_set_rsa_pss_saltlen(pc, RSA_PSS_SALTLEN_DIGEST) == 1 &&
-             EVP_PKEY_CTX_set_rsa_mgf1_md(pc, EVP_sha256()) == 1;
+             EVP_PKEY_CTX_set_rsa_mgf1_md_name(pc, md, NULL) == 1;
     if (ok) ok = EVP_DigestVerify(mc, sig, sl, (const unsigned char *)in, inl) == 1;
     EVP_MD_CTX_free(mc);
     ERR_clear_error();
@@ -1754,8 +1779,12 @@ static int verify_token_parts(char *why, size_t wn) {
     if (!strcmp(alg, "none")) { snprintf(why, wn, "algorithm none is refused (an unsigned token)"); return -1; }
     if (!strncmp(alg, "HS", 2)) { snprintf(why, wn, "algorithm %s is refused (HMAC: the key would be shared)", shown(alg, sb, sizeof sb)); return -1; }
     int ai = !strcmp(alg, "RS256") ? ALG_RS256 : !strcmp(alg, "PS256") ? ALG_PS256 : !strcmp(alg, "ES256") ? ALG_ES256 :
-             !strcmp(alg, "EdDSA") ? ALG_EDDSA : 0;
-    if (!ai) { snprintf(why, wn, "algorithm %s is not one of RS256, PS256, ES256, EdDSA", shown(alg, sb, sizeof sb)); return -1; }
+             !strcmp(alg, "EdDSA") ? ALG_EDDSA : !strcmp(alg, "RS384") ? ALG_RS384 : !strcmp(alg, "PS384") ? ALG_PS384 :
+             !strcmp(alg, "ES384") ? ALG_ES384 : 0;
+    if (!ai) {
+        snprintf(why, wn, "algorithm %s is not one of RS256, PS256, ES256, EdDSA, RS384, PS384, ES384", shown(alg, sb, sizeof sb));
+        return -1;
+    }
     if (jcount(hdr, he, "crit") != 0) { snprintf(why, wn, "its header has crit (an extension this Warden does not know)"); return -1; }
     int kr = jgets(hdr, he, "kid", kid, sizeof kid);
     if (kr < 0 || (kr == 1 && (!kid[0] || !printable(kid)))) { snprintf(why, wn, "its key id (kid) is malformed"); return -1; }
@@ -1810,7 +1839,7 @@ static int verify_token_parts(char *why, size_t wn) {
     const char *ke = ks + kl, *keys = jget(ks, ke, "keys");
     const char *pick = NULL;
     int ncompat = 0;
-    static const char *const kKty[] = { "", "RSA", "RSA", "EC", "OKP" };
+    static const char *const kKty[] = { "", "RSA", "RSA", "EC", "OKP", "RSA", "RSA", "EC" };
     for (const char *k = keys ? jarr_first(keys, ke) : NULL; k; k = jarr_next(k, ke)) {
         char kk[256], kty[16], use[16], kalg[32];
         if (*jws(k, ke) != '{') continue;
@@ -1818,6 +1847,12 @@ static int verify_token_parts(char *why, size_t wn) {
         /* review: a key named by kid but of another type is passed over (one
          * kid may name keys of several types); none of the right type: refused below */
         if (jgets(k, ke, "kty", kty, sizeof kty) != 1 || strcmp(kty, kKty[ai])) continue;
+        /* v1.41: an EC key of the algorithm's curve only (P-256 for ES256, P-384 for
+         * ES384), so a key set holding both, without alg, still has one for each */
+        if (ALG_IS_EC(ai)) {
+            char kcrv[16];
+            if (jgets(k, ke, "crv", kcrv, sizeof kcrv) != 1 || strcmp(kcrv, ai == ALG_ES384 ? "P-384" : "P-256")) continue;
+        }
         /* review: use and alg, when given, must be readable and match */
         int ru = jgets(k, ke, "use", use, sizeof use), ra = jgets(k, ke, "alg", kalg, sizeof kalg);
         if (ru < 0 || (ru == 1 && strcmp(use, "sig")) || ra < 0 || (ra == 1 && strcmp(kalg, alg))) continue;
@@ -2200,6 +2235,20 @@ int main(int argc, char **argv) {
     /* v1.28 review: a store that resets the connection must not kill the
      * helper (SIGPIPE): it reports the failure instead */
     (void)signal(SIGPIPE, SIG_IGN);
+    /* v1.41: the crypto backend, before any certificate, key or token is
+     * read (verify_svid runs as root, before the drop, as OpenSSL's first use
+     * did). The host's OpenSSL configuration is read, so system crypto policy
+     * applies to this helper's TLS; on a host in FIPS mode the FIPS provider
+     * services its TLS, digests, HMAC and signature checks. In the Defense
+     * build it refuses to run unless that provider is active, and the Warden
+     * then refuses to start the run. */
+    {
+        char cwhy[256] = {0};
+        if (vfips_init(0, cwhy, sizeof cwhy) != 0) {
+            fprintf(stderr, "[secrets] refusing to run: %s\n", cwhy);
+            return 2;
+        }
+    }
     if (arena_init() < 0) return 2;
     /* the setup and the credentials */
     static struct ws_setup su;

@@ -7,9 +7,10 @@ reason, not for a broken chain.
                                    in order; lines that are not records are
                                    kept as strings) and may change, drop or add
 """
-import hashlib
 import json
 import sys
+
+import varek_logfmt
 
 src, out, code = sys.argv[1], sys.argv[2], sys.argv[3]
 recs = []
@@ -21,12 +22,13 @@ for line in open(src, encoding="utf-8", errors="surrogateescape"):
     else:
         recs.append(line)
 exec(code, {"recs": recs})
-head = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
+fmt = varek_logfmt.of_file(src)          # v1.41: chain-2 (SHA-384) or chain-1
+head = fmt["iv"]
 with open(out, "w", encoding="utf-8", errors="surrogateescape") as f:
     for r in recs:
         if isinstance(r, str):
             f.write(r)
             continue
         body = json.dumps(r, separators=(",", ":"))[:-1]
-        head = hashlib.sha256(head + body.encode()).digest()
+        head = fmt["hash"](head + body.encode()).digest()
         f.write(body + ',"chain":"' + head.hex() + '"}\n')

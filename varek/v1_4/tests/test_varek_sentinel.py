@@ -75,10 +75,10 @@ def test_the_template_table_rule_and_rows_agree():
     content = json.load(open(os.path.join(SENTINEL, "sentinel-content.json")))
     queries = [r["properties"]["query"] for r in content["resources"] if r.get("kind") == "Scheduled"]
     queries += [i["content"]["query"] for i in content["variables"]["workbook"]["items"] if i["type"] == 3]
-    assert len(queries) == 11                                     # 3 analytics rules, the workbook's 8
+    assert len(queries) == 12                                     # 4 analytics rules (v1.42: 4), the workbook's 8
     made = {"DecidedBy", "Refused", "FirstSeen", "LastSeen", "Targets", "Verdicts", "Problems", "AuditMode",
             "LetThrough", "Decisions", "Runs", "Last", "Count", "Name", "Value", "Column", "Audit", "Start", "End",
-            "Policy", "TimeRange", "Run"}                          # the queries' own names
+            "Policy", "TimeRange", "Run", "Expired", "Waited", "Waits"}   # the queries' own names
     for q in queries:
         assert "VarekOCSF_CL" in q and not q.startswith("[")      # not an ARM expression
         body = re.sub(r'"[^"]*"', '""', q)                         # strings out
@@ -92,19 +92,23 @@ def test_the_rules_judge_each_row_when_it_arrives():
     # 5 minutes by the decision's time raised nothing for a run exported later.
     # Microsoft's pattern for ingestion delay: a longer look-back, and the rows
     # that arrived since the rule last ran. Under 2 days: a solution rule that
-    # looks back 2 days or more runs hourly at most. The arrival window is a
-    # minute wider than the rule's period (November 20's live test): Sentinel's
-    # runs are not exactly 5 minutes apart, and a 5-minute window left a row
-    # between two runs unjudged whenever they were further apart. A row is
-    # judged by two or three runs (November 21's: Sentinel measures ago() from
-    # about 5 minutes before the run), each alert grouped into the run's incident.
+    # looks back 2 days or more runs hourly at most. In a rule, now() is the
+    # end of the run's query window, not the time it runs: the windows end
+    # exactly 5 minutes apart, and each run starts about 5 minutes after its
+    # window ends. So each run takes the rows that arrived in its own 5 minutes,
+    # (now() - 5m, now()], and each row is judged once. Without the upper bound,
+    # a row that arrived after a window's end but before its run was judged by
+    # that run and the next ones too: two alerts with a 5-minute window
+    # (November 20), three with 6 minutes (November 21, a managed identity's
+    # export 23 minutes late).
     content = json.load(open(os.path.join(SENTINEL, "sentinel-content.json")))
     rules = [r["properties"] for r in content["resources"] if r.get("kind") == "Scheduled"]
-    assert len(rules) == 3
+    assert len(rules) == 4                 # v1.42: an approval nobody gave in time
     for r in rules:
         assert r["queryFrequency"] == "PT5M" and r["queryPeriod"] == "P1D", r["displayName"]
         first = r["query"].split("\n")[1]
-        assert first == "| where TimeGenerated > ago(1d) and ingestion_time() > ago(6m)", (r["displayName"], first)
+        assert first == ("| where TimeGenerated > ago(1d)"
+                         " and ingestion_time() > ago(5m) and ingestion_time() <= now()"), (r["displayName"], first)
         # an alert's time is its rows' (the latest decision), not the day the rule looks back over
         last = r["query"].split("\n")[-1]
         assert last.startswith(("| summarize TimeGenerated = max(TimeGenerated),", "| project TimeGenerated,")), \
@@ -113,7 +117,7 @@ def test_the_rules_judge_each_row_when_it_arrives():
         if inc["createIncident"]:          # a run's repeated alerts join its run's incident
             g = inc["groupingConfiguration"]
             assert g["enabled"] is True and "RunId" in g["groupByCustomDetails"], r["displayName"]
-    assert sum(r["incidentConfiguration"]["createIncident"] for r in rules) == 2   # the dry run's: no incident
+    assert sum(r["incidentConfiguration"]["createIncident"] for r in rules) == 3   # the dry run's: no incident
 
 def test_batches_and_the_url():
     rows = [{"x": "a" * 100}] * 50

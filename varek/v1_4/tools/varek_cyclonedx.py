@@ -35,12 +35,15 @@ unmerged specification proposal):
     calls the filter admits without asking the Warden. If the records break an
     invariant the text would state (an UNKNOWN that was authorized), the
     exporter refuses to attest.
-  * signature — v1.18.0, with --sign-key: an Ed25519 signature over the whole
-    BOM in the JSON Signature Format (JSF) that CycloneDX 1.6 defines, made
-    with the Warden's log key (tools/varek_keygen). --verify checks one
-    against the public key the caller trusts (--pubkey, required); the key
-    inside the BOM is not trusted. With --pubkey when exporting, the stream's
-    own signatures must verify under that key, or no BOM is written.
+  * signature — v1.18.0, with --sign-key: a signature over the whole BOM in
+    the JSON Signature Format (JSF) that CycloneDX 1.6 defines, made with the
+    Warden's log key (tools/varek_keygen). v1.41: ES384 (ECDSA P-384 with
+    SHA-384) through the `cryptography` package on the host's OpenSSL; through
+    v1.40 it was Ed25519 through libsodium, and --verify still checks those.
+    --verify checks one against the public key the caller trusts (--pubkey,
+    required); the key inside the BOM is not trusted. With --pubkey when
+    exporting, the stream's own signatures must verify under that key, or no
+    BOM is written.
   * components[] — one component per DISTINCT resolved object the agent was
     authorized to reach, each with the deciding rule as a property. Refused
     actions are summarized in the annotation, not minted as components (a
@@ -70,8 +73,6 @@ valid, well-formed authorization record).
 
 import argparse
 import base64
-import ctypes
-import ctypes.util
 import datetime as _dt
 import hashlib
 import json
@@ -81,7 +82,12 @@ import sys
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import varek_ed25519  # noqa: E402  (pure-Python RFC 8032 verification)
+import varek_ed25519  # noqa: E402  (verification through `cryptography`: P-384, and Ed25519 for old logs)
+
+from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric.utils import (  # noqa: E402
+    decode_dss_signature, encode_dss_signature)
 
 VAREK_VERSION = "1.20.0"
 SPEC_VERSION = "1.6"
@@ -98,11 +104,55 @@ class StreamError(SystemExit):
     pass
 
 
+# The stream's integrity format, named by run_start's "log".
+#   chain-1 (v1.16 to v1.40): SHA-256 chain, Ed25519 signatures over
+#            "VAREK-LOG-SIG-1" || chain (32 bytes).
+#   chain-2 (v1.41): SHA-384 chain, ECDSA P-384 (SHA-384, DER) signatures over
+#            "VAREK-LOG-SIG-2" || chain (48 bytes), computed by the host's
+#            OpenSSL provider (the FIPS provider on a host in FIPS mode).
+# Both are verified; the Warden writes chain-2.
 LOG_CHAIN_FORMAT = "chain-1"
 LOG_CHAIN_IV = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
 LOG_SIG_DOMAIN = b"VAREK-LOG-SIG-1"
+LOG_CHAIN_FORMAT_2 = "chain-2"
+LOG_CHAIN_IV_2 = hashlib.sha384(b"VAREK-LOG-CHAIN-2").digest()
+LOG_SIG_DOMAIN_2 = b"VAREK-LOG-SIG-2"
+LOG_FORMATS = {
+    LOG_CHAIN_FORMAT: {"name": LOG_CHAIN_FORMAT, "iv": LOG_CHAIN_IV, "hash": hashlib.sha256,
+                       "domain": LOG_SIG_DOMAIN, "chain_hex": 64, "key_len": 32,
+                       "sigalg": "ed25519", "verify": varek_ed25519.verify},
+    LOG_CHAIN_FORMAT_2: {"name": LOG_CHAIN_FORMAT_2, "iv": LOG_CHAIN_IV_2, "hash": hashlib.sha384,
+                         "domain": LOG_SIG_DOMAIN_2, "chain_hex": 96, "key_len": 97,
+                         "sigalg": "ecdsa-p384-sha384", "verify": varek_ed25519.verify_p384},
+}
 CHECKPOINT_EVENTS = ("run_start", "checkpoint", "run_end")
-_CHAIN_TAIL = re.compile(rb',"chain":"([0-9a-f]{64})"(?:,"sig":"([0-9a-f]{128})")?\}\n?\Z')
+# The chain value's width and the signature's form are checked against the
+# stream's format in _chain_step (a DER P-384 signature is 8 to 104 bytes).
+_CHAIN_TAIL = re.compile(rb',"chain":"([0-9a-f]{96}|[0-9a-f]{64})"(?:,"sig":"([0-9a-f]{16,208})")?\}\n?\Z')
+
+
+def log_format(name):
+    """The integrity format a run_start's "log" names, or None."""
+    return LOG_FORMATS.get(name) if isinstance(name, str) else None
+
+
+def sig_form_ok(fmt, sig_hex):
+    """A signature's hex has the form the format's signatures have."""
+    if fmt["name"] == LOG_CHAIN_FORMAT:
+        return len(sig_hex) == 128
+    return len(sig_hex) % 2 == 0 and 16 <= len(sig_hex) <= 208
+
+
+def pubkey_from_hex(txt):
+    """A log public key as hex: an Ed25519 key (64 hex characters, chain-1) or
+    an uncompressed P-384 point (194 hex characters, 04 || X || Y, chain-2).
+    The key's bytes, or None."""
+    if not isinstance(txt, str):
+        return None
+    txt = txt.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}|04[0-9a-f]{192}", txt):
+        return None
+    return bytes.fromhex(txt)
 
 
 def _version_at_least(v, want):
@@ -126,7 +176,11 @@ def _chain_step(st, raw, rec, lineno, ndecisions, fail):
         fail(lineno, "record of a chained stream without a well-formed chain value "
                      "(it was edited, or not written by the Warden).")
     body = b[:m.start()]
-    h = hashlib.sha256(st["head"] + body).digest()
+    fmt = st["fmt"]
+    if len(m.group(1)) != fmt["chain_hex"] or (m.group(2) and not sig_form_ok(fmt, m.group(2).decode())):
+        fail(lineno, f"record whose chain value or signature is not of the stream's format "
+                     f"({fmt['name']}): it was edited, or not written by the Warden.")
+    h = fmt["hash"](st["head"] + body).digest()
     if h.hex() != m.group(1).decode():
         fail(lineno, "hash chain broken: this record, or one before it, was altered, "
                      "inserted, removed or reordered.")
@@ -288,10 +342,11 @@ def _iter_log(stream, allow_incomplete=False, meta=None, on_line=None, on_signed
                 early.setdefault(rec["run"], lineno)
             if event == "run_start" or (run is not None and rec.get("run") == run):
                 if chained is not None or (event == "run_start" and run is None
-                                           and rec.get("log") == LOG_CHAIN_FORMAT):
+                                           and log_format(rec.get("log")) is not None):
                     if chained is None:
-                        chained = {"head": LOG_CHAIN_IV, "n": 0, "signed": [], "since_signed": 0,
-                                   "anchor_errors": []}
+                        fmt = log_format(rec.get("log"))
+                        chained = {"head": fmt["iv"], "n": 0, "signed": [], "since_signed": 0,
+                                   "anchor_errors": [], "fmt": fmt}
                         if on_signed is not None:
                             chained["on_signed"] = on_signed
                         if meta is not None:
@@ -314,6 +369,19 @@ def _iter_log(stream, allow_incomplete=False, meta=None, on_line=None, on_signed
                 if chained is None and _version_at_least(w, (1, 16)):
                     fail(lineno, "run_start names a Warden that chains its records (1.16 or later) "
                                  "but the stream is not chained: the chain was stripped.")
+                # v1.41: a Warden of 1.41 or later writes chain-2 (SHA-384,
+                # P-384), and says so with its key: a chain-1 stream naming one
+                # was rewritten into the older format.
+                if chained is not None and _version_at_least(w, (1, 41)) and \
+                        chained["fmt"]["name"] != LOG_CHAIN_FORMAT_2:
+                    fail(lineno, "run_start names a Warden that writes chain-2 (1.41 or later) "
+                                 "but the stream is in an older format: it was rewritten.")
+                if chained is not None and "log_pubkey" in rec:
+                    lpk = pubkey_from_hex(rec.get("log_pubkey"))     # (k is the segment's index here)
+                    if lpk is None or len(lpk) != chained["fmt"]["key_len"] or \
+                            rec.get("sigalg", chained["fmt"]["sigalg"]) != chained["fmt"]["sigalg"]:
+                        fail(lineno, f"run_start's log_pubkey or sigalg is not of its format "
+                                     f"({chained['fmt']['name']}).")
                 if meta is not None:
                     meta["run_start"] = rec      # v1.15: policy_sha256, for the audit
                     meta["_run"], meta["_warden"] = run, warden_version
@@ -1000,7 +1068,7 @@ def build_bom(records, agent, policy, serial, run_id="", complete=True,
     return bom
 
 
-# ---------------- v1.18.0: JSF signature (Ed25519) ----------------
+# ---------------- v1.18.0: JSF signature (v1.41: ES384; Ed25519 verified) ----------------
 
 def jcs(obj):
     """RFC 8785 JSON canonicalization of the BOM: keys sorted, no whitespace,
@@ -1036,63 +1104,63 @@ def _b64u_dec(t):
     return base64.urlsafe_b64decode(t + "=" * (-len(t) % 4))
 
 
-def _read_hex32(arg, what):
+def _read_pubkey(arg, what):
+    """A log public key given as hex or as a file holding it (a .pub file of
+    tools/varek_keygen): P-384 (194 hex characters) or, for logs and BOMs from
+    v1.40 or earlier, Ed25519 (64)."""
     txt = arg
     if os.path.exists(arg):
         with open(arg) as fh:
             txt = fh.read()
-    txt = txt.strip()
-    if not re.fullmatch(r"[0-9a-fA-F]{64}", txt):
-        raise SystemExit(f"varek_cyclonedx: {what} must be 64 hex characters (or a file holding them)")
-    return bytes.fromhex(txt)
+    k = pubkey_from_hex(txt)
+    if k is None:
+        raise SystemExit(f"varek_cyclonedx: {what} must be a P-384 public key (194 hex characters, "
+                         f"04...) or an Ed25519 one (64), or a file holding it")
+    return k
+
+
+def _load_sign_key(key_path):
+    """The P-384 private key of a tools/varek_keygen key file (PKCS#8 PEM)."""
+    if not os.path.isfile(key_path):
+        raise SystemExit(f"varek_cyclonedx: --sign-key {key_path}: no such file")
+    with open(key_path, "rb") as fh:
+        data = fh.read()
+    try:
+        key = serialization.load_pem_private_key(data, password=None)
+    except (ValueError, TypeError):
+        key = None
+    finally:
+        data = None
+    if not isinstance(key, ec.EllipticCurvePrivateKey) or key.curve.name != "secp384r1":
+        raise SystemExit(f"varek_cyclonedx: --sign-key {key_path}: not a v1.41 signing key (a P-384 "
+                         f"PEM key from tools/varek_keygen; a v1.40 Ed25519 key is no longer used)")
+    return key
+
+
+def _point(key):
+    return key.public_key().public_bytes(serialization.Encoding.X962,
+                                         serialization.PublicFormat.UncompressedPoint)
 
 
 def public_key_of(key_path):
-    """The public key (hex) of a varek_keygen seed file, via libsodium."""
-    na, seed, pk, sk = _keypair(key_path)
-    ctypes.memset(sk, 0, 64)
-    ctypes.memset(seed, 0, 32)
-    return pk.raw.hex()
-
-
-def _keypair(key_path):
-    name = ctypes.util.find_library("sodium")
-    if not name:
-        raise SystemExit("varek_cyclonedx: --sign-key needs libsodium (the Warden's dependency)")
-    na = ctypes.CDLL(name)
-    if na.sodium_init() < 0:
-        raise SystemExit("varek_cyclonedx: libsodium failed to initialize")
-    if not os.path.isfile(key_path):
-        raise SystemExit(f"varek_cyclonedx: --sign-key {key_path}: no such file")
-    seed = ctypes.create_string_buffer(_read_hex32(key_path, "--sign-key"), 32)
-    pk = ctypes.create_string_buffer(32)
-    sk = ctypes.create_string_buffer(64)
-    if na.crypto_sign_seed_keypair(pk, sk, seed) != 0:
-        ctypes.memset(seed, 0, 32)
-        raise SystemExit("varek_cyclonedx: cannot derive the key pair")
-    return na, seed, pk, sk
+    """The public key (hex: the uncompressed P-384 point) of a varek_keygen key file."""
+    return _point(_load_sign_key(key_path)).hex()
 
 
 def sign_bom(bom, key_path):
-    """Add a JSF signature over the BOM, made with libsodium (the library the
-    Warden signs its stream with) from the varek_keygen seed file."""
-    # The seed and the secret key live in ctypes buffers that are zeroed on
-    # every path. (Python may still hold copies of the file's text; the key
-    # file itself is the secret to guard.)
-    na, seed, pk, sk = _keypair(key_path)
-    try:
-        bom.pop("signature", None)
-        bom["signature"] = {"algorithm": "Ed25519",
-                            "publicKey": {"kty": "OKP", "crv": "Ed25519", "x": _b64u(pk.raw)}}
-        msg = jcs(bom)
-        sig = ctypes.create_string_buffer(64)
-        if na.crypto_sign_detached(sig, None, msg, ctypes.c_ulonglong(len(msg)), sk) != 0:
-            raise SystemExit("varek_cyclonedx: signing failed")
-        bom["signature"]["value"] = _b64u(sig.raw)
-        return pk.raw
-    finally:
-        ctypes.memset(sk, 0, 64)
-        ctypes.memset(seed, 0, 32)
+    """Add a JSF signature over the BOM: ES384 (ECDSA P-384, SHA-384), made by
+    the host's OpenSSL through `cryptography`, with the varek_keygen key file
+    the Warden signs its stream with. As JWA (RFC 7518, 3.4) says for JSF, the
+    value is R || S, 48 bytes each, not DER."""
+    key = _load_sign_key(key_path)
+    pt = _point(key)
+    bom.pop("signature", None)
+    bom["signature"] = {"algorithm": "ES384",
+                        "publicKey": {"kty": "EC", "crv": "P-384", "x": _b64u(pt[1:49]), "y": _b64u(pt[49:97])}}
+    msg = jcs(bom)
+    r, sv = decode_dss_signature(key.sign(msg, ec.ECDSA(hashes.SHA384())))
+    bom["signature"]["value"] = _b64u(r.to_bytes(48, "big") + sv.to_bytes(48, "big"))
+    return pt
 
 
 def _no_duplicate_keys(pairs):
@@ -1105,9 +1173,10 @@ def _no_duplicate_keys(pairs):
 
 
 def verify_bom(path, pubkey_arg):
-    """Check a BOM's JSF Ed25519 signature against the key the caller trusts.
-    Returns 0 if it verifies under that key, else 1, saying why. The key the BOM
-    carries is not trusted: anyone can sign a BOM with a key of their own."""
+    """Check a BOM's JSF signature against the key the caller trusts: ES384
+    (v1.41), or Ed25519 (a BOM signed by v1.40 or earlier). Returns 0 if it
+    verifies under that key, else 1, saying why. The key the BOM carries is not
+    trusted: anyone can sign a BOM with a key of their own."""
     try:
         with open(path, encoding="utf-8") as fh:
             bom = json.load(fh, object_pairs_hook=_no_duplicate_keys)
@@ -1120,21 +1189,42 @@ def verify_bom(path, pubkey_arg):
         return 1
     pkobj = sig.get("publicKey") or {}
     try:
-        if sig.get("algorithm") != "Ed25519" or pkobj.get("kty") != "OKP" \
-                or pkobj.get("crv") != "Ed25519" or set(sig) - {"algorithm", "publicKey", "value"}:
-            raise ValueError("expected an Ed25519 JSF signer with algorithm, publicKey and value only")
-        pk = _b64u_dec(pkobj.get("x"))
-        value = _b64u_dec(sig.get("value"))
+        if set(sig) - {"algorithm", "publicKey", "value"} or not isinstance(pkobj, dict):
+            raise ValueError("expected a JSF signer with algorithm, publicKey and value only")
+        alg = sig.get("algorithm")
+        if alg == "ES384":
+            if pkobj.get("kty") != "EC" or pkobj.get("crv") != "P-384" or set(pkobj) - {"kty", "crv", "x", "y"}:
+                raise ValueError("an ES384 signer's publicKey must be an EC P-384 JWK (kty, crv, x, y)")
+            x, y = _b64u_dec(pkobj.get("x")), _b64u_dec(pkobj.get("y"))
+            raw = _b64u_dec(sig.get("value"))
+            if len(x) != 48 or len(y) != 48 or len(raw) != 96:
+                raise ValueError("an ES384 key is 48 + 48 bytes and its value 96 (R || S)")
+            pk = b"\x04" + x + y
+            value = encode_dss_signature(int.from_bytes(raw[:48], "big"), int.from_bytes(raw[48:], "big"))
+            check = varek_ed25519.verify_p384
+        elif alg == "Ed25519":
+            if pkobj.get("kty") != "OKP" or pkobj.get("crv") != "Ed25519":
+                raise ValueError("an Ed25519 signer's publicKey must be an OKP Ed25519 JWK")
+            pk = _b64u_dec(pkobj.get("x"))
+            value = _b64u_dec(sig.get("value"))
+            check = varek_ed25519.verify
+        else:
+            raise ValueError(f"algorithm {alg!r} is not ES384 or Ed25519")
     except (ValueError, TypeError) as e:
         print(f"varek_cyclonedx: {path}: malformed signature ({e})", file=sys.stderr)
         return 1
     unsigned = dict(bom)
     unsigned["signature"] = {k: v for k, v in sig.items() if k != "value"}
-    if not varek_ed25519.verify(pk, jcs(unsigned), value):
+    try:
+        good = check(pk, jcs(unsigned), value)
+    except varek_ed25519.AlgorithmUnavailable as e:          # v1.41: a host in FIPS mode
+        print(f"varek_cyclonedx: {path}: {e}", file=sys.stderr)
+        return 1
+    if not good:
         print(f"varek_cyclonedx: {path}: signature does NOT verify (the BOM was changed "
               f"after signing, or the signature is not for it)", file=sys.stderr)
         return 1
-    if pk != _read_hex32(pubkey_arg, "--pubkey"):
+    if pk != _read_pubkey(pubkey_arg, "--pubkey"):
         print(f"varek_cyclonedx: {path}: signed under key {pk.hex()}, not the one given",
               file=sys.stderr)
         return 1
@@ -1146,12 +1236,16 @@ def check_stream_signatures(meta, pubkey_arg, complete):
     """v1.18.0: verify the stream's signed records against the key the caller
     trusts (as tools/varek_audit.py --pubkey does for the signatures). Raises
     StreamError on any failure; returns the key's hex."""
-    pk = _read_hex32(pubkey_arg, "--pubkey")
+    pk = _read_pubkey(pubkey_arg, "--pubkey")
     lg = meta.get("log")
     if not lg:
         raise StreamError("varek_cyclonedx: --pubkey given, but the stream is not chained "
                           "(a Warden before v1.16): nothing is signed. Refusing to emit a BOM.")
-    named = str(meta.get("run_start", {}).get("log_pubkey", ""))
+    named = str(meta.get("run_start", {}).get("log_pubkey", "")).lower()
+    fmt = lg.get("fmt") or log_format(LOG_CHAIN_FORMAT)
+    if len(pk) != fmt["key_len"]:
+        raise StreamError(f"varek_cyclonedx: the key given is not of the stream's format "
+                          f"({fmt['name']} is signed with {fmt['sigalg']}). Refusing to emit a BOM.")
     if named != pk.hex():
         raise StreamError(f"varek_cyclonedx: run_start names signing key {named or '(none)'}, "
                           f"not the one given. Refusing to emit a BOM.")
@@ -1160,7 +1254,11 @@ def check_stream_signatures(meta, pubkey_arg, complete):
         if not c.get("sig"):
             raise StreamError(f"varek_cyclonedx: line {c['line']}: {c['event']} record is not "
                               f"signed. Refusing to emit a BOM.")
-        if not varek_ed25519.verify(pk, LOG_SIG_DOMAIN + c["chain"], bytes.fromhex(c["sig"])):
+        try:
+            good = fmt["verify"](pk, fmt["domain"] + c["chain"], bytes.fromhex(c["sig"]))
+        except varek_ed25519.AlgorithmUnavailable as e:      # v1.41: a host in FIPS mode
+            raise StreamError(f"varek_cyclonedx: {e}. Refusing to emit a BOM.")
+        if not good:
             raise StreamError(f"varek_cyclonedx: line {c['line']}: {c['event']} signature does "
                               f"not verify under the key given. Refusing to emit a BOM.")
     if not signed or signed[0]["event"] != "run_start" or \
@@ -1182,7 +1280,7 @@ def main(argv=None):
     ap.add_argument("--serial", help="BOM serialNumber (default: a fresh urn:uuid)")
     ap.add_argument("--allow-incomplete", action="store_true",
                     help="attest a stream with no run_end record (marked run.complete=false)")
-    ap.add_argument("--sign-key", help="sign the BOM (JSF, Ed25519) with this varek_keygen key file")
+    ap.add_argument("--sign-key", help="sign the BOM (JSF, ES384: ECDSA P-384) with this varek_keygen key file")
     ap.add_argument("--verify", metavar="BOM",
                     help="verify a signed BOM against --pubkey and exit")
     ap.add_argument("--pubkey", help="the Warden's log public key (hex, or its .pub file): with "

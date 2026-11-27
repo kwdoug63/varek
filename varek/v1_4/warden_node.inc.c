@@ -163,7 +163,9 @@ static int node_key_put(const char *path, const char *text, mode_t mode, bool re
 }
 
 static int node_key_prepare(const char *path, const char *pub_path, const char *anchor) {
-    if (sodium_init() < 0) { fprintf(stderr, "[warden] libsodium failed to initialize\n"); return -1; }
+    /* v1.41: the crypto backend is initialised in main() before this runs.
+     * The node's key is an ECDSA P-384 key (PKCS#8 PEM) made by the host
+     * provider; through v1.40 it was an Ed25519 seed (64 hex characters). */
     /* the key's directory: root's, written by no one else (so no one else
      * can put a key of their own there before the first start) */
     char dir[PATH_MAX];
@@ -177,17 +179,18 @@ static int node_key_prepare(const char *path, const char *pub_path, const char *
         fprintf(stderr, "[warden] --node-key %s: its directory %s must be root's, written by no one else\n", path, dir);
         return -1;
     }
-    unsigned char seed[crypto_sign_SEEDBYTES];
-    char hex[2 * crypto_sign_SEEDBYTES + 2];
+    char pem[4096];
+    char pk_hex[VFIPS_PUB_HEX_MAX + 1];      /* + the newline written after it */
     bool made = false;
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0 && errno == ENOENT) {        /* the first start: make it */
-        randombytes_buf(seed, sizeof seed);
-        sodium_bin2hex(hex, sizeof hex - 1, seed, sizeof seed);
-        sodium_memzero(seed, sizeof seed);
-        strcat(hex, "\n");
-        int err = node_key_put(path, hex, 0400, false);
-        sodium_memzero(hex, sizeof hex);
+        if (vfips_keygen_pem(pem, sizeof pem, pk_hex, sizeof pk_hex) != 0) {
+            vfips_memzero(pem, sizeof pem);
+            fprintf(stderr, "[warden] --node-key %s: cannot make the node's key (P-384 key generation failed)\n", path);
+            return -1;
+        }
+        int err = node_key_put(path, pem, 0400, false);
+        vfips_memzero(pem, sizeof pem);
         if (err && err != EEXIST) {         /* EEXIST: made meanwhile; read that one */
             fprintf(stderr, "[warden] --node-key %s: cannot make the node's key: %s\n", path, strerror(err));
             return -1;
@@ -202,28 +205,30 @@ static int node_key_prepare(const char *path, const char *pub_path, const char *
         if (fd >= 0) close(fd);
         return -1;
     }
-    char buf[80];
+    size_t total = 0;
     ssize_t n;
-    do { n = read(fd, buf, sizeof buf); } while (n < 0 && errno == EINTR);
-    close(fd);
-    size_t bl = 0;
-    bool ok = (n == 64 || (n == 65 && buf[64] == '\n')) &&
-              sodium_hex2bin(seed, sizeof seed, buf, 64, NULL, &bl, NULL) == 0 && bl == sizeof seed;
-    sodium_memzero(buf, sizeof buf);
-    unsigned char *sk = ok ? sodium_malloc(crypto_sign_SECRETKEYBYTES) : NULL;
-    unsigned char pk[crypto_sign_PUBLICKEYBYTES];
-    if (sk) {
-        crypto_sign_seed_keypair(pk, sk, seed);
-        sodium_free(sk);
+    for (;;) {
+        n = read(fd, pem + total, sizeof pem - 1 - total);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        total += (size_t)n;
+        if (total == sizeof pem - 1) break;
     }
-    sodium_memzero(seed, sizeof seed);
-    if (!sk) {
-        fprintf(stderr, "[warden] --node-key %s: %s\n", path, ok ? "cannot allocate protected memory"
-                : "not a VAREK signing key (64 hex characters); remove it, and the node agent makes a new one");
+    int rerr = n < 0 ? errno : 0;
+    close(fd);
+    pem[total] = '\0';
+    char kwhy[160] = {0};
+    vfips_key *k = n < 0 ? NULL : vfips_key_load_pem(pem, total, kwhy, sizeof kwhy);
+    vfips_memzero(pem, sizeof pem);
+    int pl = k ? vfips_pubkey_hex(k, pk_hex, sizeof pk_hex - 1) : -1;
+    vfips_key_free(k);
+    if (pl < 0) {
+        fprintf(stderr, "[warden] --node-key %s: %s; remove it, and the node agent makes a new one "
+                "(v1.41 node keys are P-384; a key from v1.40 or earlier is not used, and the node's "
+                "public key changes, so update its VarekNodeKey)\n",
+                path, n < 0 ? strerror(rerr) : (k ? "cannot derive its public key" : kwhy));
         return -1;
     }
-    char pk_hex[2 * crypto_sign_PUBLICKEYBYTES + 2];
-    sodium_bin2hex(pk_hex, sizeof pk_hex - 1, pk, sizeof pk);
     char pub[PATH_MAX];
     if ((size_t)snprintf(pub, sizeof pub, pub_path ? "%s" : "%s.pub", pub_path ? pub_path : path) >= sizeof pub) {
         fprintf(stderr, "[warden] --node-key %s: the path is too long\n", path);
@@ -243,9 +248,11 @@ static int node_key_prepare(const char *path, const char *pub_path, const char *
             return -1;
         }
     }
-    strcat(pk_hex, "\n");
+    size_t hl = strlen(pk_hex);
+    pk_hex[hl] = '\n';
+    pk_hex[hl + 1] = '\0';
     int err = node_key_put(pub, pk_hex, 0444, true);
-    pk_hex[2 * crypto_sign_PUBLICKEYBYTES] = '\0';
+    pk_hex[hl] = '\0';
     if (err) {
         fprintf(stderr, "[warden] --node-key %s: cannot write its public key %s: %s\n", path, pub, strerror(err));
         return -1;
@@ -263,9 +270,17 @@ static int node_key_prepare(const char *path, const char *pub_path, const char *
         }
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        char line[512];
-        int ln = snprintf(line, sizeof line, "{\"event\":\"node_key\",\"node\":\"%s\",\"key\":\"%s\",\"timestamp_ns\":%lld}\n",
+        /* v1.41: a P-384 key is 194 hex characters (an Ed25519 key was 64), so
+         * with a 253-character node name the line no longer fits 512 bytes */
+        char line[1024];
+        int ln = snprintf(line, sizeof line, "{\"event\":\"node_key\",\"node\":\"%s\",\"key\":\"%s\","
+                          "\"sigalg\":\"" VFIPS_SIGALG_P384 "\",\"timestamp_ns\":%lld}\n",
                           g_node_name, pk_hex, (long long)(ts.tv_sec * 1000000000LL + ts.tv_nsec));
+        if (ln < 0 || (size_t)ln >= sizeof line) {
+            close(af);
+            fprintf(stderr, "[warden] anchor %s: the node_key line is too long\n", anchor);
+            return -1;
+        }
         ssize_t w;
         do { w = write(af, line, (size_t)ln); } while (w < 0 && errno == EINTR);
         int e = w < 0 ? errno : EIO;
@@ -617,10 +632,14 @@ static int node_copy(int sd, const char *streams, const char *base, const char *
         snprintf(why, wn, "cannot read the %s %.300s whole", what, *policy_path);
         return -1;
     }
-    unsigned char h[crypto_hash_sha256_BYTES];
+    unsigned char h[VFIPS_SHA256_LEN];
     char hex[65];
-    crypto_hash_sha256(h, (const unsigned char *)b, n);
-    sodium_bin2hex(hex, sizeof hex, h, sizeof h);
+    if (vfips_sha256(b, n, h) != 0) {          /* v1.41: via the host provider */
+        free(b);
+        snprintf(why, wn, "cannot hash the %s %.300s (SHA-256 failed)", what, *policy_path);
+        return -1;
+    }
+    vfips_bin2hex(hex, sizeof hex, h, sizeof h);
     if (want[0] && strcmp(hex, want)) {
         free(b);
         snprintf(why, wn, "the %s %.300s is not the one the NRI plugin wrote the container's filter for "
@@ -2505,7 +2524,7 @@ static int node_supervise(const struct policy *p, const char *boot_path, const c
     /* the container's exit status is the runtime's to report: -1 here */
     emit_run_end(-1);
     anchor_drain();
-    if (g_sk) sodium_free(g_sk);
+    if (g_key) vfips_key_free(g_key);
     close(target_pidfd);
     close(g_nr.notify_fd);
     return ended ? 0 : 1;
