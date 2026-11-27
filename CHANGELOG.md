@@ -18,6 +18,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Python 3.9 (RHEL 9, Rocky Linux 9, Amazon Linux 2023) pytest is the
   distribution's `python3-pytest`, as no pytest for 3.9 is free of a known
   vulnerability.
+- `integrations/sentinel/README.md` says where the workbook and rules are
+  now that Sentinel is moving to the Microsoft Defender portal (Defender
+  only after March 31, 2027): the workbook is an Azure Monitor workbook and
+  still opens from its resource group or Monitor → Workbooks.
 
 ---
 

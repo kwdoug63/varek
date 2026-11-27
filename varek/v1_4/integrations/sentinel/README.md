@@ -118,6 +118,17 @@ az deployment group create -g RESOURCE_GROUP --template-file /opt/varek/integrat
   time, by policy line and by agent; runs; the latest refusals; dry runs;
   failed audits.
 
+**Where to find them: Sentinel is moving to the Defender portal.** In the
+live test (November 16, 2026), Sentinel → Workbooks in the Azure portal
+said the page had moved to the Microsoft Defender portal, and that after
+March 31, 2027 Sentinel is in the Defender portal only. The template's
+workbook is an Azure Monitor workbook (`microsoft.insights/workbooks`), so
+it still opens in the Azure portal: the resource group → the workbook
+resource → Open workbook, or Monitor → Workbooks. In the Defender portal
+(`security.microsoft.com`), the workspace's rules, incidents and
+workbooks appear once the workspace is connected there, in its Microsoft
+Sentinel settings; the live test did not do that step.
+
 The rules run every 5 minutes and judge the rows that arrived in their own
 5 minutes (`ingestion_time() > ago(5m) and ingestion_time() <= now()`),
 whenever their decisions were made, up to a day before: a run exported
