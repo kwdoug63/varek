@@ -40,7 +40,8 @@ signed by pinned keys, standing grants and plans approved ahead of time,
 the user's request recorded (`--intent`) and each proposal posted to a
 webhook (`notify=`). The policy grammar moves to 1.42. AARM's conformance
 tests for R1 to R6 run in `mode=hold` (`make test-v1420`, section 15). The
-24-hour soak's results follow when it ends.
+24-hour soak passed (the shared soak with v1.42.0's approvals, and the packs
+on the core build and on the Defense build in FIPS mode).
 
 ### Added
 
