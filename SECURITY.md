@@ -124,9 +124,9 @@ published release.
 
 | Version | Security fixes |
 |---|---|
-| 1.40.x | Yes (the latest) |
-| 1.39.x | Yes, until 1.41.0 is released |
-| 1.38.x and earlier | No: upgrade to 1.40 |
+| 1.42.x | Yes (the latest) |
+| 1.41.x | Yes, until 1.43.0 is released |
+| 1.40.x and earlier | No: upgrade to 1.42 |
 
 The container images, the charts and VAREK Enterprise's Marketplace image
 follow the same lines.

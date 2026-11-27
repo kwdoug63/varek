@@ -10,8 +10,9 @@
 #
 # Checks, in order, and prints PASS / WARN / FAIL for each:
 #   1. The Warden and its tools are built and up to date; if not, the build
-#      dependencies (compiler, libseccomp and libsodium headers; v1.16 needs
-#      libsodium) are checked and the tools are built. --install-deps installs
+#      dependencies (compiler, libseccomp and OpenSSL 3 headers; v1.41: the
+#      Warden's hashing and signing are OpenSSL's, and libsodium is no longer
+#      used) are checked and the tools are built. --install-deps installs
 #      missing dependencies with apt-get or dnf (sudo). A host with up-to-date
 #      binaries needs neither a compiler nor the headers.
 #   2. The policy loads in both parsers and lints.
@@ -22,9 +23,10 @@
 #                       policy lets the agent open, and must have one name; its
 #                       directory must exist;
 #        --sign-key K   a regular file (not a symlink) with one name, mode
-#                       without group/other bits, exactly 64 hex characters
-#                       (optionally a trailing newline), that the agent cannot
-#                       open;
+#                       without group/other bits, a PKCS#8 PEM private key
+#                       (v1.41: ECDSA P-384, from tools/varek_keygen; with the
+#                       openssl command, the curve and K.pub are checked too),
+#                       that the agent cannot open;
 #        --anchor PATH  not a symlink; a regular file (one name), FIFO or
 #                       character device, or a new file in an existing
 #                       directory; the agent cannot open it;
@@ -121,22 +123,22 @@ else
         missing=""
         command -v "${CC:-cc}" >/dev/null 2>&1 || missing="$missing compiler"
         have_header seccomp.h || missing="$missing libseccomp"
-        have_header sodium.h || missing="$missing libsodium"
+        have_header openssl/evp.h || missing="$missing OpenSSL"
     }
     missing_deps
     if [ -n "$missing" ] && [ "$INSTALL" = 1 ]; then
         if command -v apt-get >/dev/null 2>&1; then
-            $SUDO apt-get update && $SUDO apt-get install -y build-essential libseccomp-dev libsodium-dev
+            $SUDO apt-get update && $SUDO apt-get install -y build-essential libseccomp-dev libssl-dev
         elif command -v dnf >/dev/null 2>&1; then
-            $SUDO dnf install -y gcc make libseccomp-devel libsodium-devel
+            $SUDO dnf install -y gcc make libseccomp-devel openssl-devel
         fi
         missing_deps
     fi
     if [ -n "$missing" ]; then
-        fail "missing:$missing. Install with: sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libsodium-dev (Debian/Ubuntu) or sudo dnf install -y gcc make libseccomp-devel libsodium-devel (Fedora/RHEL), or rerun with --install-deps"
+        fail "missing:$missing. Install with: sudo apt-get update && sudo apt-get install -y build-essential libseccomp-dev libssl-dev (Debian/Ubuntu) or sudo dnf install -y gcc make libseccomp-devel openssl-devel (Fedora/RHEL), or rerun with --install-deps"
         echo "preflight: FAIL (cannot build without the dependencies)"; exit 1
     fi
-    pass "compiler, libseccomp and libsodium headers found"
+    pass "compiler, libseccomp and OpenSSL headers found"
     blog="$(mktemp)"
     if make -s -C "$HERE" "${TOOLS[@]}" >"$blog" 2>&1; then
         pass "the Warden and its tools built ($HERE)"
@@ -243,11 +245,32 @@ if [ -n "$KEY" ]; then
         [ "$nl" = 1 ] && pass "signing key has one name" || fail "signing key has $nl names (hard links): refused"
         sz="$(stat -c %s "$K")"
         if [ -r "$K" ]; then
-            body="$(head -c 64 "$K")"
-            tail_ok=1
-            [ "$sz" = 64 ] || { [ "$sz" = 65 ] && [ "$(tail -c 1 "$K" | od -An -c | tr -d ' ')" = '\n' ]; } || tail_ok=0
-            if [ "$tail_ok" = 1 ] && [[ "$body" =~ ^[0-9a-fA-F]{64}$ ]]; then pass "signing key is 64 hex characters"
-            else fail "signing key is not exactly 64 hex characters (optionally one trailing newline); make one with tools/varek_keygen"; fi
+            # v1.41: a PKCS#8 PEM key (ECDSA P-384). A v1.40 key (an Ed25519
+            # seed, 64 hex characters) is named as such: the Warden refuses it.
+            first="$(head -n 1 "$K")"; last="$(grep -v '^$' "$K" | tail -n 1)"
+            if [ "$sz" -le 65 ] && [[ "$(head -c 64 "$K")" =~ ^[0-9a-fA-F]{64}$ ]]; then
+                fail "signing key is a v1.40 Ed25519 key (64 hex characters); v1.41 signs with ECDSA P-384: make a new key with tools/varek_keygen (logs the old key signed stay verifiable with its .pub)"
+            elif [ "$first" = "-----BEGIN PRIVATE KEY-----" ] && [ "$last" = "-----END PRIVATE KEY-----" ] && [ "$sz" -le 4096 ]; then
+                pass "signing key is a PKCS#8 PEM private key"
+                if command -v openssl >/dev/null 2>&1; then
+                    # Only the public half is derived (nothing of the private key
+                    # is printed), its point uncompressed whatever the key's own form (RHEL 9.8's
+                    # OpenSSL writes it compressed): P-384's OID, 1.3.132.0.34, in its DER form
+                    spki="$(openssl pkey -in "$K" -pubout -outform DER -ec_conv_form uncompressed 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+                    if [ -z "$spki" ]; then fail "signing key: openssl cannot read it as a private key"
+                    elif [[ "$spki" == *06052b81040022* ]]; then
+                        pass "signing key is on curve P-384"
+                        if [ -f "$K.pub" ]; then
+                            [ "$(tr -d '\n' < "$K.pub")" = "${spki: -194}" ] && pass "$K.pub is the key's public half" \
+                              || fail "$K.pub is not this key's public half: auditors would check against the wrong key"
+                        fi
+                    else fail "signing key is not on curve P-384 (v1.41 signs with ECDSA P-384; make one with tools/varek_keygen)"; fi
+                else
+                    warn "no openssl command: the key's curve was not checked here (the Warden checks it at start)"
+                fi
+            else
+                fail "signing key is not a PKCS#8 PEM private key; make one with tools/varek_keygen"
+            fi
         else
             warn "cannot read the signing key as this user, so its contents were not checked (run as root, or use --run)"
         fi

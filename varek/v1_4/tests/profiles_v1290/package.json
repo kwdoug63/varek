@@ -1,0 +1,10 @@
+{
+  "name": "varek-profiles-v1290-clis",
+  "private": true,
+  "description": "The agent CLIs profiles_v1290.sh runs against their profiles, at exact versions; package-lock.json pins every package by integrity hash, npm ci installs it, and Dependabot updates it.",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.330",
+    "@google/gemini-cli": "0.70.0",
+    "@openai/codex": "0.171.0"
+  }
+}

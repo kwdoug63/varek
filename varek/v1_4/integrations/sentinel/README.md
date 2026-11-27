@@ -105,26 +105,55 @@ az deployment group create -g RESOURCE_GROUP --template-file /opt/varek/integrat
   came 10 minutes after the run.
 - **VAREK: a dry run let through what its policy refuses**
   (Informational; no incident).
+- **VAREK: an approval nobody gave in time** (v1.42; Medium; an
+  incident): a call a `step_up` rule held or proposed was refused at its
+  timeout, with no approver's answer, or a deferral's context (its marker,
+  or a plan extension) did not come in time. One alert for each run, agent
+  and policy line, with the calls that waited. It reads the row's
+  `EventName` (`varek.step_up_end`, `varek.defer_end`) and the ending in
+  `OcsfEvent`, so the table needs no new column. An approval abandoned
+  because its call or its run ended first (usual for `mode=grant` at a
+  run's end) raises nothing.
 - **The workbook, *VAREK: the Warden's decisions***: counts; refusals over
   time, by policy line and by agent; runs; the latest refusals; dry runs;
   failed audits.
 
-The rules run every 5 minutes and judge the rows that arrived in the last
-6 minutes (`ingestion_time()`), whenever their decisions were made, up to a
-day before: a run exported within a day of its decisions raises its
-incidents. One exported later reaches the table and the workbook but
-raises none. (A day: Sentinel runs a rule that looks back 2 days or more
-at most hourly.) The window is a minute longer than the rule's period
-because Sentinel's runs are not exactly 5 minutes apart: no row falls
-between two runs. Sentinel also measures a scheduled rule's `ago()` from
-about 5 minutes before the run (its built-in delay for late rows), so a
-row is judged by two or three runs, and each raises its alert again, in
-the same incident (the incidents group a run's alerts by run and host).
-An alert's time is its rows', the latest decision. In `SecurityAlert`, a
-refusal's or a failed audit's run is in the alert's custom details:
-`parse_json(tostring(parse_json(ExtendedProperties)["Custom Details"])).RunId[0]`. Rules deployed before v1.40.0 looked back 5
-minutes by the decision's time; deploy `sentinel-content.json` again to
-replace them.
+**Where to find them: Sentinel is moving to the Defender portal.** In the
+live test (November 16, 2026), Sentinel → Workbooks in the Azure portal
+said the page had moved to the Microsoft Defender portal, and that after
+March 31, 2027 Sentinel is in the Defender portal only. The template's
+workbook is an Azure Monitor workbook (`microsoft.insights/workbooks`), so
+it still opens in the Azure portal: the resource group → the workbook
+resource → Open workbook, or Monitor → Workbooks. In the Defender portal
+(`security.microsoft.com`), the workspace's rules, incidents and
+workbooks appear once the workspace is connected there, in its Microsoft
+Sentinel settings; the live test did not do that step.
+
+The rules run every 5 minutes and judge the rows that arrived in their own
+5 minutes (`ingestion_time() > ago(5m) and ingestion_time() <= now()`),
+whenever their decisions were made, up to a day before: a run exported
+within a day of its decisions raises its incidents. One exported later
+reaches the table and the workbook but raises none. (A day: Sentinel runs
+a rule that looks back 2 days or more at most hourly.) In a rule, `now()`
+is the end of the run's query window, and the windows end exactly 5
+minutes apart, so each row is judged once and raises one alert, about 5
+to 10 minutes after it arrives (8 to 9 in the live test, November 21,
+2026). An alert's time is its rows', the latest decision. Rules deployed before
+v1.40.0 looked back 5 minutes by the decision's time, and v1.40.0's took
+the last 6 minutes of arrivals with no upper bound, so a row could raise
+the same alert up to three times; deploy `sentinel-content.json` again
+to replace them.
+
+A run's refusal and failed-audit alerts carry its id in their custom
+details (the dry-run rule's do not):
+
+```kusto
+SecurityAlert
+| where TimeGenerated > ago(1d) and AlertName startswith "VAREK"
+| extend RunId = tostring(parse_json(tostring(parse_json(ExtendedProperties)["Custom Details"])).RunId[0])
+| where RunId == "RUNID"
+| project TimeGenerated, AlertSeverity, AlertName, SystemAlertId
+```
 
 Sentinel is moving to the Microsoft Defender portal (after March 31, 2027,
 Sentinel is in Defender only), and the Azure portal's Sentinel →

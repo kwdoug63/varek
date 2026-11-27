@@ -14,7 +14,7 @@
 #      exit status.
 #   3. A refusal's record says the errno the agent received (EACCES).
 #   4. The CycloneDX export: attestation derived from the stream, the policy
-#      file checked against the Warden's, a JSF Ed25519 signature that
+#      file checked against the Warden's, a JSF ES384 (ECDSA P-384; v1.41) signature that
 #      verifies only under a key the caller gives and catches tampering, the
 #      stream's own signatures checked under that key, CycloneDX 1.6
 #      schema-valid, and a stream that authorizes an UNKNOWN refused.
@@ -355,7 +355,7 @@ python3 "$CDX" --log "$OUT/edited2.log" --policy "$DENYPOL" --sign-key "$D/state
 python3 -c '
 import re, sys
 t = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read()
-open(sys.argv[2], "w", encoding="utf-8", errors="surrogateescape").write(re.sub(r",\"sig\":\"[0-9a-f]{128}\"", "", t))' "$OUT/run.log" "$OUT/nosig.log"
+open(sys.argv[2], "w", encoding="utf-8", errors="surrogateescape").write(re.sub(r",\"sig\":\"[0-9a-f]+\"", "", t))' "$OUT/run.log" "$OUT/nosig.log"
 python3 "$CDX" --log "$OUT/nosig.log" --policy "$DENYPOL" --pubkey "$D/state/log.key.pub" --output "$OUT/r.json" 2> "$OUT/x.err"; rc=$?
 [ "$rc" -ne 0 ] && grep -q 'not signed' "$OUT/x.err" && pass "a stream with its signatures stripped is refused under the Warden's key" \
     || flunk "a stream with its signatures stripped is refused under the Warden's key (rc=$rc)"

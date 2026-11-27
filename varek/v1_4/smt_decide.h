@@ -102,7 +102,15 @@
 
 typedef enum { VDP_KIND_PATH = 0, VDP_KIND_HOST = 1, VDP_KIND_EXEC = 2,
                VDP_KIND_REQUEST = 3 /* v1.26.1 */, VDP_KIND_MCP = 4 /* v1.31 */ } vdp_kind_t;
-typedef enum { VDP_ALLOW = 0, VDP_DENY = 1 } vdp_verb_t;
+/* v1.42 (docs/security/v1.42-step-up-defer.md): VDP_STEP_UP, a rule whose
+ * calls a person must approve. Decided alone it refuses (UNSATISFIED, like
+ * VDP_DENY); a call it decides is allowed only by a grant under it
+ * (vdp_decide_grant). */
+/* v1.42 step 5: VDP_DEFER, a conditional allow: `defer ... until=FILE`.
+ * Decided alone it refuses (UNSATISFIED); the Warden allows a call it
+ * decides while its marker passes, and defers (holds) it otherwise. With
+ * `escalate`, a grant under it may allow the call, as under a step_up rule. */
+typedef enum { VDP_ALLOW = 0, VDP_DENY = 1, VDP_STEP_UP = 2, VDP_DEFER = 3 } vdp_verb_t;
 typedef enum {
     VDP_STR_PREFIX = 0, VDP_STR_EQ = 1, VDP_STR_HOST = 2,          /* v1.13 */
     VDP_STR_SUFFIX = 3, VDP_STR_CONTAINS = 4, VDP_STR_GLOB = 5,    /* v1.14 */
@@ -142,6 +150,23 @@ typedef struct {
     uint32_t mask;      /* 0 = no constraint */
     uint32_t value;     /* value & ~mask == 0 */
 } vdp_bv_atom_t;
+
+enum { VDP_SU_GRANT = 0, VDP_SU_HOLD = 1 };          /* su_mode */
+enum { VDP_SCOPE_THREAD = 0, VDP_SCOPE_RUN = 1 };    /* su_scope */
+#define VDP_SU_TIMEOUT_DEFAULT 300                   /* seconds */
+#define VDP_SU_TIMEOUT_MAX     3600
+#define VDP_SU_NOTIFY_MAX      512                   /* notify= URL, bytes */
+#define VDP_DF_UNTIL_MAX       255                   /* until= path, bytes (v1.42 step 5) */
+
+/* v1.42 step 6: an approver's pinned key (`approver key=HEX group=G [name=N]`) */
+#define VDP_MAX_APPROVERS     16
+#define VDP_APPROVER_KEY_HEX  194          /* the uncompressed P-384 point 04||X||Y, as hex */
+typedef struct {
+    char key[VDP_APPROVER_KEY_HEX + 1];
+    char group[33];
+    char name[33];
+    int  line;
+} vdp_approver_t;
 
 typedef struct {
     vdp_verb_t     verb;
@@ -185,6 +210,23 @@ typedef struct {
     int            confined_subj;
     bool           mcp_server;
     char           sha256[65];
+    /* v1.42: a step_up rule's options (not part of any decision):
+     * `mode=grant|hold` (su_mode; default grant), `approvers=GROUP` (a Unix
+     * group, "" : any user but root alone), `timeout=N` (seconds, 1 to
+     * VDP_SU_TIMEOUT_MAX; 0: the default, VDP_SU_TIMEOUT_DEFAULT),
+     * `scope=thread|run` (su_scope; default thread) and `notify=URL` (an
+     * https:// webhook, "" : none). */
+    uint8_t        su_mode;
+    uint8_t        su_scope;
+    uint32_t       su_timeout;
+    char           su_approvers[33];
+    char           su_notify[VDP_SU_NOTIFY_MAX + 1];
+    /* v1.42 step 5: a defer rule's `until=FILE` (its marker, an absolute
+     * path) and `escalate`; its approvers=, timeout= and scope= are the su_
+     * fields (scope default run; su_mode is hold: a deferral is held). Not
+     * part of any decision. */
+    bool           su_escalate;
+    char           df_until[VDP_DF_UNTIL_MAX + 1];
 } vdp_rule_t;
 
 #define VDP_PROXY_MAX_PORTS 16
@@ -307,6 +349,37 @@ typedef struct {
      * without a plan, or not held to it, refuses to start. Not part of any
      * decision. */
     bool         require_plan;
+    /* v1.42: `max_held N` (calls held at once in a run; default
+     * VDP_MAX_HELD_DEFAULT) and `max_pending N` (proposed grants awaiting an
+     * answer; default VDP_MAX_PENDING_DEFAULT), each 1 to VDP_MAX_HELD_LIMIT.
+     * 0: not given. Not part of any decision. */
+    uint32_t     max_held;
+    uint32_t     max_pending;
+    /* v1.42 step 5: `on unknown defer escalate [timeout=N] [scope=thread|run]
+     * [approvers=GROUP]` (unk_line its line; 0: `on unknown deny`, the
+     * default): a call no rule holds is held as a STEP_UP after every rule
+     * of the policy (a grant's `step_up line` may name this line). Not part
+     * of any decision. */
+    int          unk_line;
+    uint32_t     unk_timeout;
+    uint8_t      unk_scope;
+    char         unk_approvers[33];
+    /* v1.42 step 5b: `on outside_plan defer [timeout=N] [scope=thread|run]
+     * [approvers=GROUP]` (op_line its line; 0: `on outside_plan deny`, the
+     * default): under --hold-to-plan, a call the policy allows but no plan
+     * step covers is held until a plan extension covers it. Not part of any
+     * decision. */
+    int          op_line;
+    uint32_t     op_timeout;
+    uint8_t      op_scope;
+    char         op_approvers[33];
+    /* v1.42 step 6: `approver key=HEX group=GROUP [name=NAME]`: an
+     * approver's signing key, pinned by its value (the uncompressed P-384
+     * point, as varek_keygen writes KEY.pub), so the policy's digest covers
+     * it. Standing grants, plan approvals and signed runtime grants are
+     * checked against these. Not part of any decision. */
+    vdp_approver_t approvers[VDP_MAX_APPROVERS];
+    size_t       napprovers;
     /* v1.31: the confined subjects (subject k is subjects[k - 1]) and the
      * MCP resources trusted for the user's token */
     vdp_subject_t subjects[VDP_MAX_SUBJECTS];
@@ -314,6 +387,10 @@ typedef struct {
     vdp_mcpres_t  mcpres[VDP_MAX_MCPRES];
     size_t        nmcpres;
 } vdp_policy_t;
+
+#define VDP_MAX_HELD_DEFAULT    8
+#define VDP_MAX_PENDING_DEFAULT 16
+#define VDP_MAX_HELD_LIMIT      1024
 
 /* Why a verdict was reached (for records). */
 typedef enum {
@@ -329,6 +406,7 @@ typedef enum {
 const char *vdp_verdict_name(vdp_verdict_t v);
 const char *vdp_why_name(vdp_why_t w);
 const char *vdp_kind_name(vdp_kind_t k);
+const char *vdp_verb_name(vdp_verb_t v);   /* v1.42: allow, deny, step_up */
 
 // Parse a policy file. Returns 0, or -1 with a message in err. Refuses (never
 // silently drops) a policy with more than VDP_MAX_RULES rules, a line of more
@@ -547,6 +625,73 @@ typedef struct {
  * then refuses: the action is not authorized). */
 int vdp_certificate(const vdp_policy_t *p, int rule_index, const char *s, vdp_cert_t *c);
 
+/* ------------------------------------------------------------------------ */
+/* v1.42: grants (docs/security/v1.42-step-up-defer.md, "Grants")             */
+/* ------------------------------------------------------------------------ */
+/* A grant is what one approval allows: a few allow rules in the policy
+ * grammar, under one step_up rule of the policy (its envelope), with a scope
+ * and limits. Its text:
+ *
+ *     grant
+ *     step_up line N                 the policy's step_up rule (its line)
+ *     allow <kind> ...               1 to VDP_GRANT_MAX_RULES rules
+ *     for [user=U] [subagent=S] [run=ID]           optional, once
+ *     count N                        at least one of count and until
+ *     until YYYY-MM-DDTHH:MM:SSZ
+ *
+ * Blank lines and '#' comments are allowed; nothing else. The allow rules
+ * are of the step_up rule's kind and are read as the policy's own would be
+ * (its proxy settings included), but without for=, credential=, header=,
+ * subagent=, a wildcard host or an mcp server line. A grant allows a call
+ * only when the step_up rule is the first of the policy's rules to hold on
+ * it and one of the grant's rules is the first of the grant's to hold, so it
+ * can neither widen the policy nor reach past its step_up rule. Scope and
+ * limits are the Warden's to apply; they are not part of any decision. */
+#define VDP_GRANT_MAX_RULES 8
+#define VDP_GRANT_TEXT_MAX  16384
+
+typedef struct {
+    vdp_rule_t rules[VDP_GRANT_MAX_RULES];
+    size_t     n;
+    int        su_rule;         /* the step_up rule's index in the policy (-1: su_unknown) */
+    int        su_line;         /* and its line */
+    bool       su_unknown;      /* v1.42 step 5: under the `on unknown defer escalate` line */
+    int        lines[VDP_GRANT_MAX_RULES];   /* each rule's line in the grant's text */
+    char       user[256];       /* for user=, "" : any */
+    char       subagent[33];    /* for subagent=, "" : any (the agent's own calls included) */
+    char       run[65];         /* for run=, "" : any */
+    uint32_t   count;           /* calls it allows; 0: no count */
+    int64_t    until;           /* seconds since the epoch, UTC; 0: no time limit */
+} vdp_grant_t;
+
+/* Parse a grant's text against policy p (which holds the step_up rule).
+ * 0, or -1 with the reason in err ("grant:LINE: ..."). On success free it
+ * with vdp_grant_free. */
+int  vdp_grant_parse(const vdp_policy_t *p, const char *text, size_t len, vdp_grant_t *g,
+                     char *err, size_t errlen);
+void vdp_grant_free(vdp_grant_t *g);
+
+/* Decide a call within grants. As vdp_decide_subj, except: when the
+ * policy's verdict is UNSATISFIED because step_up rule *rule_index decided
+ * it, each grant in gs[0..ng) under that rule (in order) decides the call
+ * among its own rules, and the first to reach SATISFIED allows it: then
+ * *grant is its index in gs and *grant_rule the deciding rule's index in it
+ * (-1 when several of its rules agree on symbolic flags). Otherwise *grant
+ * is -1 and the verdict is the policy's. With symbolic flags a grant is
+ * consulted only when one step_up rule decides every flags value. */
+/* v1.42 step 5: may a grant be under rule r (a step_up rule, or a defer
+ * rule with escalate)? */
+bool vdp_rule_grantable(const vdp_rule_t *r);
+
+vdp_verdict_t vdp_decide_grant(const vdp_policy_t *p, const vdp_grant_t *const *gs, size_t ng,
+                               int subj, vdp_kind_t kind, const char *s,
+                               uint32_t flags, bool has_flags,
+                               int *rule_index, vdp_why_t *why, int *grant, int *grant_rule);
+
+/* The certificate's second half, for an ALLOW under grant g: grant_rule's
+ * witness on s, as vdp_certificate's. */
+int vdp_grant_certificate(const vdp_grant_t *g, int grant_rule, const char *s, vdp_cert_t *c);
+
 /* v1.32: does path rule r allow some open that writes (an access mode of
  * write or read-write, O_TRUNC, or O_CREAT)? The Warden mounts the
  * directories of such rules noexec when launches are decided. */
@@ -674,7 +819,8 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * `require warden 1.31`; a v1.29 Warden refuses each, so the policy fails
  * closed there. (v1.30 adds no lines.) */
 #define VDP_WARDEN_MAJOR 1
-#define VDP_WARDEN_MINOR 35     /* the grammar: the highest `require warden` a policy may name */
+#define VDP_WARDEN_MINOR 42     /* the grammar: the highest `require warden` a policy may name
+                                 * (v1.42: step_up rules, max_held, max_pending) */
 /* v1.32 (D12): the Warden's own version, ahead of the grammar's when a
  * release adds no policy lines (v1.32.0: containers; v1.34.0: Kubernetes, the
  * node agent; the grammar stays 1.31; v1.36.0, docs/security/v1.36-
@@ -684,8 +830,13 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * filter, the grammar stays 1.35; v1.39.0: security operations, the OCSF
  * events sent to OpenTelemetry and Splunk, the grammar stays 1.35; v1.40.0:
  * Microsoft Sentinel, a failed export resumed, the sector packs at
- * `require warden 1.27`, the grammar stays 1.35) */
-#define VDP_WARDEN_REL_MINOR 40
+ * `require warden 1.27`, the grammar stays 1.35; v1.41.0: every hash and
+ * signature through the host's OpenSSL 3 provider (the FIPS provider on a
+ * host in FIPS mode), the verdict stream in format chain-2 (SHA-384, ECDSA
+ * P-384), libsodium no longer used, and the Defense build (make DEFENSE=1);
+ * the grammar stays 1.35; v1.42.0: STEP_UP and DEFER, approvals as grants,
+ * the grammar 1.42 with it) */
+#define VDP_WARDEN_REL_MINOR 42
 #define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's
                                  * (v1.36.1: packaging for Red Hat's certification;
                                  * v1.36.2: the node key published again, a test

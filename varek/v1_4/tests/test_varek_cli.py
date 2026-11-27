@@ -186,6 +186,17 @@ def _varek_module():
     return mod
 
 
+def test_pending_shows_no_control_characters():
+    """v1.42 step 8: what `varek pending` shows an approver (the user's
+    request, a proposal, the object it names) cannot drive the terminal:
+    control, format and bidirectional characters are written as escapes"""
+    mod = _varek_module()
+    assert mod._shown("read /w/data/r.csv\tok, résumé") == "read /w/data/r.csv\tok, résumé"
+    assert mod._shown("ok\x1b[2K\x1b[1Adeny") == "ok\\x1b[2K\\x1b[1Adeny"
+    assert mod._shown("a\u202ecod.exe") == "a\\u202ecod.exe" and mod._shown("x\rY\x85\u2028") == "x\\x0dY\\x85\\u2028"
+    assert mod._shown("\U000e0041") == "\\U000e0041"
+
+
 def test_a_long_stream_is_read_as_it_goes(tmp_path):
     """v1.31 (the shared soak): after 24 hours under the baseline a stream is
     about 250 MB, and `varek run`'s summary held it all and was killed on a

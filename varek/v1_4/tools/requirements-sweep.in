@@ -1,0 +1,16 @@
+# The Python packages tests/arm64_sweep.sh --deps installs (and so
+# tests/vm_cell.sh's sweep cells). requirements-sweep.txt is compiled from
+# this file, every package pinned by version and hash, for every Python from
+# 3.9 up (RHEL 9, Rocky Linux 9 and Amazon Linux 2023 run 3.9; Ubuntu 24.04
+# 3.12):
+#   uv pip compile --universal --python-version 3.9 --generate-hashes \
+#       --no-header --output-file requirements-sweep.txt requirements-sweep.in
+# The reference solver is tools/requirements-crosscheck.txt, installed on its
+# own (its source build may fail; that check then skips).
+-r requirements-test.txt
+# pytest 9 needs Python 3.10. Every pytest for 3.9 (8.4.2 the last) has
+# PYSEC-2026-1845 / CVE-2025-71176 (fixed in 9.0.3), so none is pinned here
+# for 3.9: there arm64_sweep.sh installs the distribution's own python3-pytest
+# (dnf), which its vendor patches
+pytest==9.2.0; python_version >= "3.10"
+pyyaml==6.0.3

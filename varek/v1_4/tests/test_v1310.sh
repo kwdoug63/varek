@@ -129,7 +129,7 @@ refused "for= before 1.31"                        'require warden 1.29\nallow pa
 refused "confined before 1.31"                    'require warden 1.29\nallow exec /x subagent=a confined\n'            "confined needs"
 refused "audience= before 1.31"                   'require warden 1.29\ncredential a from file:/x audience=https://m.example.com/\n' "audience= needs"
 refused "trust mcp-resource before 1.31"          "require warden 1.29\ntrust mcp-resource $U\n"                       "needs \`require warden 1.31\`"
-refused "require warden 1.36"                     'require warden 1.36\n'                                                "requires Warden 1.36"
+refused "require warden 1.43"                     'require warden 1.43\n'                                                "requires Warden 1.43"
 for launcher in /usr/bin/node /usr/bin/npx /usr/local/bin/uvx /usr/bin/docker /usr/bin/env /usr/bin/python3.12 /bin/sh /lib64/ld-linux-x86-64.so.2 \
                 /usr/bin/time /usr/bin/strace /usr/bin/bwrap /usr/bin/setpriv /usr/local/bin/tsx; do       # review: more launchers
     refused "an MCP server that is $(basename "$launcher")" "${R}mcp server a exec $launcher\n" "an interpreter or a launcher"
@@ -706,7 +706,7 @@ ids = [e['unmapped']['varek'].get('report_id') for e in E if 'report_id' in e['u
 want = [r['report_id'] for r in R if r['action'] != 'file.rename_to']
 sys.exit(0 if ids == want else 1)"
     check "each event names its record's seq and chain value, and the run (correlation_uid)" \
-        ev "$OUT/m.ev" "all(v['chain'] and len(v['chain']) == 64 for v in V[:-1]) and len({e['metadata']['correlation_uid'] for e in E}) == 1"
+        ev "$OUT/m.ev" "all(v['chain'] and len(v['chain']) == 96 for v in V[:-1]) and len({e['metadata']['correlation_uid'] for e in E}) == 1"
     check "the classes: file, process, network, HTTP, API (MCP) and lifecycle" \
         ev "$OUT/m.ev" "{1001, 1007, 4001, 4002, 6003, 6002} <= {e['class_uid'] for e in E}"
     check "an MCP tools/call is API Activity Other, with its tool; a tools/list is Read" \

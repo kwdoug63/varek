@@ -52,6 +52,23 @@ def checks(path):
     return out
 
 
+def after_check(path, text, nth, lines=2):
+    """the lines a suite printed right after a check (text, the nth time):
+    a failure's reason, where the suite gives one"""
+    try:
+        ls = [l.rstrip("\n")[:300] for l in open(path, errors="replace")]
+    except OSError:
+        return []
+    seen = 0
+    for i, l in enumerate(ls):
+        m = CHECK.match(l)
+        if m and re.sub(r"\d+", "#", re.sub(r"\s+", " ", m.group(2))) == text:
+            seen += 1
+            if seen == nth:
+                return [x for x in ls[i + 1:i + 1 + lines] if not CHECK.match(x)]
+    return []
+
+
 def host_failures(path, most=12):
     """A failed run's FAIL lines as the suite printed them, each with the two
     lines after it (a failure's reason), or its last lines if it has none."""
@@ -121,6 +138,11 @@ def main():
                     c["unlisted"] += 1
                     bad += 1
                     notes.append("  %-16s DIFFERS, no reason listed (%s): %s" % (s, nv, k[0][:110]))
+                    # what the node run printed after it (a failure's reason,
+                    # where the suite gives one): the run's files are gone
+                    if nv == "FAIL":
+                        notes.extend("%-20s node: %s" % ("", l)
+                                     for l in after_check(os.path.join(out, "node", s + ".log"), k[0], k[1]))
                     # a check missing from the node run is often there with
                     # more words (a failure's reason after its text): say it
                     for nk, nvv in n.items():
