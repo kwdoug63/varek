@@ -90,8 +90,9 @@ static int trust_pem_der(const unsigned char *pem, size_t n, unsigned char **der
     return 0;
 }
 
-static int trust_setup(const struct policy *p) {
-    char why[512];
+/* The host's trust bundle (or --trust-bundle's): its path into
+ * g_trust_host_bundle. 0, or -1 (said why). v1.43: shared with gateways. */
+static int trust_find_bundle(const char *mode) {
     struct stat st;
     g_trust_host_bundle[0] = '\0';
     /* --trust-bundle names the roots to trust in place of the host's (a
@@ -115,10 +116,43 @@ static int trust_setup(const struct policy *p) {
             break;
         }
     if (!g_trust_host_bundle[0]) {
-        fprintf(stderr, "[warden] inspecting mode: no trust bundle found on the host (looked for %s and "
-                "others); refusing to start\n", kHostBundles[0]);
+        fprintf(stderr, "[warden] %s: no trust bundle found on the host (looked for %s and "
+                "others); refusing to start\n", mode, kHostBundles[0]);
         return -1;
     }
+    return 0;
+}
+
+/* v1.43: gateways without inspecting mode: the bundle's digest for run_start,
+ * and the proxy loads it to verify gateway servers */
+static int gateway_setup(void) {
+    char why[512];
+    if (trust_find_bundle("mcp gateway") < 0) return -1;
+    FILE *bf = fopen(g_trust_host_bundle, "re");
+    unsigned char *host = bf ? malloc(TRUST_BUNDLE_MAX) : NULL;
+    size_t hl = host ? fread(host, 1, TRUST_BUNDLE_MAX, bf) : 0;
+    bool bad = !host || hl == 0 || ferror(bf) || (hl == TRUST_BUNDLE_MAX && fgetc(bf) != EOF);
+    if (bf) fclose(bf);
+    if (bad) {
+        fprintf(stderr, "[warden] mcp gateway: cannot read the trust bundle %s (or it is over 8 MB); "
+                "refusing to start\n", g_trust_host_bundle);
+        free(host);
+        return -1;
+    }
+    trust_sha_hex(host, hl, g_trust_host_sha);
+    free(host);
+    if (wp_gateway_setup(&g_proxy, g_trust_host_bundle, &g_trust_nroots, why, sizeof why) < 0) {
+        fprintf(stderr, "[warden] mcp gateway: %s; refusing to start\n", why);
+        return -1;
+    }
+    fprintf(stderr, "[warden] mcp gateway: servers verified against %s (%d roots)\n", g_trust_host_bundle,
+            g_trust_nroots);
+    return 0;
+}
+
+static int trust_setup(const struct policy *p) {
+    char why[512];
+    if (trust_find_bundle("inspecting mode") < 0) return -1;
     /* the Warden reads the bundle for the views; the proxy reads it too, for
      * the trust store (and, from step 4, to verify servers) */
     FILE *bf = fopen(g_trust_host_bundle, "re");

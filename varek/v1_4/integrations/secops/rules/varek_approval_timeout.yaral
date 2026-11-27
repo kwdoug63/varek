@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// VAREK for Google Security Operations (v1.43; integrations/secops/README.md).
+// VAREK for Google Security Operations (v1.44; integrations/secops/README.md).
 // An approval nobody gave in time (v1.42): a step_up proposal, or a
 // deferral waiting for its context, that ended at its timeout, so the call
 // was refused. One detection per run, host and policy line within the hour.

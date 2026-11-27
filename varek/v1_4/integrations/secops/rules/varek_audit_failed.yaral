@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// VAREK for Google Security Operations (v1.43; integrations/secops/README.md).
+// VAREK for Google Security Operations (v1.44; integrations/secops/README.md).
 // A run's audit failed: its verdict stream doesn't verify (a record edited,
 // dropped or forged, a signature that fails, a decision its certificate
 // doesn't support). One detection per failed audit. Sentinel's "VAREK: a

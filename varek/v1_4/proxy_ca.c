@@ -227,6 +227,27 @@ static int alpn_select(SSL *s, const unsigned char **out, unsigned char *outlen,
     return SSL_TLSEXT_ERR_ALERT_FATAL;
 }
 
+/* v1.43: the context toward servers (TLS 1.2+, http/1.1, verified against
+ * the roots loaded), alone: what an `mcp gateway` needs without the CA. */
+int pca_sctx_init(pca_t *c, char *why, size_t wn) {
+    c->sctx = SSL_CTX_new(TLS_client_method());
+    X509_STORE *st = X509_STORE_new();
+    if (!c->sctx || !st) { X509_STORE_free(st); ossl_why(why, wn, "the TLS context"); return -1; }
+    for (int i = 0; i < sk_X509_num(c->roots); i++) (void)X509_STORE_add_cert(st, sk_X509_value(c->roots, i));
+    ERR_clear_error();                            /* a root listed twice */
+    SSL_CTX_set_cert_store(c->sctx, st);
+    static const unsigned char h11[] = "\x08http/1.1";
+    if (!SSL_CTX_set_min_proto_version(c->sctx, TLS1_2_VERSION) ||
+        SSL_CTX_set_alpn_protos(c->sctx, h11, sizeof h11 - 1) != 0) {
+        ossl_why(why, wn, "the TLS context's settings");
+        return -1;
+    }
+    SSL_CTX_set_options(c->sctx, SSL_OP_NO_TICKET | SSL_OP_NO_RENEGOTIATION);
+    SSL_CTX_set_session_cache_mode(c->sctx, SSL_SESS_CACHE_OFF);
+    SSL_CTX_set_verify(c->sctx, SSL_VERIFY_PEER, NULL);
+    return 0;
+}
+
 int pca_tls_init(pca_t *c, char *why, size_t wn) {
     EVP_PKEY_CTX *kc = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
     if (!kc || EVP_PKEY_keygen_init(kc) <= 0 ||
@@ -237,27 +258,16 @@ int pca_tls_init(pca_t *c, char *why, size_t wn) {
         return -1;
     }
     EVP_PKEY_CTX_free(kc);
+    if (pca_sctx_init(c, why, wn) < 0) return -1;   /* toward servers (v1.43: shared with gateways) */
     c->cctx = SSL_CTX_new(TLS_server_method());
-    c->sctx = SSL_CTX_new(TLS_client_method());
-    X509_STORE *st = X509_STORE_new();
-    if (!c->cctx || !c->sctx || !st) { X509_STORE_free(st); ossl_why(why, wn, "the TLS contexts"); return -1; }
-    for (int i = 0; i < sk_X509_num(c->roots); i++) (void)X509_STORE_add_cert(st, sk_X509_value(c->roots, i));
-    ERR_clear_error();                            /* a root listed twice */
-    SSL_CTX_set_cert_store(c->sctx, st);
-    static const unsigned char h11[] = "\x08http/1.1";
-    if (!SSL_CTX_set_min_proto_version(c->cctx, TLS1_2_VERSION) ||
-        !SSL_CTX_set_min_proto_version(c->sctx, TLS1_2_VERSION) ||
-        SSL_CTX_set_alpn_protos(c->sctx, h11, sizeof h11 - 1) != 0 ||
-        !SSL_CTX_set_num_tickets(c->cctx, 0)) {
+    if (!c->cctx) { ossl_why(why, wn, "the TLS contexts"); return -1; }
+    if (!SSL_CTX_set_min_proto_version(c->cctx, TLS1_2_VERSION) || !SSL_CTX_set_num_tickets(c->cctx, 0)) {
         ossl_why(why, wn, "the TLS contexts' settings");
         return -1;
     }
     SSL_CTX_set_options(c->cctx, SSL_OP_NO_TICKET | SSL_OP_NO_RENEGOTIATION);
-    SSL_CTX_set_options(c->sctx, SSL_OP_NO_TICKET | SSL_OP_NO_RENEGOTIATION);
     SSL_CTX_set_session_cache_mode(c->cctx, SSL_SESS_CACHE_OFF);
-    SSL_CTX_set_session_cache_mode(c->sctx, SSL_SESS_CACHE_OFF);
     SSL_CTX_set_alpn_select_cb(c->cctx, alpn_select, NULL);
-    SSL_CTX_set_verify(c->sctx, SSL_VERIFY_PEER, NULL);
     c->leaf_name = calloc(PCA_MAX_LEAVES, sizeof *c->leaf_name);
     c->leaf = calloc(PCA_MAX_LEAVES, sizeof *c->leaf);
     if (!c->leaf_name || !c->leaf) { snprintf(why, wn, "out of memory"); return -1; }

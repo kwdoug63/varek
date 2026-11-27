@@ -1,6 +1,6 @@
 # VAREK for Google Security Operations
 
-v1.43 (`docs/security/v1.39-security-operations.md`, section 6). The
+v1.44 (`docs/security/v1.39-security-operations.md`, section 6). The
 Warden's decisions in Google Security Operations (SecOps):
 `varek export --format secops` sends a run's OCSF 1.9.0 events, audited
 first, as UDM events to the instance's Chronicle API (`events:import`).
@@ -12,7 +12,7 @@ gives an overview.
 tested against a stand-in Google (`tests/test_varek_secops.py`). The rules
 and the dashboard are checked against what the export writes
 (`tests/test_varek_secops_content.py`). The ship gate, in Google's
-development instance, comes before v1.43.0 ships; see section 6 below.
+development instance, comes before v1.44.0 ships; see section 6 below.
 
 What's here:
 
@@ -121,7 +121,7 @@ instance, by sending the same run both ways.
 
 ## 6. Checked only at the ship gate
 
-In Google's development instance, before v1.43.0 ships:
+In Google's development instance, before v1.44.0 ships:
 - **The export:**
   - `events:import`'s endpoint and body, and its permission (G2);
   - the UDM field names, and whether `additional` takes plain string

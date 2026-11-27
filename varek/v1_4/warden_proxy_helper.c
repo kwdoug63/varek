@@ -104,6 +104,7 @@ struct wp_held {
     bool      refused;           /* a later request was refused: no more is read from the client */
     /* v1.26.1, step 4: inspecting mode */
     bool      inspect;           /* terminate its TLS */
+    bool      gateway;           /* v1.43: an `mcp gateway`: plain HTTP from the client, TLS to the server */
     unsigned  rport;             /* the port decided (a CONNECT's own) */
     int       tstage;            /* TS_* */
     short     swant;             /* the server handshake waits for this (POLLIN, POLLOUT) */
@@ -231,7 +232,12 @@ static void held_drop(int k) {
  * handshake_failure alert, in the clear */
 static void held_refuse_alert(struct wp_held *h) {
     static const uint8_t alert[] = { 21, 3, 3, 0, 2, 2, 40 };
-    (void)send(h->fd, alert, sizeof alert, MSG_DONTWAIT | MSG_NOSIGNAL);
+    /* v1.43: a gateway's client speaks plain HTTP: the server could not be
+     * verified (or reached in TLS), said in HTTP */
+    static const char bad_gw[] = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: 51\r\n"
+                                 "Connection: close\r\n\r\nVAREK: the MCP server's TLS could not be verified.\n";
+    if (h->gateway) (void)send(h->fd, bad_gw, sizeof bad_gw - 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+    else (void)send(h->fd, alert, sizeof alert, MSG_DONTWAIT | MSG_NOSIGNAL);
 }
 #endif
 
@@ -456,6 +462,10 @@ static bool held_pump(int k, short crev, short srev) {
 /* v1.26.1: inspecting mode. The run's CA, made once, on WP_MSG_CA_GO. */
 static pca_t g_ca;
 static bool  g_inspect, g_ca_made;
+/* v1.43: without inspecting mode, the roots and the context gateways verify
+ * their servers with (WP_MSG_GATEWAY); with it, the CA's (g_ca.sctx) */
+static pca_t g_gw;
+static bool  g_gw_ready;
 static char  g_ca_run[48], g_ca_bundle[1024];
 static char *g_ca_names[PCA_MAX_NAMES];
 static size_t g_ca_nnames, g_ca_want;
@@ -682,7 +692,7 @@ static bool tls_begin(int k) {
     h->state = WH_TLS;
     h->since = h->relay_at = mono_ms();
     h->ig = IG_HEAD;
-    if (h->kind == PP_KIND_HTTP) {
+    if (h->kind == PP_KIND_HTTP && !h->gateway) {
         h->tstage = TS_RELAY;
         h->off = h->fwd = 0;
         h->why = "closed";
@@ -691,7 +701,10 @@ static bool tls_begin(int k) {
     h->tstage = TS_SERVER;
     h->swant = POLLOUT;
     h->why = "server_tls";
-    if (!g_ca_made || !(h->cout = malloc(WP_COUT_BUF)) || !(h->ss = SSL_new(g_ca.sctx)) ||
+    /* v1.43: a gateway's server is verified with the CA's context in
+     * inspecting mode, else with the roots its setup loaded */
+    SSL_CTX *sx = g_ca_made ? g_ca.sctx : h->gateway && g_gw_ready ? g_gw.sctx : NULL;
+    if (!sx || !(h->cout = malloc(WP_COUT_BUF)) || !(h->ss = SSL_new(sx)) ||
         !SSL_set_fd(h->ss, h->up) || !SSL_set_tlsext_host_name(h->ss, h->name) || !SSL_set1_host(h->ss, h->name)) {
         tls_err(h, "server_tls", "setting up TLS to the server");
         return false;
@@ -955,6 +968,15 @@ static bool tls_step(int k, short crev, short srev) {
             held_refuse_alert(h);
             return false;
         }
+        if (h->gateway) {
+            /* v1.43: the client speaks plain HTTP to the gateway: no handshake
+             * with it. Its first request, already read, is in buf. */
+            h->off = h->fwd = h->skip = 0;
+            h->tstage = TS_RELAY;
+            h->since = mono_ms();
+            h->why = "closed";
+            goto relay;
+        }
         /* the client's handshake, from the ClientHello already read */
         char why[96];
         X509 *leaf = pca_leaf(&g_ca, h->name, why, sizeof why);
@@ -979,6 +1001,7 @@ static bool tls_step(int k, short crev, short srev) {
         h->tstage = TS_CLIENT;
         h->since = mono_ms();
     }
+relay:
     c_read(h, crev);
     if (h->tstage == TS_CLIENT) {
         ERR_clear_error();
@@ -1088,7 +1111,7 @@ static int wp_drain_ctl(int ctl) {
     for (;;) {
         union { struct wp_conn c; struct wp_verdict v; struct wp_verdict_up u; struct wp_inspect in;
                 struct wp_ca_name cn; struct wp_reqverdict rv; struct wp_ph ph; struct wp_creds cr;
-                struct wp_mcpverdict mv; struct wp_heldnote hn; uint32_t type; } m;
+                struct wp_mcpverdict mv; struct wp_heldnote hn; struct wp_gateway gw; uint32_t type; } m;
         union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
         struct iovec iv = { &m, sizeof m };
         struct msghdr mh = { .msg_iov = &iv, .msg_iovlen = 1, .msg_control = cb.b, .msg_controllen = sizeof cb.b };
@@ -1124,8 +1147,20 @@ static int wp_drain_ctl(int ctl) {
             }
             g_held[k].inspect = false;
 #else
-            /* v1.26.1: inspect, only with the run's CA made */
+            /* v1.26.1: inspect, only with the run's CA made; v1.43: a gateway,
+             * plain HTTP only, with the roots loaded */
             g_held[k].inspect = m.v.allow && m.v.inspect;
+            g_held[k].gateway = m.v.allow && m.v.inspect == WP_INSPECT_GATEWAY;
+            /* v1.43: a gateway's requests are read as https to its server's port */
+            if (g_held[k].gateway) g_held[k].rport = m.v.port;
+            if (g_held[k].gateway && (g_held[k].kind != PP_KIND_HTTP || !(g_ca_made || g_gw_ready) ||
+                                      m.v.port == 0 || m.v.port > 65535)) {
+                if (fd >= 0) close(fd);
+                if (passed) report_gone(m.v.id);
+                g_held[k].inspect = g_held[k].gateway = false;
+                held_refuse(k);
+                continue;
+            }
 #endif
             if (!m.v.allow || fd < 0 || held_relay(k, fd) < 0) {
                 if (fd >= 0) close(fd);
@@ -1161,6 +1196,15 @@ static int wp_drain_ctl(int ctl) {
             g_held[k].inspect = false;
 #else
             g_held[k].inspect = m.u.allow && m.u.inspect;     /* v1.26.1 */
+            g_held[k].gateway = m.u.allow && m.u.inspect == WP_INSPECT_GATEWAY;   /* v1.43 */
+            if (g_held[k].gateway) g_held[k].rport = m.u.port;
+            if (g_held[k].gateway && (g_held[k].kind != PP_KIND_HTTP || !(g_ca_made || g_gw_ready))) {
+                if (fd >= 0) close(fd);
+                if (passed) report_gone(m.u.id);
+                g_held[k].inspect = g_held[k].gateway = false;
+                held_refuse(k);
+                continue;
+            }
 #endif
             if (!m.u.allow || fd < 0 || held_relay_up(k, fd, m.u.name, m.u.port) < 0) {
                 if (g_held[k].state == WH_UPSTREAM || g_held[k].up >= 0) {
@@ -1287,6 +1331,23 @@ static int wp_drain_ctl(int ctl) {
             continue;
         }
         if (n == (ssize_t)sizeof(struct wp_msg) && m.type == WP_MSG_CA_GO) { ca_go(ctl); continue; }
+        /* v1.43: a gateway's setup without inspecting mode (once, before the agent runs) */
+        if (n == (ssize_t)sizeof m.gw && m.type == WP_MSG_GATEWAY && !g_gw_ready && !g_inspect) {
+            struct wp_gateway_done d;
+            memset(&d, 0, sizeof d);
+            d.type = WP_MSG_GATEWAY_DONE;
+            if (!memchr(m.gw.bundle, 0, sizeof m.gw.bundle))
+                snprintf(d.why, sizeof d.why, "the setup message was not as expected");
+            else if (pca_init(&g_gw), pca_load_roots(&g_gw, m.gw.bundle, d.why, sizeof d.why) < 0) { }
+            else if (pca_sctx_init(&g_gw, d.why, sizeof d.why) < 0) { }
+            else {
+                d.ok = 1;
+                d.nroots = (uint32_t)pca_nroots(&g_gw);
+                g_gw_ready = true;
+            }
+            (void)send(ctl, &d, sizeof d, MSG_NOSIGNAL);
+            continue;
+        }
 #endif /* VAREK_NO_TLS_INSPECT: a Defense build ignores these messages */
         if (n == (ssize_t)sizeof(struct wp_msg) && m.type == WP_MSG_FLUSH) {
             /* the run is ending: close everything, reporting each relay */

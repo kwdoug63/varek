@@ -59,7 +59,7 @@ FLOW_SRC  := $(V1_7_DIR)/plan_dataflow.c $(V1_7_DIR)/plan_dataflow_adapter.c \
 
 BINS := warden warden-proxy warden-secrets warden-notify target_demo bench_target tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
 
-.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1410 test-v1420 fips-acceptance test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-v1311 test-v1320 test-v1321 test-v1340 test-v1350 test-v1300 test-v1300-oflags test-varek-k8s test-varek-chart sweep-v1340 test-v1340-kind test-v1340-apiserver varek-nri varek-admission varek-svid test-node-json test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 latency-v1420 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
+.PHONY: all deps deps-check deps-check-ssl preflight install uninstall test-cli clean run-demo run-bench run-bench-v14 run-plan-demo run-conformance check-kernel test-lifecycle test-v112 test-v1121 test-v1122 test-v1123 test-v1124 test-v1130 test-v1140 test-v1150 test-v1160 test-v1161 test-v1162 test-v1410 test-v1420 test-v1430 fips-acceptance test-v1170 test-v1180 test-v1190 test-v1200 test-v1210 test-v1211 test-v1240 test-v1250 test-v1260 test-v1261 test-v1270 test-v1271 test-v1280 test-v1281 test-v1290 test-v1310 test-v1311 test-v1320 test-v1321 test-v1340 test-v1350 test-v1300 test-v1300-oflags test-varek-k8s test-varek-chart sweep-v1340 test-v1340-kind test-v1340-apiserver varek-nri varek-admission varek-svid test-node-json test-mcp-json latency-v1260 latency-v1261 latency-v1270 latency-v1281 latency-v1290 latency-v1310 latency-v1420 fuzz-proxy-parse fuzz-proxy-parse-libfuzzer crosscheck crosscheck-profiles harness video-v112
 
 all: $(BINS)
 
@@ -326,6 +326,11 @@ test-v1410: all
 # mode=grant, the approvers' socket, the audit (as root).
 test-v1420: warden warden-notify tools/vdp_check tools/vdp_cert_check tools/varek_keygen
 	@sudo ./tests/test_v1420.sh
+
+# v1.43 step 4 (docs/security/v1.43-palantir-ontology-mcp.md): `mcp gateway`,
+# the grammar in all three readings, and gateway mode under a real Warden
+test-v1430: warden warden-proxy warden-secrets tools/vdp_check tools/vdp_cert_check
+	@./tests/test_v1430.sh ./tools/vdp_check ./tools/vdp_cert_check ./warden
 
 # v1.41: the Defense build's acceptance on RHEL 9 in FIPS mode (run there, as
 # root): it refuses to run off FIPS mode, and writes its evidence to OUT.
@@ -682,7 +687,7 @@ INSTALL_TOOLS := tools/varek tools/vdp_check tools/vdp_cert_check tools/varek_ke
 	tools/varek_audit.py tools/varek_cyclonedx.py tools/varek_ocsf.py tools/varek_otel.py tools/varek_splunk.py tools/varek_sentinel.py tools/varek_falcon.py tools/varek_secops.py tools/varek_ed25519.py \
 	tools/varek_preflight.sh tools/varek_anchor_forward.py tools/varek_anchor_receiver.sh \
 	tools/varek_license.py tools/varek_vm.py tools/varek_bench.py tools/varek_bench_proxy.py tools/bench_proxy_client.py tools/varek_bench_launch.py \
-	tools/varek_baseline.py tools/varek_suggest.py tools/varek_container.py tools/varek_node_export.py \
+	tools/varek_baseline.py tools/varek_suggest.py tools/varek_container.py tools/varek_node_export.py tools/varek_mcp_tools.py \
 	tools/bench_workload
 
 install: warden warden-proxy warden-secrets warden-notify tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
@@ -706,6 +711,14 @@ install: warden warden-proxy warden-secrets warden-notify tools/vdp_check tools/
 	# v1.40: Microsoft Sentinel's templates (integrations/sentinel/README.md)
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/integrations/sentinel
 	install -m 0644 integrations/sentinel/README.md integrations/sentinel/*.json $(DESTDIR)$(PREFIX)/integrations/sentinel/
+	# v1.43: the Palantir Ontology MCP integration (integrations/palantir/README.md)
+	install -d -m 0755 $(DESTDIR)$(PREFIX)/integrations/palantir/clients
+	install -m 0644 integrations/palantir/README.md integrations/palantir/omcp.policy.example \
+	    integrations/palantir/varek-omcp-token.service $(DESTDIR)$(PREFIX)/integrations/palantir/
+	install -m 0755 integrations/palantir/omcp_token.py integrations/palantir/omcp_measure.py integrations/palantir/demo_d5.py $(DESTDIR)$(PREFIX)/integrations/palantir/
+	install -m 0644 integrations/palantir/clients/vscode-mcp.json integrations/palantir/clients/claude_agent_sdk.py \
+	    $(DESTDIR)$(PREFIX)/integrations/palantir/clients/
+	install -m 0755 integrations/palantir/clients/omcp_agent.py $(DESTDIR)$(PREFIX)/integrations/palantir/clients/
 	# v1.43: Google Security Operations' YARA-L rules and dashboard (integrations/secops/README.md)
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/integrations/secops/rules
 	install -m 0644 integrations/secops/README.md integrations/secops/varek-dashboard.json $(DESTDIR)$(PREFIX)/integrations/secops/
@@ -721,7 +734,7 @@ uninstall:
 	@echo "removed $(PREFIX); settings in /etc/varek and logs in /var/log/varek were kept"
 
 test-cli: warden warden-proxy tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
-	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_container.py tests/test_varek_license.py tests/test_add_free_trial.py tests/test_varek_vm.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py tests/test_varek_bench_mcp.py tests/test_varek_audit_stream.py tests/test_varek_node_keys.py tests/test_varek_v140_logs.py tests/test_varek_otel.py tests/test_varek_splunk.py tests/test_varek_sentinel.py tests/test_varek_falcon.py tests/test_varek_secops.py tests/test_varek_secops_content.py tests/test_varek_export_resume.py tests/test_varek_ocsf_v142.py
+	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_container.py tests/test_varek_license.py tests/test_add_free_trial.py tests/test_varek_vm.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py tests/test_varek_bench_mcp.py tests/test_varek_audit_stream.py tests/test_varek_node_keys.py tests/test_varek_v140_logs.py tests/test_varek_otel.py tests/test_varek_splunk.py tests/test_varek_sentinel.py tests/test_varek_falcon.py tests/test_varek_secops.py tests/test_varek_secops_content.py tests/test_varek_export_resume.py tests/test_varek_ocsf_v142.py tests/test_varek_mcp_tools.py tests/test_palantir_integration.py
 
 # v1.34 step 2: the node agent's JSON reader (node_json.c)
 test-node-json: tests/test_node_json.c node_json.c node_json.h

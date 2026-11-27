@@ -1,5 +1,5 @@
 {
-  "_comment": "A draft of the VAREK dashboard for Google Security Operations' native dashboards (v1.43, step 2; integrations/secops/README.md). Its panels are YARA-L 2.0 queries over what varek_secops.py writes (tests/test_varek_secops_content.py checks each field). It is imported and drawn in the development instance at the ship gate, then exported from there, and that export replaces this file.",
+  "_comment": "A draft of the VAREK dashboard for Google Security Operations' native dashboards (v1.44, step 2; integrations/secops/README.md). Its panels are YARA-L 2.0 queries over what varek_secops.py writes (tests/test_varek_secops_content.py checks each field). It is imported and drawn in the development instance at the ship gate, then exported from there, and that export replaces this file.",
   "dashboard": {
     "displayName": "VAREK: the Warden's decisions",
     "description": "Refusals by policy line, agent and run; dry runs; failed audits; approvals nobody gave in time",

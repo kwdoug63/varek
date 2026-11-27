@@ -860,7 +860,9 @@ static int parse_mcp_rule(const char *name, int ln, char **tok, int nt, int req_
             if (!(r->subj = subj_named(pol, t + 4))) return fail(err, en, name, ln, "for= names no confined subject");
             continue;
         }
-        if (!r->allow) return fail(err, en, name, ln, "an option on a deny mcp rule");
+        /* v1.43 (D10): credential= and header= on a step_up mcp rule too */
+        if (!r->allow && !(r->step_up && ver_ge(req_maj, req_min, 1, 43) && strncmp(t, "max_body=", 9)))
+            return fail(err, en, name, ln, "an option on a deny mcp rule");
         if (!strncmp(t, "credential=", 11)) {
             if (r->cred) return fail(err, en, name, ln, "credential given twice");
             for (size_t q = 0; q < pol->ncreds && !r->cred; q++)
@@ -1560,6 +1562,23 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
                     rc = fail(err, en, name, ln, "credential before require warden 1.28");
                 else
                     rc = parse_credential(name, ln, tok, nt, p, err, en, req_maj, req_min);
+            } else if (!strcmp(tok[0], "mcp") && nt >= 2 && !strcmp(tok[1], "gateway")) {
+                /* v1.43: mcp gateway URL (https, a host name) */
+                char cu[4096], gh[254];
+                unsigned gp = 0;
+                if (!ver_ge(req_maj, req_min, 1, 43)) rc = fail(err, en, name, ln, "mcp gateway before 1.43");
+                else if (nt != 3 || mcp_canon(tok[2], 1, cu, sizeof cu, gh, &gp) < 0)
+                    rc = fail(err, en, name, ln, "bad mcp gateway");
+                for (size_t g = 0; rc == 0 && g < p->ngw; g++)
+                    if (!strcmp(p->gw_url[g], cu) || (!strcmp(p->gw_host[g], gh) && p->gw_port[g] != gp))
+                        rc = fail(err, en, name, ln, "mcp gateway twice, or a host's gateways on two ports");
+                if (rc == 0 && p->ngw == 16) rc = fail(err, en, name, ln, "more than 16 mcp gateways");
+                if (rc == 0) {
+                    memcpy(p->gw_url[p->ngw], cu, strlen(cu) + 1);
+                    memcpy(p->gw_host[p->ngw], gh, strlen(gh) + 1);
+                    p->gw_port[p->ngw] = gp;
+                    p->gw_line[p->ngw++] = ln;
+                }
             } else if (!strcmp(tok[0], "mcp")) {
                 /* v1.31: mcp server NAME exec PATH [sha256=HEX] */
                 if (p->n == VDPC_MAX_RULES) rc = fail(err, en, name, ln, "more than 512 rules");
@@ -1600,9 +1619,31 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
         vdpc_free(p);
         return fail(err, en, name, ln, "proxy passthrough without proxy inspect");
     }
+    /* v1.43: a gateway needs the proxy, port 80 proxied, and a host that is not passthrough */
+    for (size_t g = 0; g < p->ngw; g++) {
+        bool p80 = p->proxy_nports == 0, pgw = p->proxy_nports == 0 && p->gw_port[g] == 443;
+        for (size_t q = 0; q < p->proxy_nports; q++) {
+            p80 = p80 || p->proxy_ports[q] == 80;
+            pgw = pgw || p->proxy_ports[q] == p->gw_port[g];
+        }
+        bool pass = false;
+        for (size_t q = 0; q < p->proxy_npass; q++) pass = pass || !strcmp(p->proxy_pass[q], p->gw_host[g]);
+        if (!p->proxy || !p80 || !pgw || pass) {
+            int l = p->gw_line[g];
+            vdpc_free(p);
+            return fail(err, en, name, l, "mcp gateway needs the proxy, ports 80 and its own proxied, and a host not passthrough");
+        }
+    }
     for (size_t i = 0; i < p->n; i++) {
         const vdpc_rule_t *r = &p->rules[i];
         if (r->kind != VDPC_REQUEST && r->kind != VDPC_MCP) continue;      /* v1.31: mcp rules too */
+        /* v1.43: an mcp rule on a gateway's URL is read by the gateway */
+        bool via_gw = false;
+        for (size_t g = 0; r->kind == VDPC_MCP && g < p->ngw; g++) {
+            size_t ul = strlen(p->gw_url[g]);
+            if (r->clen > ul && !strncmp(r->c, p->gw_url[g], ul) && r->c[ul] == '#') via_gw = true;
+        }
+        if (via_gw) continue;
         int bad = !p->proxy_inspect;
         bool on = false;
         if (p->proxy_nports == 0) on = r->rport == 80 || r->rport == 443;
@@ -2090,7 +2131,7 @@ int vdpc_grant_load(const vdpc_policy_t *p, const char *text, size_t len, vdpc_g
     if (memchr(text, '\0', len)) return fail(err, en, "grant", 0, "NUL byte in grant");
     /* The grant's allow lines, read as a policy's (with the policy's proxy
      * settings, which request and mcp rules need), the other lines blank. */
-    size_t cap = len + 64 + 16 * 8 + 64 * 280 + 64;
+    size_t cap = len + 64 + 16 * 8 + 64 * 280 + 16 * 4112 + 64;    /* v1.43: and the gateways */
     char *buf = malloc(cap);
     if (!buf) return fail(err, en, "grant", 0, "out of memory");
     size_t bl = 0;
@@ -2099,6 +2140,7 @@ int vdpc_grant_load(const vdpc_policy_t *p, const char *text, size_t len, vdpc_g
                        if (k_ > 0) bl += (size_t)k_ < cap - bl ? (size_t)k_ : cap - bl - 1; } while (0)
     BADD("require warden %d.%d\n", VDPC_GRAMMAR_MAJOR, VDPC_GRAMMAR_MINOR); hdr++;
     if (p->proxy) { BADD("%s\n", p->proxy_inspect ? "proxy inspect" : "proxy on"); hdr++; }
+    for (size_t i = 0; i < p->ngw; i++) { BADD("mcp gateway %s\n", p->gw_url[i]); hdr++; }   /* v1.43 */
     if (p->proxy_nports) {
         BADD("proxy ports");
         for (size_t i = 0; i < p->proxy_nports; i++) BADD(" %u", p->proxy_ports[i]);

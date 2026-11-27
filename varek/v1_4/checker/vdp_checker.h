@@ -87,7 +87,7 @@
 #include <stdint.h>
 
 #define VDPC_GRAMMAR_MAJOR 1
-#define VDPC_GRAMMAR_MINOR 42     /* v1.42: step_up rules, max_held, max_pending */
+#define VDPC_GRAMMAR_MINOR 43     /* v1.42: step_up rules, max_held, max_pending; v1.43: mcp gateway */
 
 #define VDPC_MAX_S        4095
 #define VDPC_MAX_RULES    512      /* v1.31: VDP_MAX_RULES */
@@ -143,6 +143,13 @@ typedef struct {
     int           proxy_inspect;      /* v1.26.1: `proxy inspect` (proxy is then 1 too) */
     char          proxy_pass[64][254];/* v1.26.1: `proxy passthrough host NAME`, in order */
     size_t        proxy_npass;
+    /* v1.43: `mcp gateway URL`, in order: the URL canonical (https), its host
+     * and port. Not part of any decision. */
+    char          gw_url[16][4096];
+    char          gw_host[16][254];
+    unsigned      gw_port[16];
+    int           gw_line[16];
+    size_t        ngw;
     int           launches;           /* v1.27: `require warden 1.27` (launches decided) */
     int           open_as_agent;      /* v1.29: `require warden 1.29` (files opened as the agent) */
     vdpc_cred_t   creds[VDPC_MAX_CREDS]; /* v1.28: the credentials, in order */

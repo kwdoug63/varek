@@ -54,7 +54,29 @@ enum { WP_MSG_READY = 1, WP_MSG_CONN = 2, WP_MSG_REQUEST = 3, WP_MSG_UNREADABLE 
        WP_MSG_STARTFAIL = 26,
        /* v1.42 step 3b: Warden -> proxy: the verdict a connection waits for
         * is held (a step_up rule's mode=hold): struct wp_heldnote below */
-       WP_MSG_HELDNOTE = 27 };
+       WP_MSG_HELDNOTE = 27,
+       /* v1.43: a gateway's setup without inspecting mode, struct
+        * wp_gateway below; the proxy answers WP_MSG_GATEWAY_DONE */
+       WP_MSG_GATEWAY = 28, WP_MSG_GATEWAY_DONE = 29 };
+
+/* v1.43 (docs/security/v1.43-palantir-ontology-mcp.md, D3): with `mcp
+ * gateway` and without `proxy inspect`, before the agent starts, Warden ->
+ * proxy: WP_MSG_GATEWAY, the host's trust bundle (the proxy verifies gateway
+ * servers against it); proxy -> Warden: WP_MSG_GATEWAY_DONE (ok, how many
+ * roots it loaded, or why not). Under `proxy inspect` the CA's setup loads the
+ * same bundle, and gateways use it. Only once a run. */
+struct wp_gateway {
+    uint32_t type;               /* WP_MSG_GATEWAY */
+    uint32_t pad;
+    char     bundle[1024];       /* NUL-terminated */
+};
+struct wp_gateway_done {
+    uint32_t type;               /* WP_MSG_GATEWAY_DONE */
+    uint32_t ok;
+    uint32_t nroots;
+    uint32_t pad;
+    char     why[160];
+};
 
 /* v1.42 step 3b (docs/security/v1.42-step-up-defer.md): what connection id
  * waits for (a name, a request or an MCP call) is held until a person
@@ -239,12 +261,18 @@ struct wp_req {
  * socket the Warden dialed (SCM_RIGHTS): the proxy sends it what the client
  * sent and relays both ways. allow 0: the proxy refuses the client (a TLS
  * handshake_failure alert, or an HTTP 403). */
+/* v1.43: what the proxy does with an allowed connection (wp_verdict.inspect):
+ * relay it (SNI mode), inspect it (v1.26.1: terminate its TLS, or read its
+ * plain HTTP), or serve it as an `mcp gateway` (read its plain HTTP as
+ * inspecting mode does, and speak TLS to the server itself, verified against
+ * the host's trust bundle; no certificate is minted) */
+enum { WP_INSPECT_NONE = 0, WP_INSPECT_TLS = 1, WP_INSPECT_GATEWAY = 2 };
 struct wp_verdict {
     uint32_t type;               /* WP_MSG_VERDICT */
     uint32_t allow;
     uint64_t id;
-    uint32_t inspect;            /* v1.26.1: terminate TLS (inspecting mode, not a passthrough host) */
-    uint32_t pad;
+    uint32_t inspect;            /* v1.26.1: terminate TLS (inspecting mode, not a passthrough host); v1.43: WP_INSPECT_* */
+    uint32_t port;               /* v1.43: a gateway's server port (its requests are read as https to it); else 0 */
 };
 
 /* Proxy -> Warden, step 7: a relayed connection ended (section 5: or the
@@ -281,7 +309,7 @@ struct wp_verdict_up {
     uint32_t allow;
     uint64_t id;
     uint32_t port;
-    uint32_t inspect;            /* v1.26.1: as in struct wp_verdict */
+    uint32_t inspect;            /* v1.26.1: as in struct wp_verdict (v1.43: WP_INSPECT_*) */
     char     name[256];          /* NUL-terminated */
 };
 
@@ -371,6 +399,9 @@ int wp_verdict(const wp_t *w, uint64_t id, bool allow);
  * wp_inspect): send the run id, the trust bundle's path and the names, and
  * receive the CA certificate (PEM) and the PKCS#12 trust store (malloc'd).
  * Waits up to 15 s. 0, or -1 with why. */
+/* v1.43: a gateway's setup without inspecting mode (struct wp_gateway):
+ * 0 with *nroots, or -1 with why */
+int wp_gateway_setup(const wp_t *w, const char *bundle, int *nroots, char *why, size_t wn);
 int wp_inspect_setup(const wp_t *w, const char *run_id, const char *bundle, char *const *names,
                      size_t nnames, const char (*excl)[254], size_t nexcl, unsigned char **pem, size_t *pem_len, unsigned char **p12,
                      size_t *p12_len, int *secure_heap, int *nroots, char *why, size_t wn);

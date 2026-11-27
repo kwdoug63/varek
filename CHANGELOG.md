@@ -11,14 +11,23 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
-- `varek export --format secops` (`tools/varek_secops.py`, v1.43.0 step 1):
+- v1.43.0, Palantir Ontology MCP (`docs/security/v1.43-palantir-ontology-mcp.md`),
+  built against a stand-in: `mcp gateway URL` (gateway mode: MCP calls decided
+  without TLS interception, the proxy speaking verified TLS to the server);
+  `varek mcp tools` (a policy from the server's own tool list, read-only tools
+  allowed, every other tool held, `--check` for a changed list); `credential=`
+  on `step_up mcp` rules, the token released only into a call a person
+  approved; and `integrations/palantir/` (the token refresher, client
+  configurations, the recorded run's agent and the runbook). The live run
+  waits on a Palantir enrollment.
+- `varek export --format secops` (`tools/varek_secops.py`, v1.44.0 step 1):
   a run's OCSF events, audited, sent to a Google Security Operations
   instance as UDM events through the Chronicle API's `events:import`, the
   credential the VM's service account or a key file's (signed through
   `cryptography`), never the command line. Built against a stand-in
   (`tests/test_varek_secops.py`); the fields and limits are checked in
-  Google's development instance before v1.43.0 ships.
-- `integrations/secops/` (v1.43.0 step 2): four YARA-L rules, Sentinel's four
+  Google's development instance before v1.44.0 ships.
+- `integrations/secops/` (v1.44.0 step 2): four YARA-L rules, Sentinel's four
   (an agent's action refused, a run's audit failed, a dry run's let-through,
   an approval nobody gave in time), a draft of the dashboard, and the README.
   `tests/test_varek_secops_content.py` checks that they read only what the

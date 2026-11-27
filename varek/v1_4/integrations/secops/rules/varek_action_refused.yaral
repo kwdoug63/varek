@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// VAREK for Google Security Operations (v1.43; integrations/secops/README.md).
+// VAREK for Google Security Operations (v1.44; integrations/secops/README.md).
 // An agent's action refused: one detection per run, host and deciding
 // policy line within the hour, naming the line and its text. Sentinel's
 // "VAREK: an agent's action refused" (Medium). A dry run's let-through is

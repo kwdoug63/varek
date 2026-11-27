@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""v1.43 step 2 (docs/security/v1.39-security-operations.md, section 6, G6):
+"""v1.44 step 2 (docs/security/v1.39-security-operations.md, section 6, G6):
 Google SecOps' content in integrations/secops, the four YARA-L rules and the
 dashboard, reads only what the export (tools/varek_secops.py) writes. Every
 UDM field and additional key a rule or a panel reads is one the export

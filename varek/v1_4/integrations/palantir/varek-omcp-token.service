@@ -1,0 +1,27 @@
+# varek-omcp-token.service: keep the Palantir OMCP token current for VAREK (v1.43 step 5).
+# Install: copy to /etc/systemd/system/, put FOUNDRY_HOST and OMCP_CLIENT_ID in
+# /etc/varek/palantir/omcp-token.env and the client secret in /etc/varek/palantir/client_secret
+# (both root's, mode 600), then: systemctl daemon-reload && systemctl enable --now varek-omcp-token
+# See integrations/palantir/README.md, section 3. VAREK is not affiliated with Palantir.
+[Unit]
+Description=VAREK: keep the Palantir Ontology MCP token current (omcp_token.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/varek/palantir/omcp-token.env
+ExecStart=/usr/bin/python3 /opt/varek/integrations/palantir/omcp_token.py --foundry-host ${FOUNDRY_HOST} --secret-file /etc/varek/palantir/client_secret --out /etc/varek/palantir/omcp.token
+Restart=on-failure
+RestartSec=30
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/varek/palantir
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

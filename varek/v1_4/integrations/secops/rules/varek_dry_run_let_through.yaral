@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// VAREK for Google Security Operations (v1.43; integrations/secops/README.md).
+// VAREK for Google Security Operations (v1.44; integrations/secops/README.md).
 // A dry run let through what its policy refuses: the call went ahead, so the
 // export writes it ALLOW at INFORMATIONAL, with varek_mode dry_run and
 // varek_decision DENY. One detection per run, host and line within the hour,

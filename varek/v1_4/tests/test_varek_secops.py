@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""v1.43 (docs/security/v1.39-security-operations.md, section 6): the Google
+"""v1.44 (docs/security/v1.39-security-operations.md, section 6): the Google
 Security Operations export (tools/varek_secops.py): an OCSF event as a UDM
 event, and the export to the Chronicle API's events:import, against a stand-in
 Google: a Compute Engine VM's metadata server, the OAuth token endpoint a

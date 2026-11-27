@@ -48,6 +48,7 @@ import varek_suggest  # noqa: E402
 import varek_vm  # noqa: E402
 
 import varek_container  # noqa: E402  (v1.32)
+import varek_mcp_tools  # noqa: E402  (v1.43)
 
 CLI_VERSION = "1.3.0"
 DEFAULT_CONFIG = "/etc/varek/varek.conf"
@@ -2900,7 +2901,7 @@ def cmd_export_falcon(args):
 
 
 def cmd_export_secops(args):
-    """v1.43: `varek export --format secops`: the run's OCSF events (audited,
+    """v1.44: `varek export --format secops`: the run's OCSF events (audited,
     as --format ocsf writes them) sent to a Google Security Operations
     instance as UDM events, through the Chronicle API's events:import
     (tools/varek_secops.py); with --follow, as the run goes"""
@@ -3036,7 +3037,7 @@ def cmd_export(args):
         return cmd_export_sentinel(args)
     if getattr(args, "format", "cyclonedx") == "falcon":                # v1.41
         return cmd_export_falcon(args)
-    if getattr(args, "format", "cyclonedx") == "secops":                # v1.43
+    if getattr(args, "format", "cyclonedx") == "secops":                # v1.44
         return cmd_export_secops(args)
     if args.follow:
         raise CliError("--follow is for --format ocsf, otlp, splunk, sentinel, falcon and secops")
@@ -3655,6 +3656,59 @@ Add --show-commands to any command to print the underlying tool calls.
 """
 
 
+def cmd_mcp_tools(args):
+    """v1.43 step 3: an MCP server's rules from its own tool list (varek_mcp_tools.py)."""
+    if bool(args.credential) != bool(args.credential_from):
+        raise CliError("--credential and --credential-from go together")
+    if args.opaque and not args.credential:
+        raise CliError("--opaque needs --credential")
+    if args.check and (args.gateway or args.credential):
+        raise CliError("--check compares tool lists; --gateway and --credential are for writing")
+    token = None
+    if args.token_file:
+        try:
+            with open(args.token_file, encoding="utf-8") as f:
+                token = f.read().strip()
+        except OSError as e:
+            raise CliError(f"cannot read --token-file: {e.strerror}")
+    elif os.environ.get("VAREK_MCP_TOKEN"):
+        token = os.environ["VAREK_MCP_TOKEN"].strip()
+    try:
+        if args.check:
+            with open(args.check, encoding="utf-8") as f:
+                text = f.read()
+            rec = varek_mcp_tools.recorded_url(text)
+            if rec and rec != args.url:
+                raise CliError(f"{args.check} was written for {rec}, not {args.url}")
+        if args.from_:
+            tools = varek_mcp_tools.load_tools(args.from_)
+        else:
+            tools = varek_mcp_tools.fetch_tools(args.url, token)["tools"]
+        if args.check:
+            ok_, lines = varek_mcp_tools.check_policy(text, tools)
+            for ln in lines:
+                print(ln)
+            return 0 if ok_ else 1
+        cred = (args.credential, args.credential_from, args.opaque) if args.credential else None
+        text = varek_mcp_tools.write_policy(args.url, tools, approvers=args.approvers, timeout=args.timeout,
+                                            gateway=args.gateway, credential=cred)
+    except varek_mcp_tools.McpToolsError as e:
+        raise CliError(str(e))
+    except OSError as e:
+        raise CliError(f"{e.filename}: {e.strerror}")
+    finally:
+        token = None
+    if args.output:
+        if os.path.exists(args.output) and not args.force:
+            raise CliError(f"{args.output} exists", fix="add --force to write over it")
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"wrote {args.output}: review it before use (`varek policy check {args.output}`)")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="varek",
@@ -3877,7 +3931,7 @@ def build_parser():
                          "a Splunk HTTP Event Collector, sourcetype varek:ocsf (v1.39); sentinel: to Microsoft "
                          "Sentinel's workspace, table VarekOCSF_CL, through the Logs Ingestion API (v1.40); falcon: to "
                          "a CrowdStrike Falcon Next-Gen SIEM HTTP Event Collector connector (v1.41); secops: to a Google "
-                         "Security Operations instance as UDM events, through the Chronicle API (v1.43)")
+                         "Security Operations instance as UDM events, through the Chronicle API (v1.44)")
     sp.add_argument("--endpoint", help="otlp: the collector's OTLP/HTTP logs URL (default: "
                     "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, OTEL_EXPORTER_OTLP_ENDPOINT, or http://localhost:4318/v1/logs); "
                     "splunk: the HTTP Event Collector's URL, https://HOST:8088 (default: SPLUNK_HEC_URL); "
@@ -3980,6 +4034,41 @@ def build_parser():
     sp.add_argument("--json", action="store_true", help="print the results as JSON instead of the report")
     sp.add_argument("--keep", action="store_true",
                     help="keep the bench's files, policy and verdict streams (printed at the end)")
+
+    mc = sub.add_parser("mcp", help="v1.43: rules for an MCP server from its own tool list",
+                        description="v1.43: MCP servers (docs/security/v1.43-palantir-ontology-mcp.md).")
+    mcsub = mc.add_subparsers(dest="mccmd", metavar="<action>")
+    mc.set_defaults(fn=lambda a: (mc.print_help(), 0)[1])
+    x = mcsub.add_parser("tools", help="write one exact rule per tool the server lists, or --check a file",
+                         description="Write one exact rule per tool the MCP server at URL lists: a tool the "
+                                     "server marks read-only (readOnlyHint, not destructiveHint) is allowed, "
+                                     "every other tool is held for an approver (step_up mode=hold), and a "
+                                     "tool no rule can name exactly gets none (refused). No tool is called. "
+                                     "A person reviews the file before it is used.")
+    x.add_argument("url", help="the MCP server's URL, as the policy will name it")
+    x.add_argument("--from", dest="from_", metavar="FILE",
+                   help="read the tool list from FILE (a tools/list result, a list, or omcp_measure.py's "
+                        "output) instead of the server")
+    x.add_argument("--token-file", metavar="FILE",
+                   help="a bearer token for the server, read from FILE (or VAREK_MCP_TOKEN); never printed")
+    x.add_argument("--approvers", metavar="GROUP", help="the group that approves held calls (default: root alone)")
+    x.add_argument("--timeout", type=int, default=300, help="seconds a held call waits before it is refused "
+                                                              "(default 300)")
+    x.add_argument("--gateway", action="store_true",
+                   help="v1.43 gateway mode: the agent reaches the server at http://HOST/PATH and the proxy "
+                        "decides each call and speaks verified TLS to it, with no TLS interception")
+    x.add_argument("--credential", metavar="NAME",
+                   help="a token for the server the run holds (v1.31), released into the allowed calls; the "
+                        "agent holds only $VAREK_CRED_NAME")
+    x.add_argument("--credential-from", metavar="STORE:REF",
+                   help="where the token is kept: file:/PATH (root's, mode 600), vault:PATH#KEY or awssm:NAME")
+    x.add_argument("--opaque", action="store_true",
+                   help="the token is not a JWT whose aud names the server (omcp_measure.py says which)")
+    x.add_argument("-o", "--output", help="write the rules here (default: standard output)")
+    x.add_argument("--force", action="store_true", help="write over --output")
+    x.add_argument("--check", metavar="FILE", help="exit 1 if the server's tool list differs from the one FILE "
+                                                   "was written from")
+    x.set_defaults(fn=cmd_mcp_tools)
 
     add("license", cmd_license, "check the VAREK Enterprise subscription (AWS Marketplace)")
     add("version", cmd_version, "show the varek command and Warden versions")

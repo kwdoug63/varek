@@ -78,7 +78,7 @@ jobs:
           chmod -R a+rX /var/tmp/varek-fw
       - name: Check the deployment scripts parse
         run: |
-          python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py varek/v1_4/tools/varek_bench.py varek/v1_4/tools/varek_node_export.py varek/v1_4/tools/varek_vm.py varek/v1_4/tools/varek_suggest.py
+          python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py varek/v1_4/tools/varek_bench.py varek/v1_4/tools/varek_node_export.py varek/v1_4/tools/varek_vm.py varek/v1_4/tools/varek_suggest.py varek/v1_4/tools/varek_mcp_tools.py varek/v1_4/integrations/palantir/omcp_measure.py varek/v1_4/integrations/palantir/omcp_token.py varek/v1_4/integrations/palantir/clients/omcp_agent.py varek/v1_4/integrations/palantir/demo_d5.py
           bash -n varek/v1_4/tools/varek_preflight.sh
           bash -n varek/v1_4/tools/varek_anchor_receiver.sh
       - name: Lint the shipped policies
@@ -140,6 +140,8 @@ jobs:
           ! grep -q 'the code adapters under the Warden: not tried' "$RUNNER_TEMP/v1350.log"
       - name: v1.42 approvals as grants (the grammar, grants and the two-part certificate; runtime grants in mode=grant)
         run: sudo make -C varek/v1_4 test-v1420
+      - name: v1.43 mcp gateway (the grammar in all three readings; gateway mode under a real Warden)
+        run: sudo make -C varek/v1_4 test-v1430
       - name: v1.42 the shared soak's harness, for six minutes (runs A to C, and D, v1.42's approvals)
         timeout-minutes: 20
         run: |
