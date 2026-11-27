@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "palantir-omcp": {
+      "type": "http",
+      "url": "http://omcp.example.com/mcp/app1",
+      "headers": {
+        "Authorization": "Bearer ${env:VAREK_CRED_OMCP}"
+      }
+    }
+  }
+}

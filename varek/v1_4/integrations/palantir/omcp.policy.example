@@ -1,0 +1,39 @@
+# omcp.policy.example: VAREK v1.43, a policy for a Palantir Ontology MCP server in
+# gateway mode (integrations/palantir/README.md). A MODEL: the URL, the tool names
+# and their annotations are the stand-in's (tests/v1430_omcp_server.py, Palantir's
+# OSDK to-do example) until a live enrollment is measured. Write your own with
+#   varek mcp tools URL --gateway --credential omcp --credential-from file:/etc/varek/palantir/omcp.token \
+#       --approvers ontology-approvers -o omcp.policy
+# and review it. Below this block is that command's output for the stand-in, unchanged.
+# VAREK is not affiliated with Palantir Technologies Inc.
+# varek mcp tools: https://omcp.example.com/mcp/app1
+# written 2026-11-27T00:00:00Z from the server's own tool list
+# tools-sha256 afbaf83a1d009b9bebe6c6b848e2ed8dc27769d73ea4eab03390afd3a291039d
+# 5 tools: 2 allowed (the server marks them read-only), 3 held for an approver, 0 refused (no exact rule possible)
+# A person reviews this file before it is used. `varek mcp tools --check FILE` fails
+# when the server's tool list changes.
+# Gateway mode: the agent's MCP client uses http://omcp.example.com/mcp/app1 (port 80); the proxy
+# decides each call against https://omcp.example.com/mcp/app1 and speaks verified TLS to the server.
+
+require warden 1.43
+proxy on
+proxy ports 80 443
+mcp gateway https://omcp.example.com/mcp/app1
+# The agent holds only the placeholder ($VAREK_CRED_OMCP); the proxy
+# releases the token into the calls an allow rule below names.
+credential omcp from file:/etc/varek/palantir/omcp.token audience=https://omcp.example.com/mcp/app1
+allow host omcp.example.com:443
+allow mcp https://omcp.example.com/mcp/app1 initialize credential=omcp
+allow mcp https://omcp.example.com/mcp/app1 notifications/initialized credential=omcp
+allow mcp https://omcp.example.com/mcp/app1 tools/list credential=omcp
+
+# create-osdk-todo-task: no read-only annotation (Create Todo Task)
+step_up mcp https://omcp.example.com/mcp/app1 tools/call create-osdk-todo-task mode=hold timeout=300 approvers=ontology-approvers
+# delete-osdk-todo-task: the server marks it destructive (Delete Todo Task)
+step_up mcp https://omcp.example.com/mcp/app1 tools/call delete-osdk-todo-task mode=hold timeout=300 approvers=ontology-approvers
+# get-overdue-osdk-todo-tasks: the server marks it read-only (Overdue tasks)
+allow mcp https://omcp.example.com/mcp/app1 tools/call get-overdue-osdk-todo-tasks credential=omcp
+# modify-osdk-todo-task-status: the server marks it as writing (Modify Todo Task Status)
+step_up mcp https://omcp.example.com/mcp/app1 tools/call modify-osdk-todo-task-status mode=hold timeout=300 approvers=ontology-approvers
+# search-osdk-todo-task: the server marks it read-only (Search Todo Task)
+allow mcp https://omcp.example.com/mcp/app1 tools/call search-osdk-todo-task credential=omcp

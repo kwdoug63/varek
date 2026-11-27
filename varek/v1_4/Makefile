@@ -711,6 +711,14 @@ install: warden warden-proxy warden-secrets warden-notify tools/vdp_check tools/
 	# v1.40: Microsoft Sentinel's templates (integrations/sentinel/README.md)
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/integrations/sentinel
 	install -m 0644 integrations/sentinel/README.md integrations/sentinel/*.json $(DESTDIR)$(PREFIX)/integrations/sentinel/
+	# v1.43: the Palantir Ontology MCP integration (integrations/palantir/README.md)
+	install -d -m 0755 $(DESTDIR)$(PREFIX)/integrations/palantir/clients
+	install -m 0644 integrations/palantir/README.md integrations/palantir/omcp.policy.example \
+	    integrations/palantir/varek-omcp-token.service $(DESTDIR)$(PREFIX)/integrations/palantir/
+	install -m 0755 integrations/palantir/omcp_token.py integrations/palantir/omcp_measure.py $(DESTDIR)$(PREFIX)/integrations/palantir/
+	install -m 0644 integrations/palantir/clients/vscode-mcp.json integrations/palantir/clients/claude_agent_sdk.py \
+	    $(DESTDIR)$(PREFIX)/integrations/palantir/clients/
+	install -m 0755 integrations/palantir/clients/omcp_agent.py $(DESTDIR)$(PREFIX)/integrations/palantir/clients/
 	if [ -d tools/systemd ]; then install -d -m 0755 $(DESTDIR)$(PREFIX)/tools/systemd && \
 	    install -m 0644 tools/systemd/* $(DESTDIR)$(PREFIX)/tools/systemd/; fi
 	ln -sf $(PREFIX)/tools/varek $(DESTDIR)$(BINDIR)/varek
@@ -722,7 +730,7 @@ uninstall:
 	@echo "removed $(PREFIX); settings in /etc/varek and logs in /var/log/varek were kept"
 
 test-cli: warden warden-proxy tools/vdp_check tools/vdp_cert_check tools/varek_keygen tools/bench_workload
-	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_container.py tests/test_varek_license.py tests/test_add_free_trial.py tests/test_varek_vm.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py tests/test_varek_bench_mcp.py tests/test_varek_audit_stream.py tests/test_varek_node_keys.py tests/test_varek_v140_logs.py tests/test_varek_otel.py tests/test_varek_splunk.py tests/test_varek_sentinel.py tests/test_varek_falcon.py tests/test_varek_export_resume.py tests/test_varek_ocsf_v142.py tests/test_varek_mcp_tools.py
+	python3 -m pytest -q tests/test_varek_cli.py tests/test_varek_container.py tests/test_varek_license.py tests/test_add_free_trial.py tests/test_varek_vm.py tests/test_varek_bench.py tests/test_varek_bench_proxy.py tests/test_varek_bench_launch.py tests/test_varek_bench_mcp.py tests/test_varek_audit_stream.py tests/test_varek_node_keys.py tests/test_varek_v140_logs.py tests/test_varek_otel.py tests/test_varek_splunk.py tests/test_varek_sentinel.py tests/test_varek_falcon.py tests/test_varek_export_resume.py tests/test_varek_ocsf_v142.py tests/test_varek_mcp_tools.py tests/test_palantir_integration.py
 
 # v1.34 step 2: the node agent's JSON reader (node_json.c)
 test-node-json: tests/test_node_json.c node_json.c node_json.h

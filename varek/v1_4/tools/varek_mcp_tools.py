@@ -207,8 +207,29 @@ def _host_port(url):
     return u.hostname, u.port or (443 if u.scheme == "https" else 80)
 
 
-def write_policy(url, tools, approvers=None, timeout=300, now=None):
+CRED_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+CRED_STORE = re.compile(r"^(?:file:/\S+|vault:\S+|awssm:\S+)$")
+
+
+def write_policy(url, tools, approvers=None, timeout=300, now=None, gateway=False, credential=None):
+    """The policy text. gateway: v1.43's gateway mode (`mcp gateway URL`, no
+    TLS interception) in place of inspecting mode. credential: (NAME,
+    STORE:REF, opaque) for a v1.31 MCP token the run holds, released into
+    the allowed calls; the agent holds only its placeholder."""
     host, port = _host_port(url)
+    if gateway and not url.startswith("https://"):
+        raise McpToolsError(f"{url}: a gateway's server is reached over https://")
+    cred_line, cred_opt = None, ""
+    if credential:
+        name, store, opaque = credential
+        if not CRED_NAME.match(name or ""):
+            raise McpToolsError(f"--credential {name!r}: a credential's name is [a-z][a-z0-9_]{{0,31}}")
+        if not CRED_STORE.match(store or ""):
+            raise McpToolsError("--credential-from: file:/PATH, vault:PATH#KEY or awssm:NAME")
+        if not url.startswith("https://"):
+            raise McpToolsError(f"{url}: a credential goes only to an https:// server")
+        cred_line = f"credential {name} from {store} audience={url}" + (" opaque" if opaque else "")
+        cred_opt = f" credential={name}"
     now = now or _dt.datetime.now(_dt.timezone.utc)
     rows = sorted(((t, *classify(t)) for t in tools), key=lambda x: str(x[0].get("name")))
     n = {"allow": 0, "step_up": 0, "refuse": 0}
@@ -223,24 +244,39 @@ def write_policy(url, tools, approvers=None, timeout=300, now=None):
         f"{n['step_up']} held for an approver, {n['refuse']} refused (no exact rule possible)",
         "# A person reviews this file before it is used. `varek mcp tools --check FILE` fails",
         "# when the server's tool list changes.",
-        "",
-        "require warden 1.42",
-        "proxy inspect",
-        *([] if port in (80, 443) else [f"proxy ports {port}"]),
-        f"allow host {host}:{port}",
-        f"allow mcp {url} initialize",
-        f"allow mcp {url} notifications/initialized",
-        f"allow mcp {url} tools/list",
-        "",
     ]
     if not approvers:
-        out.insert(6, "# No --approvers group: root alone approves each held call (v1.42).")
+        out.append("# No --approvers group: root alone approves each held call (v1.42).")
+    if gateway:
+        gw_url = f"http://{host}{urllib.parse.urlsplit(url).path or '/'}"
+        out += [
+            f"# Gateway mode: the agent's MCP client uses {gw_url} (port 80); the proxy",
+            f"# decides each call against {url} and speaks verified TLS to the server.",
+            "",
+            "require warden 1.43",
+            "proxy on",
+            "proxy ports 80 443" + ("" if port == 443 else f" {port}"),
+            f"mcp gateway {url}",
+        ]
+    else:
+        out += ["", "require warden 1.42", "proxy inspect",
+                *([] if port in (80, 443) else [f"proxy ports {port}"])]
+    if cred_line:
+        out += [f"# The agent holds only the placeholder ($VAREK_CRED_{credential[0].upper()}); the proxy",
+                "# releases the token into the calls an allow rule below names.", cred_line]
+    out += [
+        f"allow host {host}:{port}",
+        f"allow mcp {url} initialize{cred_opt}",
+        f"allow mcp {url} notifications/initialized{cred_opt}",
+        f"allow mcp {url} tools/list{cred_opt}",
+        "",
+    ]
     for t, verdict, why in rows:
         title = (t.get("title") or "").replace("\n", " ")[:80]
         label = f"{t.get('name')!r}" if verdict == "refuse" else t["name"]
         out.append(f"# {label}: {why}" + (f" ({title})" if title else ""))
         if verdict == "allow":
-            out.append(f"allow mcp {url} tools/call {t['name']}")
+            out.append(f"allow mcp {url} tools/call {t['name']}{cred_opt}")
         elif verdict == "step_up":
             out.append(f"step_up mcp {url} tools/call {t['name']}{hold}")
         else:

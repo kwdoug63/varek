@@ -3642,6 +3642,12 @@ Add --show-commands to any command to print the underlying tool calls.
 
 def cmd_mcp_tools(args):
     """v1.43 step 3: an MCP server's rules from its own tool list (varek_mcp_tools.py)."""
+    if bool(args.credential) != bool(args.credential_from):
+        raise CliError("--credential and --credential-from go together")
+    if args.opaque and not args.credential:
+        raise CliError("--opaque needs --credential")
+    if args.check and (args.gateway or args.credential):
+        raise CliError("--check compares tool lists; --gateway and --credential are for writing")
     token = None
     if args.token_file:
         try:
@@ -3667,7 +3673,9 @@ def cmd_mcp_tools(args):
             for ln in lines:
                 print(ln)
             return 0 if ok_ else 1
-        text = varek_mcp_tools.write_policy(args.url, tools, approvers=args.approvers, timeout=args.timeout)
+        cred = (args.credential, args.credential_from, args.opaque) if args.credential else None
+        text = varek_mcp_tools.write_policy(args.url, tools, approvers=args.approvers, timeout=args.timeout,
+                                            gateway=args.gateway, credential=cred)
     except varek_mcp_tools.McpToolsError as e:
         raise CliError(str(e))
     except OSError as e:
@@ -4019,6 +4027,16 @@ def build_parser():
     x.add_argument("--approvers", metavar="GROUP", help="the group that approves held calls (default: root alone)")
     x.add_argument("--timeout", type=int, default=300, help="seconds a held call waits before it is refused "
                                                               "(default 300)")
+    x.add_argument("--gateway", action="store_true",
+                   help="v1.43 gateway mode: the agent reaches the server at http://HOST/PATH and the proxy "
+                        "decides each call and speaks verified TLS to it, with no TLS interception")
+    x.add_argument("--credential", metavar="NAME",
+                   help="a token for the server the run holds (v1.31), released into the allowed calls; the "
+                        "agent holds only $VAREK_CRED_NAME")
+    x.add_argument("--credential-from", metavar="STORE:REF",
+                   help="where the token is kept: file:/PATH (root's, mode 600), vault:PATH#KEY or awssm:NAME")
+    x.add_argument("--opaque", action="store_true",
+                   help="the token is not a JWT whose aud names the server (omcp_measure.py says which)")
     x.add_argument("-o", "--output", help="write the rules here (default: standard output)")
     x.add_argument("--force", action="store_true", help="write over --output")
     x.add_argument("--check", metavar="FILE", help="exit 1 if the server's tool list differs from the one FILE "
