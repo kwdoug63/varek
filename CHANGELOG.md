@@ -9,8 +9,167 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- `tests/arm64_sweep.sh --deps` installs its Python packages with
+  `--require-hashes`, from `tools/requirements-sweep.txt`, now compiled from
+  `tools/requirements-sweep.in` (uv, for Python 3.9 and later) with every
+  package's version and hash (OpenSSF Scorecard, Pinned-Dependencies). On
+  Python 3.9 (RHEL 9, Rocky Linux 9, Amazon Linux 2023) pytest is the
+  distribution's `python3-pytest`, as no pytest for 3.9 is free of a known
+  vulnerability.
+- `integrations/sentinel/README.md` says where the workbook and rules are
+  now that Sentinel is moving to the Microsoft Defender portal (Defender
+  only after March 31, 2027): the workbook is an Azure Monitor workbook and
+  still opens from its resource group or Monitor → Workbooks.
+
+---
+
+## [1.42.0] - 2026-11-26 — STEP UP and DEFER: approvals as grants
+
+A call a policy cannot settle on its own can now wait: for a person
+(STEP_UP: its narrowest grant proposed, answered on the run's approvers'
+socket) or for the context it needs (DEFER: a root-owned marker, or a
+person). An approval is a grant, precise and limited in count, time and
+scope, that the decision procedure and the independent checker check like
+any authorization; every proposal, grant, use and ending is recorded in the
+signed stream and replayed by the audit. Calls are refused and proposed
+(`mode=grant`, the default) or held at the kernel or the egress proxy
+(`mode=hold`), with `scope=run` freezing the run meanwhile. Approvals may be
+signed by pinned keys, standing grants and plans approved ahead of time,
+the user's request recorded (`--intent`) and each proposal posted to a
+webhook (`notify=`). The policy grammar moves to 1.42. AARM's conformance
+tests for R1 to R6 run in `mode=hold` (`make test-v1420`, section 15). The
+24-hour soak's results follow when it ends.
+
 ### Added
 
+- **`step_up` rules** (`require warden 1.42`), with the matchers of `allow`
+  and `deny` and the options `mode=grant|hold`, `approvers=GROUP`,
+  `timeout=N`, `scope=thread|run` and `notify=URL`; `max_held` and
+  `max_pending`. Grants, read by both parsers; the two-part certificate
+  (the policy's half and the grant's), checked by the checker (#241).
+- **Runtime grants** (`mode=grant`, #242): a refused call's narrowest grant
+  proposed; `varek pending`, `varek approve` (as proposed, or narrowed) and
+  `varek deny` on the run's approvers' socket; approvers by the kernel's
+  peer credentials, of the rule's `approvers=` group or root, never the
+  agent's own user.
+- **Held calls** (`mode=hold`, #243, #244): at the kernel and at the egress
+  proxy (requests and MCP tool calls), decided again when approved;
+  `max_held`; `abandoned` when the caller is gone; killable waits on Linux
+  5.19 and later, also with libseccomp before 2.6.
+- **`scope=run`** (#245): the run's control group frozen while a call is
+  held, or the call refused at once where the run cannot be frozen.
+- **DEFER** (#246, #247): `defer KIND ... until=FILE [escalate]`, released
+  by a root-owned marker naming the run; `on unknown defer escalate`;
+  `on outside_plan defer` with `varek plan extend` through the plan gate.
+- **Signed approvals** (#248): `approver key=HEX group=GROUP`; standing
+  grants (`varek run --grants DIR`); `varek plan approve` and
+  `--require-approved-plan`; `varek approve --sign-key`;
+  `varek_keygen --sign` and `--verify`.
+- **The user's request and a webhook** (#250): `varek run --intent FILE` or
+  `--intent-text TEXT`, recorded in `run_start` and shown to approvers;
+  `notify=URL`, posted by the new helper `warden-notify` (its own user,
+  notification only, retried once; the URL never recorded).
+- **The exports** (#251): every v1.42 record an OCSF event (Application
+  Lifecycle), through OpenTelemetry, Splunk (fields, the macro
+  `varek_approval_expired`), Sentinel (a fourth rule: an approval nobody
+  gave in time) and Falcon.
+- **`make test-v1420`** complete: section 14 (order, `max_pending`, a signal,
+  the caller killed and the Warden stopped or killed during a hold, 70
+  approvals in one run, the audit's remaining forgeries) and section 15
+  (AARM's conformance tests for R1 to R6, in `mode=hold`).
+- **`make latency-v1420`** (`tests/latency_v1420.sh`, recorded in
+  `tests/latency_v1.42.0.txt`): calls not held under v1.41.0's Warden,
+  built from its tag, and under v1.42.0's, with and without `step_up` and
+  `defer` rules.
+- **The shared soak's run D** (`tests/soak_shared`): each turn a held read
+  approved by a script and a read under a signed standing grant, every
+  tenth a deferral timing out.
+
+### Changed
+
+- The Warden is 1.42.0, and the grammar 1.42.
+- The threat model (trust boundaries 22, the approvers, and 23, the
+  webhook), the trusted computing base and the AARM mapping, current as of
+  v1.42.0; the mapping records AARM's conformance tests.
+
+### Fixed
+
+- **A run's live grants never shrank,** so its 65th approval would have been
+  refused ("the run holds as many grants as it may"): a grant whose count is
+  used or whose time has passed now leaves them, between decisions. Found by
+  the soak's run D, one approval a turn.
+- **The certificate checker read at most 64 grant files a batch,** so a run
+  with more grants could not be audited: `vdp_cert_check POLICY batch @LIST`
+  names them in a file, without a limit, and the audit uses it past 64.
+- **The audit refused two approvals of the same grant text** ("recorded
+  twice"), which two proposals of one call made within a second give (a
+  grant's id is the SHA-256 of its text). A second approval of the same
+  text for another open proposal is one grant, its counts summed; one
+  repeated for its own proposal is still refused.
+- `varek pending` escapes control, format and bidirectional characters in
+  what the agent supplies; the webhook's line escapes Slack's mrkdwn; an
+  exported policy line names a `notify=` URL by its host only; a run whose
+  request is over 4 KiB exports (#251).
+
+### Fixed (documentation)
+
+- **The threat model's token algorithms.** It listed the user's token as
+  RS256, PS256, ES256 or EdDSA; since v1.41 RS384, PS384 and ES384 are
+  accepted too (#237).
+
+- **The 510 TOCTOU figure has a record.** Since v1.18.0 the README said the
+  harness's "510 leaks in 20,000 attempts" had no recorded run. It was
+  measured: one run each way for v1.9.1 in GitHub Codespaces (naive 510,
+  mitigated 0), whose output was kept only in the build session. It is now
+  committed as `tests/toctou_results_v1.9.1.txt`, and the README,
+  `RELEASE-v1.18.0.md` and `tests/toctou_results_v1.18.0.txt` say so. The
+  v1.18.0 re-run (1,848 to 1,889 against 0 on a 2-vCPU host) stands; the naive
+  count depends on the host.
+
+## [1.41.0] - 2026-11-24 — VAREK implements no cryptography of its own
+
+Every hash, signature, key and random byte of the Warden and its tools is
+the host's OpenSSL 3, through one backend; libsodium and VAREK's own SHA-256
+and Ed25519 code are gone. The verdict stream moves to format chain-2
+(SHA-384, ECDSA P-384), and v1.40 logs still verify. The Defense build
+(`make DEFENSE=1`) runs only on a host in FIPS mode with its FIPS 140-3
+validated module servicing it, and leaves TLS-inspecting mode out. The
+sector packs move to `require warden 1.29`; the Falcon Next-Gen SIEM
+export is in, tested against a stand-in. The 24-hour soak passed (the
+shared soak, and the packs on the core build and on the Defense build in
+FIPS mode). v1.42.0 is planned for AARM's
+STEP UP and DEFER decisions and v1.43.0 for Google Security Operations;
+CrowdStrike Falcon Foundry and Wiz move to v1.44.0.
+
+### Added
+
+- **The Defense build, `make DEFENSE=1`** (v1.41,
+  `docs/security/v1.41-cryptography.md`). Two switches, fixed at build time:
+  the Warden, warden-secrets and varek_keygen refuse to start unless the
+  host is in FIPS mode and its FIPS 140-3 validated OpenSSL provider
+  services their hashing and signing (fail closed: off FIPS mode the Warden
+  will not even lint a policy, even where Red Hat's FIPS provider is
+  installed, which loads off FIPS mode too); and the egress proxy's TLS-inspecting mode is not compiled in,
+  so `warden-proxy` links no TLS or crypto library at all, and a policy that
+  says `proxy inspect` (and so request rules, mcp rules, credentials and
+  passthrough hosts) is refused on every path that loads one. `make DEFENSE=1`
+  keeps the switches even when `CFLAGS` is given.
+- **run_start says which provider made the stream's chain and signatures**
+  (`crypto_provider`: `fips` or `default`; v1.41), inside the signed record.
+  `varek_audit.py --require-fips` fails a run whose run_start, signed under the
+  pinned key, does not say `fips`.
+- `make test-v1410`: the crypto backend alone (known answers, RFC 6979's
+  P-384 vectors, the Defense switch's refusal), no libsodium in any binary or
+  source and no hash of VAREK's own, the Defense build's binaries and
+  refusals, and `proxy inspect` refused. `make fips-acceptance` runs the
+  Defense build's acceptance on RHEL 9 in FIPS mode and keeps its evidence;
+  it names what is not installed before it builds, and checks the user's
+  token (RS384, PS384, ES384) through the FIPS provider (`test_v1281` with
+  the core binaries, the EdDSA token skipped where Ed25519 is not offered).
+- `tests/v140_fixture`: a verdict stream, anchor and CycloneDX evidence the
+  v1.40.0 Warden wrote, which the audit and exporter must go on verifying.
 - **CrowdStrike Falcon Next-Gen SIEM export, against a stand-in** (v1.41,
   `docs/security/v1.39-security-operations.md`, section 4a; not yet
   tested in a Falcon tenant). `varek export --format falcon [LOG]` sends
@@ -27,10 +186,50 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `make test-proxy-ca` (in CI): the run CA's name constraints under ASan and
   UBSan, every permitted and excluded name kept, up to 256 names of 253
   characters each way.
-
+- `docs/security/openssf-best-practices.md`: the answer given for each
+  OpenSSF Best Practices criterion (project 16965), and how the CodeQL
+  findings open at submission were fixed or dismissed, with each reason.
+- **The user's token may be signed with RS384, PS384 or ES384** (v1.41), the
+  SHA-384 forms a CNSA-aligned identity provider uses, besides RS256, PS256,
+  ES256 and EdDSA. An ES384 token is checked with a P-384 key only, ES256 with
+  a P-256 one: a key of the other curve is passed over, as one of another type
+  is, so a token naming the issuer's P-256 key with ES384 is refused. `run_start` records the algorithm, and
+  the audit accepts the three.
 
 ### Changed
 
+- **The run id comes from the crypto provider's DRBG** (v1.41), the FIPS
+  provider's in FIPS mode, as every other random byte the Warden uses (it came
+  from `getrandom(2)`). Nothing else changes: 16 bytes, as 32 hex digits.
+
+- **VAREK implements no cryptography of its own** (v1.41,
+  `docs/security/v1.41-cryptography.md`). Every hash, signature, key and
+  random byte of the Warden and its tools is the host's OpenSSL 3, through
+  one backend (`varek_fips.c`, EVP with the library's default properties):
+  on a host in FIPS mode it activates the FIPS provider and uses it. The
+  verdict stream moves to format **chain-2**: a SHA-384 chain, run_start,
+  checkpoints and run_end signed with **ECDSA P-384** (CNSA-aligned), run_start
+  naming `"log":"chain-2"` and `"sigalg":"ecdsa-p384-sha384"`. Streams in
+  chain-1 (SHA-256, Ed25519; v1.16 to v1.40) are still audited, and one
+  rewritten into chain-1 under a 1.41 Warden is refused. The certificate
+  checker's SHA-256 and the audit's Ed25519 are no longer VAREK's own code:
+  the policy digest is OpenSSL's, and signatures are checked through
+  Python's `cryptography` package (P-384; Ed25519 for old logs, still refusing
+  every small-order key, which OpenSSL alone accepts). CycloneDX evidence is
+  signed JSF **ES384**; Ed25519 evidence still verifies.
+- **Signing keys are ECDSA P-384** (PKCS#8 PEM; public keys the uncompressed
+  point, 194 hex characters), from `tools/varek_keygen`, for `--sign-key` and
+  the node agent's `--node-key` alike. **Upgrading a v1.40 host: run `sudo varek
+  init`.** It replaces the Ed25519 key, keeps its public half as
+  `log.key.v140.pub` (which `varek audit` and `varek export` use for the runs
+  it signed), and leaves the settings and the policy as they are; until then
+  `varek run` refuses and `varek doctor` names the key. A node agent's old key
+  is refused, saying to remove it (a new one is made; its VarekNodeKey changes).
+  The VarekNodeKey CRD, the admission check, the anchor forwarder and the
+  receiver accept both key forms.
+- The deployment preflight checks the key as a P-384 PEM key (with the
+  `openssl` command: its curve, and that its `.pub` is its public half), and
+  names a v1.40 key as such.
 - **The sector packs say `require warden 1.29`** (they said 1.27). Under it:
   - **Files are opened as the agent's own user and groups,** not as root,
     so the kernel's permissions apply on top of the policy.
@@ -59,9 +258,30 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   or are not there, and how to fix each (`chown`, a group's write access, an
   ACL, or `install -d -o USER`). They ask the kernel as that user, so its
   groups, ACLs and a read-only mount count.
+- The test scripts' installs are pinned by hash (OpenSSF Scorecard,
+  Pinned-Dependencies). `measure_v1360/m3_spire.sh` builds its SPIRE client
+  from `measure_v1360/m3delegate/` (go.mod and go.sum, the node agent's
+  module versions) with `-mod=readonly`, not `go get @latest`.
+  `profiles_v1290.sh` installs the three agent CLIs with `npm ci` from
+  `profiles_v1290/package-lock.json`, into `~/.npm-global/lib/node_modules`
+  as before. Dependabot updates both.
+
+### Removed
+
+- **libsodium**, from the Warden, `varek_keygen` and `varek_cyclonedx.py`'s
+  signing, and so from the build's and the images' packages (v1.41).
+- **EPEL**: RHEL, UBI and the VM guest now need nothing from outside Red
+  Hat's repositories (it was there for libsodium). The RHEL 9 guide loses its
+  EPEL step.
 
 ### Fixed
 
+- **The launch set's SHA-256 named the non-validated provider** (v1.29's
+  `EVP_MD_fetch(.., "provider=default")`): in FIPS mode that refused every
+  `allow exec` file or bypassed the FIPS module. It follows the library's
+  default properties now.
+- warden-secrets checks its digest and HMAC: a failure left uninitialised
+  bytes to be signed (AWS SigV4).
 - The run CA's name constraints (`proxy_ca.c`) are assembled with each
   part's length checked: a buffer too short for them now refuses to make the
   CA, where the unchecked appends would have written past its end (CodeQL,
@@ -79,23 +299,34 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   error"). Both now say 1.29. A test makes the legacy `stat(2)` and
   `lstat(2)` calls directly under the bench's policy (x86-64): allowed where
   the policy reads, refused and recorded elsewhere.
-- **Microsoft Sentinel, two corrections from a live test** (November 21,
-  2026, `docs/security/v1.39-security-operations.md`, section 3). The test
-  exported a run from an Azure VM with its managed identity, no secret: 403
-  with no role, every row with Monitoring Metrics Publisher on the one
-  rule, and the refusal incident raised. That had been tested only against
-  the stand-in. `integrations/sentinel/README.md` now says:
-  - a new role can take up to about half an hour to apply (here, 23
-    minutes), not "some minutes";
-  - a row is judged by two or three of the rule's runs, not at most two:
-    Sentinel measures a scheduled rule's `ago()` from about 5 minutes
-    before the run. Each repeat lands in the same incident;
-  - where an alert's run is (`Custom Details`, `RunId[0]`).
+- **Microsoft Sentinel, a managed identity tested live** (November 21,
+  2026, `docs/security/v1.39-security-operations.md`, section 3). A run was
+  exported from an Azure VM with its managed identity, no secret: 403 with
+  no role; with Monitoring Metrics Publisher on the one rule, every row,
+  and the refusal incident raised. That had been tested only against the
+  stand-in. `integrations/sentinel/README.md` now says a new role can take
+  up to about half an hour to apply (here, 23 minutes), not "some
+  minutes". The same test's repeated alerts led to the rules' fix below.
 - `tests/test_v1260.sh`: the captures of real clients' ClientHellos wait
   for their listener. It slept 0.3 s on a random port, and under the node
   agent a listener could take longer to start, so the client was refused and
   the capture left empty ("a curl ClientHello", once on arm64). The listener
   now takes a free port and names it once it is listening.
+- **Sentinel's analytics rules raise one alert for each row**
+  (`integrations/sentinel/sentinel-content.json`). They took the rows that
+  arrived in the last 6 minutes with no upper bound; in a rule, `now()` is
+  the end of its query window, about 5 minutes before it runs, so a row
+  that arrived between a window's end and its run was judged by that run
+  and the next two: the same alert three times, in one incident (the live
+  test of a managed identity's export, November 21, 2026). Each rule now
+  takes the rows that arrived in its own 5-minute window,
+  `ingestion_time() > ago(5m) and ingestion_time() <= now()`; the windows
+  end exactly 5 minutes apart, so each row is judged once. The Sentinel
+  README shows how to find a run's alerts by the `RunId` in their custom
+  details. Deploy `sentinel-content.json` again to replace the rules.
+  Tested live (November 21, 2026): two runs exported 8 minutes late raised
+  one alert for each refusing line and one for the failed audit, each
+  once over 4 to 5 passes, 8 to 9 minutes after their rows arrived.
 
 ## [1.40.0] - 2026-11-20 — security operations: Microsoft Sentinel
 

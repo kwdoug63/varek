@@ -20,6 +20,14 @@ int install_baseline_user_notif_filter(int observe);
 // refusing it (EPERM); the hard-deny rules are unchanged.
 #define WD_FILTER_CHANGES 1
 #define WD_FILTER_DRY     2
+// v1.42 step 3: the policy holds calls (mode=hold): on Linux 5.19 or later,
+// a held call's wait is ended by a fatal signal only
+// (SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV); elsewhere a signal ends it and
+// the kernel notifies the call again. v1.42 step 4: with libseccomp before
+// 2.6 too (the program it builds, loaded with the flag).
+#define WD_FILTER_WAITKILL 4
+int wd_filter_waitkill_built(void);   // 1 if this build can ask for it
+int wd_filter_waitkill_kernel(void);  // 1 if this kernel accepts it (a child tries it)
 int install_baseline_user_notif_filter_ex(int observe, int flags);
 
 #endif

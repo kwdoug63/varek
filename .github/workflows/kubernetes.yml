@@ -59,7 +59,7 @@ jobs:
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
             | sudo tee /etc/apt/apt.conf.d/80varek-ci-retries > /dev/null
           sudo apt-get update
-          sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
+          sudo apt-get install -y build-essential libseccomp-dev libssl-dev
       - name: Build the tools the test uses (the key and the certificate checker)
         run: make -C varek/v1_4 tools/varek_keygen tools/vdp_cert_check
       - name: kind, pinned
@@ -98,7 +98,7 @@ jobs:
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
             | sudo tee /etc/apt/apt.conf.d/80varek-ci-retries > /dev/null
           sudo apt-get update
-          sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
+          sudo apt-get install -y build-essential libseccomp-dev libssl-dev
           sudo apt-get install -y openjdk-21-jdk-headless musl-tools
           sudo apt-get install -y --no-install-recommends squid python3-cryptography
           # every version and hash pinned (requirements-ci.in, compiled); --ignore-installed:
@@ -140,7 +140,7 @@ jobs:
           printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
             | sudo tee /etc/apt/apt.conf.d/80varek-ci-retries > /dev/null
           sudo apt-get update
-          sudo apt-get install -y build-essential libseccomp-dev libsodium-dev libssl-dev
+          sudo apt-get install -y build-essential libseccomp-dev libssl-dev
       - name: Build the tools the check uses (the key, the certificate checker)
         run: make -C varek/v1_4 tools/varek_keygen tools/vdp_cert_check
       - name: kind, pinned

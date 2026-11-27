@@ -51,7 +51,21 @@ enum { WP_MSG_READY = 1, WP_MSG_CONN = 2, WP_MSG_REQUEST = 3, WP_MSG_UNREADABLE 
         * struct wp_mcpreq and struct wp_mcpverdict below */
        WP_MSG_MCPREQ = 24, WP_MSG_MCPVERDICT = 25,
        /* v1.36 step 4: the proxy could not start, struct wp_startfail below */
-       WP_MSG_STARTFAIL = 26 };
+       WP_MSG_STARTFAIL = 26,
+       /* v1.42 step 3b: Warden -> proxy: the verdict a connection waits for
+        * is held (a step_up rule's mode=hold): struct wp_heldnote below */
+       WP_MSG_HELDNOTE = 27 };
+
+/* v1.42 step 3b (docs/security/v1.42-step-up-defer.md): what connection id
+ * waits for (a name, a request or an MCP call) is held until a person
+ * answers or ms pass; the proxy waits that long, plus WP_HELD_SLACK_MS, for
+ * its verdict, from now, instead of WP_VERDICT_MS. */
+struct wp_heldnote {
+    uint32_t type;               /* WP_MSG_HELDNOTE */
+    uint32_t ms;                 /* at most 3,600,000 */
+    uint64_t id;
+};
+#define WP_HELD_SLACK_MS 5000
 
 /* v1.28 (docs/security/v1.28-credential-release.md, section 3). Before the
  * agent starts, Warden -> proxy: WP_MSG_PH, each credential's placeholder

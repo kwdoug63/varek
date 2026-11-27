@@ -177,7 +177,7 @@ def write_config(path, cfg):
         fh.write("# VAREK settings, written by `varek init`. Edit by hand or re-run init.\n")
         fh.write("#   policy     the policy the Warden enforces\n")
         fh.write("#   log_dir    where each run's verdict stream is written\n")
-        fh.write("#   sign_key   Ed25519 key that signs the stream (empty: unsigned)\n")
+        fh.write("#   sign_key   ECDSA P-384 key that signs the stream (v1.41; empty: unsigned)\n")
         fh.write("#   anchor     optional --anchor path (FIFO for an off-host anchor)\n")
         fh.write("#   spool      the anchor forwarder's spool directory, if any\n")
         fh.write("#   run_as     the unprivileged user the agent runs as\n")
@@ -526,7 +526,72 @@ def verdict_word(r):
     return {"ALLOW": "SATISFIED", "DENY": "UNSATISFIED", "UNKNOWN": "UNKNOWN"}.get(raw, raw)
 
 
-def _pubkey(cfg):
+# v1.41: the Warden signs with ECDSA P-384 (a PEM key). A key of v1.40 or
+# earlier (an Ed25519 seed, 64 hex characters) is not used: `varek init`, or a
+# first run, retires it, removing its private half and keeping its public half
+# beside the new key as log.key.v140.pub, which `varek audit` and `varek
+# export` use for the runs it signed (their streams say "log":"chain-1").
+V140_PUB = ".v140.pub"
+
+
+def _key_is_v140(path):
+    """True if path holds a v1.40 signing key (an Ed25519 seed, 64 hex characters)."""
+    try:
+        with open(path, "rb") as fh:
+            b = fh.read(80)
+    except OSError:
+        return False
+    return re.fullmatch(rb"[0-9a-fA-F]{64}\n?", b) is not None
+
+
+def _retire_v140_key(key):
+    """v1.41: retire a v1.40 key at key: its public half kept as key + V140_PUB
+    (to verify the runs it signed), its private half removed. The kept path."""
+    kept, pub = key + V140_PUB, key + ".pub"
+    if os.path.exists(pub):
+        with open(pub) as fh:
+            new = fh.read().strip()
+        if os.path.exists(kept):
+            with open(kept) as fh:
+                if fh.read().strip() != new:
+                    raise CliError(f"{kept} already holds another v1.40 key's public half",
+                                   fix=f"move {kept} aside (it verifies the runs that key signed), then retry")
+        os.replace(pub, kept)
+        os.chmod(kept, 0o644)
+    os.remove(key)
+    return kept
+
+
+def _log_format(log):
+    """A verdict stream's integrity format, from its run_start: "chain-2" (v1.41),
+    "chain-1" (v1.16 to v1.40), or None."""
+    try:
+        with open(log, encoding="utf-8", errors="surrogateescape") as fh:
+            for i, line in enumerate(fh):
+                if i > 500:
+                    break
+                if line.startswith("{") and '"event":"run_start"' in line[:80]:
+                    return json.loads(line).get("log")
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def _bom_format(path):
+    """"chain-1" for evidence signed by v1.40 or earlier (JSF Ed25519), else None."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            alg = (json.load(fh).get("signature") or {}).get("algorithm")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return "chain-1" if alg == "Ed25519" else None
+
+
+def _pubkey(cfg, fmt=None):
+    """The configured key's public half; for a chain-1 stream (or evidence) of
+    v1.40 or earlier, the retired v1.40 key's, when it was kept (v1.41)."""
+    if cfg["sign_key"] and fmt == "chain-1" and os.path.exists(cfg["sign_key"] + V140_PUB):
+        return cfg["sign_key"] + V140_PUB
     if cfg["sign_key"] and os.path.exists(cfg["sign_key"] + ".pub"):
         return cfg["sign_key"] + ".pub"
     return None
@@ -827,6 +892,11 @@ def cmd_doctor(args):
                     fail(f"signing key {cfg['sign_key']} is readable by group or others")
                     hint(f"sudo chmod 600 {cfg['sign_key']}")
                     bad += 1
+                elif _key_is_v140(cfg["sign_key"]):                    # v1.41
+                    fail(f"signing key {cfg['sign_key']} is v1.40's Ed25519 key, which the Warden no longer uses")
+                    hint("`sudo varek init` replaces it, keeping its public half as "
+                         f"{cfg['sign_key']}{V140_PUB} for the runs it signed")
+                    bad += 1
                 else:
                     ok(f"signing key {cfg['sign_key']} (mode 600)")
             except PermissionError:
@@ -889,6 +959,17 @@ def cmd_init(args):
     path = config_path()
     etc = os.path.dirname(os.path.abspath(path))
     existing = load_config(required=False)
+    # v1.41: on a host set up by v1.40 or earlier, `varek init` upgrades the
+    # signing key, and only that: the settings and the policy stay as they are
+    if existing and not args.force and existing["sign_key"] and _key_is_v140(existing["sign_key"]):
+        key = existing["sign_key"]
+        kept = _retire_v140_key(key)
+        run_cmd([tool("varek_keygen"), key], capture=True)
+        ok(f"signing key {key}: v1.40's Ed25519 key replaced by a P-384 key (600) and {key}.pub")
+        ok(f"the old key's public half kept as {kept}: `varek audit` and `varek export` use it "
+           f"for the runs that key signed")
+        ok(f"settings {path} and the policy kept")
+        return 0
     if existing and not args.force:
         raise CliError(f"{path} already exists",
                        fix="use `sudo varek policy use <pack>` to change the policy, "
@@ -922,7 +1003,13 @@ def cmd_init(args):
     key = ""
     if not args.no_sign:
         key = os.path.join(etc, "log.key")
-        if os.path.exists(key) and not args.force_key:
+        if os.path.exists(key) and _key_is_v140(key):
+            # v1.41: v1.40's Ed25519 key is retired, whether or not --force-key
+            kept = _retire_v140_key(key)
+            run_cmd([tool("varek_keygen"), key], capture=True)
+            ok(f"signing key {key}: v1.40's Ed25519 key replaced by a P-384 key (600) and {key}.pub; "
+               f"the old key's public half kept as {kept}, to verify the runs it signed")
+        elif os.path.exists(key) and not args.force_key:
             ok(f"signing key {key} kept (use --force-key to replace it)")
         else:
             for p in (key, key + ".pub"):
@@ -1725,6 +1812,11 @@ def first_use(cfg):
         os.chmod(d, 0o750)
         print(_paint("2", f"[varek] log directory {d} (750), made on first use"), file=sys.stderr)
     key = os.path.join(cfg["etc"], "log.key")
+    if os.path.exists(key) and _key_is_v140(key):                       # v1.41
+        kept = _retire_v140_key(key)
+        run_cmd([tool("varek_keygen"), key], capture=True)
+        print(_paint("2", f"[varek] signing key {key}: v1.40's Ed25519 key replaced by a P-384 key; "
+                          f"its public half kept as {kept}, for the runs it signed"), file=sys.stderr)
     if not os.path.exists(key):
         os.makedirs(cfg["etc"], exist_ok=True)
         os.chmod(cfg["etc"], 0o755)
@@ -1849,7 +1941,22 @@ def cmd_run(args):
         if not args.plan:
             raise CliError("--hold-to-plan holds the run to a plan", fix="give the plan with --plan PLAN")
         argv += ["--hold-to-plan"]
+    if getattr(args, "require_approved_plan", False):                 # v1.42 step 6
+        if not args.plan:
+            raise CliError("--require-approved-plan checks the plan's approval", fix="give the plan with --plan PLAN")
+        argv += ["--require-approved-plan"]
+    if getattr(args, "grants", None):                                 # v1.42 step 6
+        argv += ["--grants", os.path.abspath(args.grants)]
+    if getattr(args, "intent", None) and getattr(args, "intent_text", None) is not None:   # v1.42 step 7
+        raise CliError("--intent and --intent-text together", fix="give the user's request one way")
+    if getattr(args, "intent", None):
+        argv += ["--intent", os.path.abspath(args.intent)]
     if cfg["sign_key"]:
+        if _key_is_v140(cfg["sign_key"]):                                 # v1.41
+            raise CliError(f"the signing key {cfg['sign_key']} is v1.40's Ed25519 key, which the Warden "
+                           f"no longer uses (it signs with ECDSA P-384)",
+                           fix=f"`sudo varek init` replaces it, keeping its public half as "
+                               f"{cfg['sign_key']}{V140_PUB} to verify the runs it signed")
         argv += ["--sign-key", cfg["sign_key"]]
     if cfg["anchor"]:
         argv += ["--anchor", cfg["anchor"]]
@@ -1875,8 +1982,20 @@ def cmd_run(args):
                              "policy refuses is let through."), file=sys.stderr)
     print(_paint("2", f"[varek] supervising `{' '.join(cmd)}` under {label}; "
                       f"verdicts -> {log}"), file=sys.stderr)
-    with os.fdopen(fd, "w") as err:
-        r = run_cmd(argv, check=False, stderr=err, env=env)
+    intent_dir = None
+    if getattr(args, "intent_text", None) is not None:              # v1.42 step 7
+        # the text, in a file for the Warden to read (in a private directory, removed after the run)
+        intent_dir = tempfile.mkdtemp(prefix="varek-intent-")
+        ip = os.path.join(intent_dir, "intent")
+        with open(os.open(ip, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as fh:
+            fh.write(args.intent_text)
+        argv[2:2] = ["--intent", ip]
+    try:
+        with os.fdopen(fd, "w") as err:
+            r = run_cmd(argv, check=False, stderr=err, env=env)
+    finally:
+        if intent_dir:
+            shutil.rmtree(intent_dir, ignore_errors=True)
 
     agent_err = []
     with open(log, encoding="utf-8", errors="replace") as fh:
@@ -2039,6 +2158,214 @@ def cmd_revoke(args):
             fail(f"{run}: {ans}")
             rc = 1
     return rc
+
+
+# v1.42 step 2 (docs/security/v1.42-step-up-defer.md): approving a grant the
+# Warden proposed for a call a step_up rule refused, through the run's
+# approvers' socket (/run/varek-approve/<run>.sock). The Warden names the
+# approver by the kernel's peer credentials: a member of the rule's
+# approvers= group, or root when it names none; never the agent's own user.
+APV_DIR = "/run/varek-approve"
+
+
+def apv_ask(run, request):
+    """The Warden's answer to one request, or None when no run by that id is running."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(30)
+    try:
+        s.connect(os.path.join(APV_DIR, run + ".sock"))
+        s.sendall(request.encode("utf-8"))
+        s.shutdown(socket.SHUT_WR)
+        out = b""
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            out += b
+        return out.decode("utf-8", "replace")
+    except (FileNotFoundError, ConnectionRefusedError):
+        return None
+    except OSError as e:
+        return f"refused: {e.strerror or e}"
+    finally:
+        s.close()
+
+
+def apv_run(arg):
+    run = arg or ""
+    if run and os.path.isfile(run):
+        first = next((r for r in read_records(run) if r.get("event") == "run_start"), {})
+        run = first.get("run", "")
+    if not run:
+        try:
+            runs = sorted(f[:-5] for f in os.listdir(APV_DIR) if f.endswith(".sock") and RUN_ID_RX.match(f[:-5]))
+        except OSError:
+            runs = []
+        if len(runs) == 1:
+            return runs[0]
+        raise CliError("which run?", fix="`varek pending <run>` (the Warden prints it at the start)"
+                       + (f"; running: {', '.join(runs)}" if runs else ""))
+    if not RUN_ID_RX.match(run):
+        raise CliError(f"not a run id: {arg}", fix="a run id is 32 hex digits; the Warden prints it at the start")
+    return run
+
+
+def _shown(text):
+    """v1.42 step 8: text an approver reads (the user's request, a proposal,
+    the object it names) with its control and format characters written as
+    escapes: the request comes from the agent's framework and an object's
+    name from the agent, and neither may move the cursor, recolour or hide
+    the text, or reorder it (bidirectional controls) on the approver's
+    terminal"""
+    import unicodedata
+    return "".join(c if c == "\t" or unicodedata.category(c) not in ("Cc", "Cf", "Co", "Cs", "Zl", "Zp")
+                   else (f"\\x{ord(c):02x}" if ord(c) < 0x100 else f"\\u{ord(c):04x}" if ord(c) < 0x10000
+                         else f"\\U{ord(c):08x}") for c in str(text))
+
+
+def cmd_pending(args):
+    run = apv_run(args.run)
+    ans = apv_ask(run, "pending")
+    if ans is None:
+        fail(f"{run}: no such run is running (or it has no step_up rule)")
+        return 1
+    props, intent = [], None
+    for line in ans.splitlines():
+        if line == "end":
+            break
+        if line.startswith("refused"):
+            fail(f"{run}: {line}")
+            return 1
+        o = json.loads(line)
+        if "intent" in o and "id" not in o:          # v1.42 step 7: the user's request, first
+            intent = o["intent"]
+            continue
+        props.append(o)
+    if args.json:
+        if intent:                                   # each proposal with the run's request
+            props = [dict(p, intent=intent) for p in props]
+        print(json.dumps(props, indent=2))
+        return 0
+    if not props:
+        info(f"{run}: no proposal you may answer is open.")
+        return 0
+    if intent:
+        info(f"the user's request ({intent['bytes']} bytes, SHA-256 {intent['sha256'][:16]}"
+             + (", the first part shown" if intent.get("truncated") else "") + "):")
+        for ln in intent["text"].splitlines() or [""]:
+            info(f"    {_shown(ln)}")
+        info("")
+    defers = [p for p in props if p.get("defer") == "outside_plan"]
+    for p in props:
+        if p in defers:
+            continue
+        info(f"proposal {p['id']} (policy line {p['rule_line']}, ends in {p['expires_in']} s)"
+             + (f", approvers {p['approvers']}" if p.get("approvers") else ""))
+        for ln in p["proposal"].splitlines():
+            info(f"    {_shown(ln)}")
+    # v1.42 step 5b: calls outside the run's plan, waiting for a plan extension
+    for p in defers:
+        info(f"outside the plan: {p['id']} (policy line {p['rule_line']}, ends in {p['expires_in']} s): "
+             f"{p['action']} {_shown(p['resolved'])}")
+        if p.get("extension"):
+            info("    an extension that covers it:")
+            for ln in p["extension"].splitlines():
+                info(f"        {_shown(ln)}")
+    if len(defers) < len(props):
+        info(f"\nAnswer with `varek approve {run} ID` (or --narrow FILE) or `varek deny {run} ID`.")
+    if defers:
+        info(f"\nExtend the run's plan with `varek plan extend {run} PLAN`.")
+    return 0
+
+
+def cmd_plan_approve(args):
+    """v1.42 step 6: an approver signs a plan (PLAN.sig), for --require-approved-plan"""
+    if os.path.exists(args.plan + ".sig") and not args.force:
+        raise CliError(f"{args.plan}.sig exists", fix="give --force to sign the plan again")
+    argv = [tool("varek_keygen"), "--sign", "plan", args.key, args.plan] + (["--force"] if args.force else [])
+    q = run_cmd(argv, capture=True)
+    if q.returncode != 0:
+        fail(f"cannot sign {args.plan}: {(q.stderr or '').strip()}")
+        return 1
+    ok(f"{args.plan}.sig: the plan, signed with {args.key}")
+    return 0
+
+
+def cmd_plan_extend(args):
+    """v1.42 step 5b: steps added to a running run's plan, through its plan gate"""
+    run = apv_run(args.run)
+    with open(args.plan, encoding="utf-8") as fh:
+        text = fh.read()
+    if len(text.encode("utf-8")) > 16384:
+        raise CliError("a plan extension is at most 16 KiB")
+    ans = apv_ask(run, "extend\n" + text)
+    if ans is None:
+        fail(f"{run}: no such run is running")
+        return 1
+    ans = ans.strip()
+    if ans.startswith("extended"):
+        ok(f"{run}: {ans}")
+        return 0
+    fail(f"{run}: {ans}")
+    return 1
+
+
+def approval_sign(kind, keyfile, text):
+    """v1.42 step 6: (sig, key) of text signed as kind with keyfile, through
+    varek_keygen (the crypto backend; varek_approval.h has the format)"""
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "x")
+        with open(f, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        q = run_cmd([tool("varek_keygen"), "--sign", kind, keyfile, f], capture=True)
+        if q.returncode != 0:
+            raise CliError(f"cannot sign with {keyfile}: {(q.stderr or '').strip()}")
+        with open(f + ".sig", encoding="ascii") as fh:
+            lines = fh.read().splitlines()
+    got = dict(ln.split(" ", 1) for ln in lines[1:] if " " in ln)
+    return got["sig"], got["key"]
+
+
+def cmd_approve(args, deny=False):
+    run = apv_run(args.run)
+    req = f"{'deny' if deny else 'approve'} {args.id}\n"
+    if args.reason:
+        if "\n" in args.reason:
+            raise CliError("a reason is one line")
+        req += f"reason {args.reason}\n"
+    text = None
+    if not deny and args.narrow:
+        with open(args.narrow, encoding="utf-8") as fh:
+            text = fh.read()
+    if not deny and getattr(args, "sign_key", None):
+        # v1.42 step 6: sign the very text approved: the narrowed grant, or the proposal's own
+        if text is None:
+            listing = apv_ask(run, "pending")
+            for line in (listing or "").splitlines():
+                if line.startswith("{"):
+                    p = json.loads(line)
+                    if p.get("id") == args.id and "proposal" in p:
+                        text = p["proposal"]
+            if text is None:
+                raise CliError(f"no open proposal {args.id} you may answer in {run}")
+        sig, key = approval_sign("grant", args.sign_key, text)
+        req += f"sig {sig} key {key}\n"
+    if text is not None:
+        req += text
+    ans = apv_ask(run, req)
+    if ans is None:
+        fail(f"{run}: no such run is running")
+        return 1
+    ans = ans.strip()
+    if ans.startswith("approved") or ans == "denied":
+        ok(f"{run}: {ans}")
+        return 0
+    fail(f"{run}: {ans}")
+    return 1
+
+
+def cmd_deny(args):
+    return cmd_approve(args, deny=True)
 
 
 def policy_line_text(path, n):
@@ -2478,7 +2805,7 @@ def cmd_audit(args):
                        fix="restore it, then audit with tools/varek_audit.py --policy <file>")
     argv = [sys.executable, tool("varek_audit.py"),
             "--policy", policy, "--checker", tool("vdp_cert_check")]
-    pub = _pubkey(cfg)
+    pub = _pubkey(cfg, _log_format(log))
     if pub:
         argv += ["--pubkey", pub]
     if cfg["anchor"] and os.path.isfile(cfg["anchor"]):
@@ -2591,7 +2918,7 @@ def _export_sent(args, sender, done):
         raise CliError("the policy file this run used is not on this host",
                        fix="restore it, or give it with --policy; the records name the policy the run used")
     ox = [sys.executable, tool("varek_ocsf.py"), "--policy", policy, "--checker", tool("vdp_cert_check")]
-    pub = args.pubkey or _pubkey(cfg)
+    pub = args.pubkey or _pubkey(cfg, _log_format(log))
     if pub:
         ox += ["--pubkey", pub]
     if cfg["anchor"] and os.path.isfile(cfg["anchor"]):
@@ -2654,7 +2981,7 @@ def cmd_export_ocsf(args):
     argv = [sys.executable, tool("varek_ocsf.py"), "--policy", policy, "--checker", tool("vdp_cert_check")]
     # review: the key given, else the configured one; the stream is audited
     # with it for --verify too
-    pub = args.pubkey or _pubkey(cfg)
+    pub = args.pubkey or _pubkey(cfg, _log_format(log))
     if pub:
         argv += ["--pubkey", pub]
     if cfg["anchor"] and os.path.isfile(cfg["anchor"]):
@@ -2702,7 +3029,7 @@ def cmd_export(args):
                        fix="the CycloneDX evidence is one document, written whole")
     if args.verify:
         cfg = load_config(required=False)
-        pub = args.pubkey or (_pubkey(cfg) if cfg else None)
+        pub = args.pubkey or (_pubkey(cfg, _bom_format(args.verify)) if cfg else None)
         if not pub:
             raise CliError("verifying needs the Warden's public key",
                            fix="pass --pubkey /etc/varek/log.key.pub")
@@ -2724,8 +3051,12 @@ def cmd_export(args):
             raise CliError("signing the evidence needs the signing key, which only root can read",
                            fix="run `sudo varek export`, or `varek export --no-sign`")
         argv += ["--sign-key", cfg["sign_key"]]
-    elif _pubkey(cfg):
-        argv += ["--pubkey", _pubkey(cfg)]
+        # v1.41: a run of v1.40 or earlier is checked under its retired key's
+        # public half, and the evidence signed with today's key
+        if _pubkey(cfg, _log_format(log)) and _pubkey(cfg, _log_format(log)).endswith(V140_PUB):
+            argv += ["--pubkey", _pubkey(cfg, _log_format(log))]
+    elif _pubkey(cfg, _log_format(log)):
+        argv += ["--pubkey", _pubkey(cfg, _log_format(log))]
     if args.allow_incomplete:
         argv.append("--allow-incomplete")
     rc = run_cmd(argv, check=False).returncode
@@ -3404,6 +3735,24 @@ def build_parser():
     x.add_argument("-o", "--output", help="write the plan here (default: standard output)")
     x.add_argument("--force", action="store_true", help="write over --output")
     x.set_defaults(fn=cmd_plan_merge)
+    x = plsub.add_parser("extend", help="v1.42: add steps to a running run's plan (an approver of its "
+                                        "`on outside_plan defer` line), decided by its plan gate",
+                         description="Send PLAN to the run's Warden over the approvers' socket. The Warden decides "
+                                     "it with the plan gate; the steps of a plan it authorizes join the run's plan, "
+                                     "and each call held outside the plan that they cover is decided again. "
+                                     "`varek pending` suggests one for each such call.")
+    x.add_argument("run", help="the run's id (or its verdict stream)")
+    x.add_argument("plan", help="the plan's steps (plan 1.35 format)")
+    x.set_defaults(fn=cmd_plan_extend)
+    x = plsub.add_parser("approve", help="v1.42: sign a plan as its approver (PLAN.sig), for "
+                                         "`varek run --require-approved-plan`",
+                         description="Sign PLAN with an approver's key (from varek_keygen, its public half "
+                                     "pinned in the policy by `approver key=... group=...`). The Warden checks "
+                                     "PLAN.sig over the plan's very bytes at the start.")
+    x.add_argument("plan", help="the plan")
+    x.add_argument("--key", required=True, help="the approver's private key (varek_keygen KEYFILE)")
+    x.add_argument("--force", action="store_true", help="write over PLAN.sig")
+    x.set_defaults(fn=cmd_plan_approve)
 
     sp = add("preflight", cmd_preflight, "check the deployment before running agents")
     sp.add_argument("--run", action="store_true", help="also do a real trial run and audit it (root)")
@@ -3435,6 +3784,16 @@ def build_parser():
     sp.add_argument("--hold-to-plan", action="store_true",
                     help="v1.35: also hold the run to the plan: a call the policy allows but no step of the plan "
                          "covers is refused (outside_plan)")
+    sp.add_argument("--require-approved-plan", action="store_true",
+                    help="v1.42: refuse the run unless the plan carries an approver's signature (PLAN.sig, "
+                         "`varek plan approve`)")
+    sp.add_argument("--grants", metavar="DIR",
+                    help="v1.42: standing grants (DIR/NAME.grant, each signed: NAME.grant.sig), checked at the start")
+    sp.add_argument("--intent", metavar="FILE",
+                    help="v1.42: the user's request, as the agent framework received it: recorded in run_start (its "
+                         "SHA-256, and its text up to 4 KiB, or a file beside the log) and shown to approvers "
+                         "(`varek pending`); no rule matches on it")
+    sp.add_argument("--intent-text", metavar="TEXT", help="v1.42: the same, given as text")
     sp.add_argument("--run-as", help="unprivileged user for the agent (default from settings; with the "
                                      "baseline, the user who ran sudo)")
     sp.add_argument("--log", help="write the verdict stream here instead of a new file")
@@ -3455,6 +3814,25 @@ def build_parser():
                     "on, held to refusals, and ends as it would.")
     sp.add_argument("run", nargs="?", help="the run id (or a running run's verdict log)")
     sp.add_argument("--all", action="store_true", help="revoke every running run")
+
+    sp = add("pending", cmd_pending, "list a run's proposed grants you may answer (v1.42)",
+             epilog="A call a step_up rule refuses proposes the narrowest grant that would allow it. "
+                    "Approve it, as proposed or narrowed, and the agent's next try is decided against "
+                    "the policy and the grant, with a certificate the checker verifies.")
+    sp.add_argument("run", nargs="?", help="the run id (or its verdict log); the only running one by default")
+    sp.add_argument("--json", action="store_true", help="the proposals as JSON")
+    sp = add("approve", cmd_approve, "approve a proposed grant, as proposed or narrowed (v1.42)")
+    sp.add_argument("run", help="the run id (or its verdict log)")
+    sp.add_argument("id", help="the proposal's id (varek pending)")
+    sp.add_argument("--narrow", metavar="FILE", help="a grant narrower than the proposal: its count, time "
+                    "and scope no wider")
+    sp.add_argument("--reason", help="why, recorded with the grant")
+    sp.add_argument("--sign-key", metavar="KEYFILE", help="v1.42: also sign the grant with an approver's key "
+                    "(pinned in the policy by `approver key=... group=...`), recorded with it")
+    sp = add("deny", cmd_deny, "refuse a proposed grant (v1.42)")
+    sp.add_argument("run", help="the run id (or its verdict log)")
+    sp.add_argument("id", help="the proposal's id (varek pending)")
+    sp.add_argument("--reason", help="why, recorded")
 
     sp = add("refusals", cmd_refusals, "list the actions refused in a run, and why")
     sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")

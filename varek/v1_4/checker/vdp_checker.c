@@ -16,60 +16,25 @@
 #include <ctype.h>
 #include <string.h>
 
+#include "../varek_fips.h"
+
 /* ------------------------------------------------------------------------ */
-/* SHA-256 (FIPS 180-4)                                                      */
+/* SHA-256 (FIPS 180-4) — the policy digest.                                 */
+/*                                                                           */
+/* v1.41: the checker no longer carries its own SHA-256. The digest is       */
+/* computed by the host OpenSSL provider through the shared backend          */
+/* (varek_fips.c), so on a FIPS-mode host it runs in the FIPS 140-3          */
+/* validated module. The algorithm stays SHA-256: the digest is surfaced as  */
+/* `sha256=` and matched against operator-authored executable pins in        */
+/* policy, which are SHA-256 by definition.                                  */
 /* ------------------------------------------------------------------------ */
-
-static const uint32_t K256[64] = {
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-};
-
-static uint32_t ror(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
-
-static void sha256_block(uint32_t h[8], const unsigned char *b) {
-    uint32_t w[64];
-    for (int i = 0; i < 16; i++)
-        w[i] = (uint32_t)b[4 * i] << 24 | (uint32_t)b[4 * i + 1] << 16 |
-               (uint32_t)b[4 * i + 2] << 8 | (uint32_t)b[4 * i + 3];
-    for (int i = 16; i < 64; i++) {
-        uint32_t s0 = ror(w[i - 15], 7) ^ ror(w[i - 15], 18) ^ (w[i - 15] >> 3);
-        uint32_t s1 = ror(w[i - 2], 17) ^ ror(w[i - 2], 19) ^ (w[i - 2] >> 10);
-        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-    }
-    uint32_t a = h[0], bb = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
-    for (int i = 0; i < 64; i++) {
-        uint32_t t1 = hh + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) + ((e & f) ^ (~e & g)) + K256[i] + w[i];
-        uint32_t t2 = (ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + ((a & bb) ^ (a & c) ^ (bb & c));
-        hh = g; g = f; f = e; e = d + t1; d = c; c = bb; bb = a; a = t1 + t2;
-    }
-    h[0] += a; h[1] += bb; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
-}
 
 void vdpc_sha256(const void *data, size_t len, unsigned char out[32]) {
-    uint32_t h[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-                      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
-    const unsigned char *p = data;
-    size_t left = len;
-    while (left >= 64) { sha256_block(h, p); p += 64; left -= 64; }
-    unsigned char tail[128];
-    memset(tail, 0, sizeof tail);
-    memcpy(tail, p, left);
-    tail[left] = 0x80;
-    size_t tl = (left < 56) ? 64 : 128;
-    uint64_t bits = (uint64_t)len * 8;
-    for (int i = 0; i < 8; i++) tail[tl - 1 - i] = (unsigned char)(bits >> (8 * i));
-    sha256_block(h, tail);
-    if (tl == 128) sha256_block(h, tail + 64);
-    for (int i = 0; i < 8; i++) {
-        out[4 * i] = (unsigned char)(h[i] >> 24); out[4 * i + 1] = (unsigned char)(h[i] >> 16);
-        out[4 * i + 2] = (unsigned char)(h[i] >> 8); out[4 * i + 3] = (unsigned char)h[i];
+    if (vfips_sha256(data, len, out) != 0) {
+        /* A digest that cannot be computed must not silently become zero and
+         * match nothing (or, worse, a zero pin). Fail loudly. */
+        fprintf(stderr, "vdp_checker: SHA-256 via the host crypto provider failed\n");
+        abort();
     }
 }
 
@@ -121,6 +86,14 @@ typedef struct {
 
 struct vdpc_rule {
     bool     allow;
+    bool     step_up;                 /* v1.42: a step_up rule (allow false) */
+    bool     defer;                   /* v1.42 step 5: a defer rule (allow, step_up false) */
+    bool     su_escalate;             /* ... escalate */
+    char     df_until[256];           /* ... until= */
+    int      su_mode, su_scope;       /* v1.42: mode=, scope= */
+    uint32_t su_timeout;              /* v1.42: timeout=, 0: not set */
+    char     su_approvers[33];        /* v1.42: approvers= */
+    char     su_notify[513];          /* v1.42: notify= */
     int      kind;
     int      match;
     char    *c;                       /* the constant (for a glob, the pattern) */
@@ -609,8 +582,68 @@ static bool printable(const char *v, size_t lo, size_t hi) {
 }
 
 /* v1.28.1: an https URL with a host, at most hi bytes */
+/* v1.42 step 5: a defer rule's until= path: absolute, 2 to 255 bytes of
+ * 0x21 to 0x7e, no empty, `.` or `..` component, not ending in '/' */
+static bool until_ok(const char *v) {
+    size_t l = strlen(v);
+    if (l < 2 || l > 255 || v[0] != '/' || v[l - 1] == '/') return false;
+    for (size_t i = 0; i < l; i++) if ((unsigned char)v[i] < 0x21 || (unsigned char)v[i] > 0x7e) return false;
+    size_t start = 1;
+    for (size_t i = 1; i <= l; i++) {
+        if (i < l && v[i] != '/') continue;
+        size_t cl = i - start;
+        if (cl == 0 || (cl == 1 && v[start] == '.') || (cl == 2 && v[start] == '.' && v[start + 1] == '.')) return false;
+        start = i + 1;
+    }
+    return true;
+}
+
 static bool https_with_host(const char *u, size_t hi) {
     return printable(u, 9, hi) && !strncmp(u, "https://", 8) && u[8] != '/' && u[8] != '?' && u[8] != '#';
+}
+
+/* v1.42 step 7: notify='s other form, http:// to a loopback address
+ * (127.0.0.0/8 written as four decimal parts, or [::1]), an optional port
+ * from 1 to 65535, then nothing, or '/', '?' or '#'. Written apart from
+ * the procedure's. */
+static bool http_loopback(const char *u, size_t hi) {
+    if (!printable(u, 8, hi) || strncmp(u, "http://", 7)) return false;
+    const char *h = u + 7, *e = h + strcspn(h, "/?#");
+    const char *colon = NULL;
+    if (*h == '[') {
+        if ((size_t)(e - h) < 5 || memcmp(h, "[::1]", 5)) return false;
+        colon = h + 5;
+    } else {
+        const char *c = memchr(h, ':', (size_t)(e - h));
+        colon = c ? c : e;
+        int parts = 0;
+        for (const char *q = h; q <= colon && parts < 5;) {
+            const char *d = q;
+            while (d < colon && *d != '.') d++;
+            size_t tl = (size_t)(d - q);
+            if (tl < 1 || tl > 3) return false;
+            int v = 0;
+            for (const char *x = q; x < d; x++) {
+                if (*x < '0' || *x > '9') return false;
+                v = v * 10 + (*x - '0');
+            }
+            if (v > 255 || (parts == 0 && v != 127)) return false;
+            parts++;
+            q = d + 1;
+            if (d == colon) break;
+        }
+        if (parts != 4) return false;
+    }
+    if (colon == e) return true;
+    if (*colon != ':') return false;
+    size_t pl = (size_t)(e - colon - 1);
+    if (pl < 1 || pl > 5) return false;
+    long port = 0;
+    for (const char *q = colon + 1; q < e; q++) {
+        if (*q < '0' || *q > '9') return false;
+        port = port * 10 + (*q - '0');
+    }
+    return port >= 1 && port <= 65535;
 }
 
 /* v1.31: an MCP server's URL in canonical form, "scheme://host:port/path"
@@ -1008,7 +1041,61 @@ static int parse_rule(const char *name, int ln, char **tok, int nt, int req_maj,
     memset(r, 0, sizeof *r);
     r->line = ln;
     if (!strcmp(tok[0], "allow")) r->allow = true;
+    else if (!strcmp(tok[0], "step_up")) r->step_up = true;           /* v1.42 */
+    else if (!strcmp(tok[0], "defer")) r->defer = true;               /* v1.42 step 5 */
     else if (strcmp(tok[0], "deny")) return fail(err, en, name, ln, "unknown verb");
+    if (r->step_up || r->defer) {
+        /* v1.42: its options, last: mode= approvers= timeout= scope= notify=;
+         * v1.42 step 5, a defer rule's: until= (required) approvers= timeout=
+         * scope= (default run) escalate; held (mode hold) */
+        if (!ver_ge(req_maj, req_min, 1, 42)) return fail(err, en, name, ln, "step_up or defer before 1.42");
+        int seen = 0;
+        if (r->defer) { r->su_mode = 1; r->su_scope = 1; }
+        while (nt > 3) {
+            const char *o = tok[nt - 1], *v = strchr(o, '=');
+            int k = !strncmp(o, "mode=", 5) ? 1 : !strncmp(o, "approvers=", 10) ? 2 : !strncmp(o, "timeout=", 8) ? 4
+                  : !strncmp(o, "scope=", 6) ? 8 : !strncmp(o, "notify=", 7) ? 16 : !strncmp(o, "until=", 6) ? 32
+                  : !strcmp(o, "escalate") ? 64 : 0;
+            if (!k) break;
+            if (r->step_up ? k > 16 : (k == 1 || k == 16)) return fail(err, en, name, ln, "an option of the other verb");
+            if (seen & k) return fail(err, en, name, ln, "step_up or defer option twice");
+            seen |= k;
+            if (k == 64) { r->su_escalate = true; nt--; continue; }
+            v++;
+            size_t vl = strlen(v);
+            if (k == 32) {
+                if (!until_ok(v)) return fail(err, en, name, ln, "bad until=");
+                memcpy(r->df_until, v, vl + 1);
+                nt--;
+                continue;
+            }
+            if (k == 1) {
+                if (strcmp(v, "grant") && strcmp(v, "hold")) return fail(err, en, name, ln, "bad mode=");
+                r->su_mode = v[0] == 'h';
+            } else if (k == 2) {
+                bool ok = vl >= 1 && vl <= 32 && (islower((unsigned char)v[0]) || v[0] == '_');
+                for (size_t i = 1; ok && i < vl; i++)
+                    ok = islower((unsigned char)v[i]) || isdigit((unsigned char)v[i]) || v[i] == '_' || v[i] == '-' ||
+                         (v[i] == '$' && i + 1 == vl);
+                if (!ok) return fail(err, en, name, ln, "bad approvers=");
+                memcpy(r->su_approvers, v, vl + 1);
+            } else if (k == 4) {
+                uint32_t x = 0;
+                bool ok = vl >= 1 && vl <= 4 && v[0] != '0';
+                for (size_t i = 0; ok && i < vl; i++) { ok = isdigit((unsigned char)v[i]); x = x * 10 + (uint32_t)(v[i] - '0'); }
+                if (!ok || x < 1 || x > 3600) return fail(err, en, name, ln, "bad timeout=");
+                r->su_timeout = x;
+            } else if (k == 8) {
+                if (strcmp(v, "thread") && strcmp(v, "run")) return fail(err, en, name, ln, "bad scope=");
+                r->su_scope = v[0] == 'r';
+            } else {
+                if (!https_with_host(v, 512) && !http_loopback(v, 512)) return fail(err, en, name, ln, "bad notify=");
+                memcpy(r->su_notify, v, vl + 1);
+            }
+            nt--;
+        }
+        if (r->defer && !r->df_until[0]) return fail(err, en, name, ln, "defer without until=");
+    }
     if (!strcmp(tok[1], "path"))      { r->kind = VDPC_PATH; r->match = M_PREFIX; }
     else if (!strcmp(tok[1], "host")) { r->kind = VDPC_HOST; r->match = M_HOST; }
     else if (!strcmp(tok[1], "exec")) { r->kind = VDPC_EXEC; r->match = M_EXACT; }
@@ -1262,6 +1349,8 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
     if (!p->rules) return fail(err, en, name, 0, "out of memory");
     int req_maj = 0, req_min = 0;
     int legacy_name = 0;              /* v1.24: line of a host name read before `require warden 1.24` */
+    bool unk_seen = false;            /* v1.42 step 5: an `on unknown` line */
+    bool op_seen = false;             /* v1.42 step 5b: an `on outside_plan` line */
     size_t glob_total = 0;
     int ln = 0;
     size_t pos = 0;
@@ -1358,6 +1447,107 @@ int vdpc_load(const char *name, const char *buf, size_t len, vdpc_policy_t *p,
                     }
                 } else
                     rc = fail(err, en, name, ln, "bad proxy directive");
+            } else if (!strcmp(tok[0], "on") && nt >= 2 && (!strcmp(tok[1], "unknown") || !strcmp(tok[1], "outside_plan"))) {
+                /* v1.42 step 5: on unknown deny | on unknown defer escalate [timeout=] [scope=] [approvers=];
+                 * v1.42 step 5b: on outside_plan deny | on outside_plan defer [timeout=] [scope=] [approvers=]
+                 * (no escalate: a plan extension resolves it) */
+                bool op = tok[1][0] == 'o';
+                int *line = op ? &p->op_line : &p->unk_line;
+                bool *seenl = op ? &op_seen : &unk_seen;
+                uint32_t *tmo = op ? &p->op_timeout : &p->unk_timeout;
+                int *scope = op ? &p->op_scope : &p->unk_scope;
+                char *apv = op ? p->op_approvers : p->unk_approvers;
+                if (!ver_ge(req_maj, req_min, 1, 42)) rc = fail(err, en, name, ln, "on unknown/outside_plan before 1.42");
+                else if (*line || *seenl) rc = fail(err, en, name, ln, "on unknown/outside_plan twice");
+                else if (nt == 3 && !strcmp(tok[2], "deny")) *seenl = true;
+                else if (nt < 3 || strcmp(tok[2], "defer")) rc = fail(err, en, name, ln, "bad on unknown/outside_plan");
+                else {
+                    *seenl = true;
+                    int seen = 0;
+                    bool esc = false;
+                    *scope = 1;
+                    for (int i = 3; rc == 0 && i < nt; i++) {
+                        const char *o = tok[i], *v = strchr(o, '=');
+                        int k = !strncmp(o, "approvers=", 10) ? 2 : !strncmp(o, "timeout=", 8) ? 4
+                              : !strncmp(o, "scope=", 6) ? 8 : !strcmp(o, "escalate") ? 64 : 0;
+                        if (!k || (seen & k)) { rc = fail(err, en, name, ln, "bad on unknown/outside_plan option"); break; }
+                        seen |= k;
+                        if (k == 64) { esc = true; continue; }
+                        v++;
+                        size_t vl = strlen(v);
+                        if (k == 2) {
+                            bool ok = vl >= 1 && vl <= 32 && (islower((unsigned char)v[0]) || v[0] == '_');
+                            for (size_t j = 1; ok && j < vl; j++)
+                                ok = islower((unsigned char)v[j]) || isdigit((unsigned char)v[j]) || v[j] == '_' ||
+                                     v[j] == '-' || (v[j] == '$' && j + 1 == vl);
+                            if (!ok) rc = fail(err, en, name, ln, "bad approvers=");
+                            else memcpy(apv, v, vl + 1);
+                        } else if (k == 4) {
+                            uint32_t x = 0;
+                            bool ok = vl >= 1 && vl <= 4 && v[0] != '0';
+                            for (size_t j = 0; ok && j < vl; j++) { ok = isdigit((unsigned char)v[j]); x = x * 10 + (uint32_t)(v[j] - '0'); }
+                            if (!ok || x < 1 || x > 3600) rc = fail(err, en, name, ln, "bad timeout=");
+                            else *tmo = x;
+                        } else {
+                            if (strcmp(v, "thread") && strcmp(v, "run")) rc = fail(err, en, name, ln, "bad scope=");
+                            else *scope = v[0] == 'r';
+                        }
+                    }
+                    if (rc == 0 && !op && !esc) rc = fail(err, en, name, ln, "on unknown defer without escalate");
+                    if (rc == 0 && op && esc) rc = fail(err, en, name, ln, "escalate on on outside_plan");
+                    if (rc == 0) *line = ln;
+                }
+            } else if (!strcmp(tok[0], "approver")) {
+                /* v1.42 step 6: approver key=HEX group=GROUP [name=NAME], each once, any order */
+                int seen = 0;
+                char key[195] = "", grp[33] = "", nm[33] = "";
+                if (!ver_ge(req_maj, req_min, 1, 42)) rc = fail(err, en, name, ln, "approver before 1.42");
+                for (int i = 1; rc == 0 && i < nt; i++) {
+                    const char *o = tok[i];
+                    int k = !strncmp(o, "key=", 4) ? 1 : !strncmp(o, "group=", 6) ? 2 : !strncmp(o, "name=", 5) ? 4 : 0;
+                    if (!k || (seen & k)) { rc = fail(err, en, name, ln, "bad approver option"); break; }
+                    seen |= k;
+                    const char *v = strchr(o, '=') + 1;
+                    size_t vl = strlen(v);
+                    bool ok;
+                    if (k == 1) {
+                        ok = vl == 194 && v[0] == '0' && v[1] == '4';
+                        for (size_t j = 0; ok && j < vl; j++) ok = isdigit((unsigned char)v[j]) || (v[j] >= 'a' && v[j] <= 'f');
+                        if (ok) memcpy(key, v, vl + 1);
+                    } else if (k == 2) {
+                        ok = vl >= 1 && vl <= 32 && (islower((unsigned char)v[0]) || v[0] == '_');
+                        for (size_t j = 1; ok && j < vl; j++)
+                            ok = islower((unsigned char)v[j]) || isdigit((unsigned char)v[j]) || v[j] == '_' ||
+                                 v[j] == '-' || (v[j] == '$' && j + 1 == vl);
+                        if (ok) memcpy(grp, v, vl + 1);
+                    } else {
+                        ok = vl >= 1 && vl <= 32;
+                        for (size_t j = 0; ok && j < vl; j++)
+                            ok = isalnum((unsigned char)v[j]) || v[j] == '.' || v[j] == '_' || v[j] == '-';
+                        if (ok) memcpy(nm, v, vl + 1);
+                    }
+                    if (!ok) rc = fail(err, en, name, ln, "bad approver key=, group= or name=");
+                }
+                if (rc == 0 && (seen & 3) != 3) rc = fail(err, en, name, ln, "approver without key= and group=");
+                for (size_t j = 0; rc == 0 && j < p->napprovers; j++)
+                    if (!strcmp(p->approvers[j].key, key)) rc = fail(err, en, name, ln, "the same approver key twice");
+                if (rc == 0 && p->napprovers >= 16) rc = fail(err, en, name, ln, "more than 16 approvers");
+                if (rc == 0) {
+                    memcpy(p->approvers[p->napprovers].key, key, sizeof key);
+                    memcpy(p->approvers[p->napprovers].group, grp, sizeof grp);
+                    memcpy(p->approvers[p->napprovers].name, nm, sizeof nm);
+                    p->approvers[p->napprovers++].line = ln;
+                }
+            } else if (!strcmp(tok[0], "max_held") || !strcmp(tok[0], "max_pending")) {
+                /* v1.42 */
+                uint32_t *slot = tok[0][4] == 'h' ? &p->max_held : &p->max_pending, x = 0;
+                size_t vl = nt == 2 ? strlen(tok[1]) : 0;
+                bool ok = vl >= 1 && vl <= 4 && tok[1][0] != '0';
+                for (size_t i = 0; ok && i < vl; i++) { ok = isdigit((unsigned char)tok[1][i]); x = x * 10 + (uint32_t)(tok[1][i] - '0'); }
+                if (!ver_ge(req_maj, req_min, 1, 42)) rc = fail(err, en, name, ln, "max_held/max_pending before 1.42");
+                else if (!ok || x < 1 || x > 1024) rc = fail(err, en, name, ln, "bad max_held/max_pending");
+                else if (*slot) rc = fail(err, en, name, ln, "max_held/max_pending twice");
+                else *slot = x;
             } else if (!strcmp(tok[0], "trust")) {
                 /* v1.28.1 */
                 if (!ver_ge(req_maj, req_min, 1, 28))
@@ -1566,6 +1756,15 @@ int vdpc_rule_info(const vdpc_policy_t *p, size_t i, vdpc_rule_info_t *o) {
     if (i >= p->n) return -1;
     const vdpc_rule_t *r = &p->rules[i];
     o->allow = r->allow;
+    o->step_up = r->step_up;                          /* v1.42 */
+    o->su_mode = r->su_mode;
+    o->su_scope = r->su_scope;
+    o->su_timeout = r->su_timeout;
+    o->su_approvers = r->su_approvers;
+    o->su_notify = r->su_notify;
+    o->defer = r->defer;                              /* v1.42 step 5 */
+    o->su_escalate = r->su_escalate;
+    o->df_until = r->df_until;
     o->kind = r->kind;
     o->match = r->match;
     o->line = r->line;
@@ -1654,31 +1853,94 @@ int vdpc_check(const vdpc_policy_t *p, int kind, const char *s, size_t sl,
     return vdpc_check_subj(p, 0, kind, s, sl, f, has_flags, c, why, wn);
 }
 
-int vdpc_check_subj(const vdpc_policy_t *p, int subj, int kind, const char *s, size_t sl,
-                    uint32_t f, bool has_flags, const vdpc_cert_t *c, char *why, size_t wn) {
+/* The check over rules[0..n), for subject subj: the deciding rule (every
+ * flags value's, with symbolic flags) is an allow rule, or with step_up a
+ * step_up rule (v1.42). */
+static int check_rules(const vdpc_rule_t *rules, size_t n, int subj, int kind, const char *s, size_t sl,
+                       uint32_t f, bool has_flags, const vdpc_cert_t *c, int want, char *why, size_t wn);
+/* what check_rules wants of the deciding rule: an allow rule, one a grant
+ * may be under (a step_up rule, or v1.42 step 5 a defer rule with
+ * escalate), or a defer rule */
+enum { WANT_ALLOW = 0, WANT_GRANTABLE = 1, WANT_DEFER = 2 };
+static bool rule_wanted(const vdpc_rule_t *r, int want) {
+    return want == WANT_ALLOW ? r->allow : want == WANT_DEFER ? r->defer : (r->step_up || (r->defer && r->su_escalate));
+}
+
+/* The checks on the call itself; 1 if they pass, else 0 with the reason.
+ * f and has_flags are normalised (no flags but a path's). */
+static int check_call(const vdpc_policy_t *p, int subj, int kind, const char *s, size_t sl,
+                      uint32_t *f, bool *has_flags, char *why, size_t wn) {
     if (why && wn) why[0] = '\0';
     if (kind != VDPC_PATH && kind != VDPC_HOST && kind != VDPC_EXEC && kind != VDPC_REQUEST && kind != VDPC_MCP)
         return reject(why, wn, "bad kind");
     if (subj < 0 || (size_t)subj > p->nsubjects) return reject(why, wn, "no such subject");
     if (sl > VDPC_MAX_S) return reject(why, wn, "string over the length bound");
     if (memchr(s, '\0', sl)) return reject(why, wn, "NUL byte in the string");
-    if (kind != VDPC_PATH) { f = 0; has_flags = true; }
-    else if (has_flags) {
-        if (f & ~known_bits()) return reject(why, wn, "flag bits outside open(2)");
-        if ((f & ACCMODE) == ACCMODE) return reject(why, wn, "access mode 3");
+    if (kind != VDPC_PATH) { *f = 0; *has_flags = true; }
+    else if (*has_flags) {
+        if (*f & ~known_bits()) return reject(why, wn, "flag bits outside open(2)");
+        if ((*f & ACCMODE) == ACCMODE) return reject(why, wn, "access mode 3");
     }
+    return 1;
+}
 
+int vdpc_check_subj(const vdpc_policy_t *p, int subj, int kind, const char *s, size_t sl,
+                    uint32_t f, bool has_flags, const vdpc_cert_t *c, char *why, size_t wn) {
+    if (!check_call(p, subj, kind, s, sl, &f, &has_flags, why, wn)) return 0;
+    return check_rules(p->rules, p->n, subj, kind, s, sl, f, has_flags, c, WANT_ALLOW, why, wn);
+}
+
+int vdpc_check_defer(const vdpc_policy_t *p, int subj, int kind, const char *s, size_t sl,
+                     uint32_t f, bool has_flags, const vdpc_cert_t *c, char *why, size_t wn) {
+    if (!check_call(p, subj, kind, s, sl, &f, &has_flags, why, wn)) return 0;
+    return check_rules(p->rules, p->n, subj, kind, s, sl, f, has_flags, c, WANT_DEFER, why, wn);
+}
+
+int vdpc_check_grant(const vdpc_policy_t *p, const vdpc_grant_t *g, int subj, int kind,
+                     const char *s, size_t sl, uint32_t f, bool has_flags,
+                     const vdpc_cert_t *su, const vdpc_cert_t *gc, char *why, size_t wn) {
+    if (!check_call(p, subj, kind, s, sl, &f, &has_flags, why, wn)) return 0;
+    if (g && g->su_unknown) {
+        /* v1.42 step 5: under `on unknown defer escalate`: a ground call no
+         * rule of the policy (of its kind and subject) holds on */
+        if (!p->unk_line) return reject(why, wn, "the grant is under an `on unknown` line the policy lacks");
+        if (!has_flags) return reject(why, wn, "a grant under `on unknown` needs the call's flags");
+        if (su->r >= 0) return reject(why, wn, "the certificate names a rule, under `on unknown`");
+        for (size_t j = 0; j < p->n; j++) {
+            const vdpc_rule_t *e = &p->rules[j];
+            if (e->kind == kind && e->subj == subj && flag_holds(e, f) && str_holds(e, s, sl))
+                return reject(why, wn, "a rule of the policy holds, under `on unknown`");
+        }
+    } else {
+        if (!g || g->su_rule < 0 || (size_t)g->su_rule >= p->n || !rule_wanted(&p->rules[g->su_rule], WANT_GRANTABLE))
+            return reject(why, wn, "the grant is under no step_up rule");
+        if (su->r != g->su_rule) return reject(why, wn, "the certificate names another step_up rule than the grant's");
+        if (!check_rules(p->rules, p->n, subj, kind, s, sl, f, has_flags, su, WANT_GRANTABLE, why, wn)) return 0;
+    }
+    char w2[200] = "";
+    if (!check_rules(g->rules, g->n, 0, kind, s, sl, f, has_flags, gc, WANT_ALLOW, w2, sizeof w2)) {
+        if (why && wn) snprintf(why, wn, "grant: %s", w2);
+        return 0;
+    }
+    return 1;
+}
+
+static int check_rules(const vdpc_rule_t *rules, size_t n, int subj, int kind, const char *s, size_t sl,
+                       uint32_t f, bool has_flags, const vdpc_cert_t *c, int want, char *why, size_t wn) {
+    bool step_up = want != WANT_ALLOW;                /* a step_up or defer half names its rule */
     if (has_flags) {
-        if (c->r < 0 || (size_t)c->r >= p->n) return reject(why, wn, "no such rule");
-        const vdpc_rule_t *r = &p->rules[c->r];
+        if (c->r < 0 || (size_t)c->r >= n) return reject(why, wn, "no such rule");
+        const vdpc_rule_t *r = &rules[c->r];
         if (r->kind != kind) return reject(why, wn, "deciding rule is of another kind");
         if (r->subj != subj) return reject(why, wn, "deciding rule is another subject's");
-        if (!r->allow) return reject(why, wn, "deciding rule is not an allow rule");
+        if (!rule_wanted(r, want))
+            return reject(why, wn, want == WANT_DEFER ? "deciding rule is not a defer rule"
+                                   : step_up ? "deciding rule is not a step_up rule" : "deciding rule is not an allow rule");
         if (!flag_holds(r, f)) return reject(why, wn, "deciding rule's flag clause does not hold");
         const char *w = NULL;
         if (!witness_holds(r, s, sl, c, &w)) return reject(why, wn, w);
         for (int j = 0; j < c->r; j++) {
-            const vdpc_rule_t *e = &p->rules[j];
+            const vdpc_rule_t *e = &rules[j];
             if (e->kind == kind && e->subj == subj && flag_holds(e, f) && str_holds(e, s, sl))
                 return reject(why, wn, "an earlier rule holds");
         }
@@ -1689,15 +1951,15 @@ int vdpc_check_subj(const vdpc_policy_t *p, int subj, int kind, const char *s, s
      * certificate naming one deciding rule carries that rule's witness. */
     if (c->r < 0 && c->wkind != 0) return reject(why, wn, "unexpected witness");
     if (c->r >= 0) {
-        if ((size_t)c->r >= p->n || p->rules[c->r].kind != VDPC_PATH || p->rules[c->r].subj != subj)
+        if ((size_t)c->r >= n || rules[c->r].kind != VDPC_PATH || rules[c->r].subj != subj)
             return reject(why, wn, "no such path rule");
         const char *w = NULL;
-        if (!witness_holds(&p->rules[c->r], s, sl, c, &w)) return reject(why, wn, w);
+        if (!witness_holds(&rules[c->r], s, sl, c, &w)) return reject(why, wn, w);
     }
     size_t hold[VDPC_MAX_RULES], nh = 0;
     uint32_t bits = 0;
-    for (size_t j = 0; j < p->n; j++) {
-        const vdpc_rule_t *e = &p->rules[j];
+    for (size_t j = 0; j < n; j++) {
+        const vdpc_rule_t *e = &rules[j];
         if (e->kind != VDPC_PATH || e->subj != subj || !str_holds(e, s, sl)) continue;
         hold[nh++] = j;
         bits |= e->mask;
@@ -1710,15 +1972,20 @@ int vdpc_check_subj(const vdpc_policy_t *p, int subj, int kind, const char *s, s
         if ((sub & ACCMODE) != ACCMODE) {
             int first = -1;
             for (size_t k = 0; k < nh && first < 0; k++)
-                if (flag_holds(&p->rules[hold[k]], sub)) first = (int)hold[k];
+                if (flag_holds(&rules[hold[k]], sub)) first = (int)hold[k];
             if (first < 0) return reject(why, wn, "some flags value is decided by no rule");
-            if (!p->rules[first].allow) return reject(why, wn, "some flags value is denied");
+            if (!rule_wanted(&rules[first], want))
+                return reject(why, wn, want == WANT_DEFER ? "some flags value is not decided by a defer rule"
+                                       : step_up ? "some flags value is not decided by a step_up rule"
+                                                 : "some flags value is denied");
             deciding = (deciding == -2 || deciding == first) ? first : -1;
         }
         if (sub == bits) break;
         sub = (sub - bits) & bits;            /* next subset of bits */
     }
     if (c->r >= 0 && c->r != deciding) return reject(why, wn, "certificate names the wrong rule");
+    /* v1.42: a grant falls under one step_up rule, so its half names it */
+    if (step_up && c->r < 0) return reject(why, wn, "step_up certificate names no rule");
     return 1;
 }
 
@@ -1770,7 +2037,7 @@ static int path_openable_subj(const vdpc_policy_t *p, int subj, const char *s, s
             for (size_t k = 0; k < nh; k++) {
                 const vdpc_rule_t *e = &p->rules[hold[k]];
                 if (flag_holds(e, sub)) {
-                    if (e->allow) return 1;
+                    if (e->allow || e->step_up || e->defer) return 1;    /* v1.42: a grant or a marker may allow it */
                     break;
                 }
             }
@@ -1779,4 +2046,178 @@ static int path_openable_subj(const vdpc_policy_t *p, int subj, const char *s, s
         sub = (sub - bits) & bits;
     }
     return 0;
+}
+
+/* ------------------------------------------------------------------------ */
+/* v1.42: grants, read on their own (smt_decide.h has the text)               */
+/* ------------------------------------------------------------------------ */
+
+void vdpc_grant_free(vdpc_grant_t *g) {
+    if (!g) return;
+    for (size_t i = 0; i < g->n; i++) {
+        free(g->rules[i].c);
+        free(g->rules[i].g);
+    }
+    free(g->rules);
+    g->rules = NULL;
+    g->n = 0;
+}
+
+/* A scope word: 1 to max bytes of 0x21 to 0x7e. */
+static bool grant_word_ok(const char *v, size_t max) { return printable(v, 1, max); }
+
+/* YYYY-MM-DDTHH:MM:SSZ, a real time in UTC, 2000 to 2999 (the Warden keeps
+ * the time; this checks the text is one). */
+static bool grant_time_ok(const char *s) {
+    if (strlen(s) != 20) return false;
+    for (int i = 0; i < 20; i++) {
+        char want = i == 4 || i == 7 ? '-' : i == 10 ? 'T' : i == 13 || i == 16 ? ':' : i == 19 ? 'Z' : '0';
+        if (want == '0' ? !isdigit((unsigned char)s[i]) : s[i] != want) return false;
+    }
+    int y = atoi(s), mo = (s[5] - '0') * 10 + (s[6] - '0'), d = (s[8] - '0') * 10 + (s[9] - '0');
+    int h = (s[11] - '0') * 10 + (s[12] - '0'), mi = (s[14] - '0') * 10 + (s[15] - '0'), se = (s[17] - '0') * 10 + (s[18] - '0');
+    static const int md[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    return y >= 2000 && y <= 2999 && mo >= 1 && mo <= 12 && d >= 1 && d <= md[mo - 1] + (mo == 2 && leap) &&
+           h <= 23 && mi <= 59 && se <= 59;
+}
+
+int vdpc_grant_load(const vdpc_policy_t *p, const char *text, size_t len, vdpc_grant_t *g,
+                    char *err, size_t en) {
+    memset(g, 0, sizeof *g);
+    g->su_rule = -1;
+    if (len > 16384) return fail(err, en, "grant", 0, "grant over 16384 bytes");
+    if (memchr(text, '\0', len)) return fail(err, en, "grant", 0, "NUL byte in grant");
+    /* The grant's allow lines, read as a policy's (with the policy's proxy
+     * settings, which request and mcp rules need), the other lines blank. */
+    size_t cap = len + 64 + 16 * 8 + 64 * 280 + 64;
+    char *buf = malloc(cap);
+    if (!buf) return fail(err, en, "grant", 0, "out of memory");
+    size_t bl = 0;
+    int hdr = 0;
+#define BADD(...) do { int k_ = snprintf(buf + bl, cap - bl, __VA_ARGS__); \
+                       if (k_ > 0) bl += (size_t)k_ < cap - bl ? (size_t)k_ : cap - bl - 1; } while (0)
+    BADD("require warden %d.%d\n", VDPC_GRAMMAR_MAJOR, VDPC_GRAMMAR_MINOR); hdr++;
+    if (p->proxy) { BADD("%s\n", p->proxy_inspect ? "proxy inspect" : "proxy on"); hdr++; }
+    if (p->proxy_nports) {
+        BADD("proxy ports");
+        for (size_t i = 0; i < p->proxy_nports; i++) BADD(" %u", p->proxy_ports[i]);
+        BADD("\n"); hdr++;
+    }
+    for (size_t i = 0; i < p->proxy_npass; i++) { BADD("proxy passthrough host %s\n", p->proxy_pass[i]); hdr++; }
+
+    int rc = 0, ln = 0, nallow = 0, seen = 0;    /* seen: 1 grant, 2 step_up, 4 for, 8 count, 16 until */
+    size_t pos = 0;
+    char line[16385], copy[16385];
+    while (rc == 0 && pos < len) {
+        size_t end = pos;
+        while (end < len && text[end] != '\n') end++;
+        size_t ll = end - pos;
+        memcpy(line, text + pos, ll);
+        line[ll] = '\0';
+        memcpy(copy, line, ll + 1);
+        pos = end < len ? end + 1 : end;
+        ln++;
+        char *tok[65];
+        int nt = 0;
+        for (char *q = line; *q && nt < 64;) {
+            while (*q && is_ws(*q)) q++;
+            if (!*q || *q == '#') break;
+            tok[nt++] = q;
+            while (*q && !is_ws(*q)) q++;
+            if (*q) *q++ = '\0';
+        }
+        if (nt == 0) { BADD("\n"); continue; }
+        if (!(seen & 1)) {
+            if (nt != 1 || strcmp(tok[0], "grant")) rc = fail(err, en, "grant", ln, "a grant starts with `grant`");
+            seen |= 1;
+            BADD("\n");
+            continue;
+        }
+        if (!strcmp(tok[0], "allow")) {
+            if (++nallow > 8) rc = fail(err, en, "grant", ln, "more than 8 rules");
+            BADD("%s\n", copy);
+            continue;
+        }
+        BADD("\n");
+        if (!strcmp(tok[0], "step_up")) {
+            int x = 0;
+            size_t vl = nt == 3 ? strlen(tok[2]) : 0;
+            bool ok = nt == 3 && !strcmp(tok[1], "line") && vl >= 1 && vl <= 9 && tok[2][0] != '0';
+            for (size_t i = 0; ok && i < vl; i++) { ok = isdigit((unsigned char)tok[2][i]); x = x * 10 + (tok[2][i] - '0'); }
+            if (seen & 2) rc = fail(err, en, "grant", ln, "step_up line twice");
+            else if (!ok) rc = fail(err, en, "grant", ln, "bad step_up line");
+            else {
+                for (size_t i = 0; i < p->n && g->su_rule < 0; i++)
+                    if (p->rules[i].line == x && rule_wanted(&p->rules[i], WANT_GRANTABLE)) g->su_rule = (int)i;
+                if (g->su_rule < 0 && p->unk_line && p->unk_line == x) g->su_unknown = true;   /* v1.42 step 5 */
+                if (g->su_rule < 0 && !g->su_unknown) rc = fail(err, en, "grant", ln, "no step_up rule on that line");
+            }
+            seen |= 2;
+        } else if (!strcmp(tok[0], "for")) {
+            int got = 0;
+            if (seen & 4 || nt < 2) rc = fail(err, en, "grant", ln, "bad for");
+            for (int i = 1; rc == 0 && i < nt; i++) {
+                const char *t = tok[i];
+                int k = !strncmp(t, "user=", 5) ? 1 : !strncmp(t, "subagent=", 9) ? 2 : !strncmp(t, "run=", 4) ? 4 : 0;
+                size_t max = k == 1 ? 255 : k == 2 ? 32 : 64;
+                if (!k || (got & k) || !grant_word_ok(strchr(t, '=') + 1, max)) rc = fail(err, en, "grant", ln, "bad for");
+                got |= k;
+            }
+            seen |= 4;
+        } else if (!strcmp(tok[0], "count")) {
+            uint32_t x = 0;
+            size_t vl = nt == 2 ? strlen(tok[1]) : 0;
+            bool ok = vl >= 1 && vl <= 7 && tok[1][0] != '0';
+            for (size_t i = 0; ok && i < vl; i++) { ok = isdigit((unsigned char)tok[1][i]); x = x * 10 + (uint32_t)(tok[1][i] - '0'); }
+            if ((seen & 8) || !ok || x > 1000000) rc = fail(err, en, "grant", ln, "bad count");
+            seen |= 8;
+        } else if (!strcmp(tok[0], "until")) {
+            if ((seen & 16) || nt != 2 || !grant_time_ok(tok[1])) rc = fail(err, en, "grant", ln, "bad until");
+            seen |= 16;
+        } else {
+            rc = fail(err, en, "grant", ln, "unknown grant line");
+        }
+    }
+#undef BADD
+    if (rc == 0 && !(seen & 1)) rc = fail(err, en, "grant", ln, "empty grant");
+    if (rc == 0 && !(seen & 2)) rc = fail(err, en, "grant", ln, "no step_up line");
+    if (rc == 0 && nallow == 0) rc = fail(err, en, "grant", ln, "no allow rule");
+    if (rc == 0 && !(seen & 24)) rc = fail(err, en, "grant", ln, "neither count nor until");
+    vdpc_policy_t *tmp = rc == 0 ? calloc(1, sizeof *tmp) : NULL;
+    if (rc == 0 && !tmp) rc = fail(err, en, "grant", 0, "out of memory");
+    if (rc == 0) {
+        char e2[512] = "";
+        if (vdpc_load("grant", buf, bl, tmp, e2, sizeof e2) < 0) {
+            int el = 0, off = 0;
+            if (sscanf(e2, "grant:%d:%n", &el, &off) == 1 && off > 0)
+                rc = fail(err, en, "grant", el - hdr, "%s", e2 + off + (e2[off] == ' '));
+            else
+                rc = fail(err, en, "grant", 0, "%s", e2);
+            free(tmp);
+            tmp = NULL;
+        }
+    }
+    const vdpc_rule_t *su = rc == 0 && g->su_rule >= 0 ? &p->rules[g->su_rule] : NULL;
+    for (size_t i = 0; rc == 0 && i < tmp->n; i++) {
+        const vdpc_rule_t *r = &tmp->rules[i];
+        if (!r->allow || (su && r->kind != su->kind))
+            rc = fail(err, en, "grant", r->line - hdr, "a grant's rule of another kind than its step_up rule");
+        else if (r->subj || r->cred || r->hdr[0] || r->subagent[0] || r->mcp_server || r->csubj || r->confined)
+            rc = fail(err, en, "grant", r->line - hdr, "a grant's rule with for=, credential=, header= or subagent=");
+        else if (r->wild)
+            rc = fail(err, en, "grant", r->line - hdr, "a grant's rule with a wildcard host");
+    }
+    if (rc == 0 && (tmp->n != (size_t)nallow || tmp->nsubjects || tmp->ncreds))
+        rc = fail(err, en, "grant", 0, "a grant's lines made more than its rules");
+    if (rc == 0) {
+        g->rules = tmp->rules;                       /* the grant's now */
+        g->n = tmp->n;
+        tmp->rules = NULL;
+        tmp->n = 0;
+    }
+    if (tmp) { vdpc_free(tmp); free(tmp); }
+    free(buf);
+    if (rc < 0) vdpc_grant_free(g);
+    return rc;
 }

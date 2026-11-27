@@ -88,15 +88,31 @@ check_fail "an anchor that is a directory fails" "not a regular file, FIFO or ch
 check_fail "an anchor whose directory does not exist fails" "anchor's directory" "$FIN" --anchor "$D/r/nodir/anchor"
 : > "$D/r/a1"; ln "$D/r/a1" "$D/r/a2"
 check_fail "an anchor with two names fails" "has 2 names" "$FIN" --anchor "$D/r/a1"
-hex="$(head -c 64 "$D/keys/k")"
-for v in 'nn' 'lead' 'split'; do
+# v1.41: the key is a PKCS#8 PEM (ECDSA P-384) key. Cut short, without its
+# end line, or with its body garbled, it is not one; a v1.40 key (an Ed25519
+# seed, 64 hex characters) is named as such; with the openssl command, a key
+# on another curve, or a .pub that is not its public half, fails too.
+for v in trunc noend garbled old; do
     case "$v" in
-        nn)    printf '%s\n\n' "$hex" ;;
-        lead)  printf '\n%s' "$hex" ;;
-        split) printf '%s\n%s' "${hex:0:32}" "${hex:32}" ;;
+        trunc)   head -n 2 "$D/keys/k" ;;
+        noend)   grep -v 'END PRIVATE KEY' "$D/keys/k" ;;
+        garbled) sed '2s/^..../AAAA/' "$D/keys/k" ;;
+        old)     head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; echo ;;
     esac > "$D/keys/bad_$v"; chmod 600 "$D/keys/bad_$v"
-    check_fail "a malformed key ($v) fails" "not exactly 64 hex" "$FIN" --sign-key "$D/keys/bad_$v"
 done
+check_fail "a key cut short fails" "not a PKCS#8 PEM private key" "$FIN" --sign-key "$D/keys/bad_trunc"
+check_fail "a key without its end line fails" "not a PKCS#8 PEM private key" "$FIN" --sign-key "$D/keys/bad_noend"
+if command -v openssl >/dev/null 2>&1; then
+    check_fail "a key with its body garbled fails" "openssl cannot read it" "$FIN" --sign-key "$D/keys/bad_garbled"
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$D/keys/p256" 2>/dev/null; chmod 600 "$D/keys/p256"
+    check_fail "a key on curve P-256 fails" "not on curve P-384" "$FIN" --sign-key "$D/keys/p256"
+    "$HERE/tools/varek_keygen" "$D/keys/k3" >/dev/null        # another key: its .pub beside a copy of k
+    cp "$D/keys/k" "$D/keys/swap"; chmod 600 "$D/keys/swap"; cp "$D/keys/k3.pub" "$D/keys/swap.pub"
+    check_fail "a .pub that is not the key's public half fails" "is not this key's public half" "$FIN" --sign-key "$D/keys/swap"
+else
+    printf '  %-6s %s\n' SKIP "the curve and .pub checks (no openssl command)"
+fi
+check_fail "a v1.40 Ed25519 key fails, saying so" "a v1.40 Ed25519 key" "$FIN" --sign-key "$D/keys/bad_old"
 mkfifo "$D/r/ff_unused" 2>/dev/null
 mkdir -p '/tmp/varek_v1161_$(touch /tmp/varek_v1161_PWNED)'
 chmod 755 '/tmp/varek_v1161_$(touch /tmp/varek_v1161_PWNED)'
@@ -115,8 +131,9 @@ rm -f /tmp/varek/v1161_fifo
 
 echo "== 3. build dependency check"
 o="$(make -s -C "$HERE" deps-check CC=false 2>&1)"
-grep -q "libsodium-dev" <<<"$o" && grep -q "libsodium-devel" <<<"$o" \
-  && pass "make names the packages to install when the headers are missing" || flunk "deps-check message"
+grep -q "libssl-dev" <<<"$o" && grep -q "openssl-devel" <<<"$o" && ! grep -q "sodium" <<<"$o" \
+  && pass "make names the packages to install when the headers are missing (v1.41: OpenSSL; no libsodium)" \
+  || flunk "deps-check message"
 make -s -C "$HERE" deps-check >/dev/null 2>&1 && pass "make deps-check passes on this host" || flunk "deps-check on this host"
 
 echo

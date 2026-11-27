@@ -11,6 +11,7 @@ updates:
     directories:
       - "/varek/v1_4/k8s"
       - "/varek/v1_4/tests/v1340_nri"
+      - "/varek/v1_4/tests/measure_v1360/m3delegate"
     schedule:
       interval: "weekly"
 
@@ -31,6 +32,12 @@ updates:
       # install. Remove when langchain-mcp-adapters takes mcp 2.
       - dependency-name: "mcp"
         versions: [">=2"]
+
+  # the agent CLIs profiles_v1290.sh installs (npm ci from the lockfile)
+  - package-ecosystem: "npm"
+    directory: "/varek/v1_4/tests/profiles_v1290"
+    schedule:
+      interval: "weekly"
 
   # base images pinned by digest
   - package-ecosystem: "docker"

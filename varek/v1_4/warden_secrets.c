@@ -107,7 +107,8 @@ static bool identity_ok(const struct ws_identity *m, const ws_idreq_t *idr) {
             !printable_field(m->kid, sizeof m->kid, false) || !hex64(m->token_sha256) || m->nact > WS_MAX_ACTORS ||
             m->exp <= 0 || m->exp >= (int64_t)1 << 53 || m->iat < -1 || m->iat >= (int64_t)1 << 53 ||
             m->nbf < -1 || m->nbf >= (int64_t)1 << 53 ||
-            (strcmp(m->alg, "RS256") && strcmp(m->alg, "PS256") && strcmp(m->alg, "ES256") && strcmp(m->alg, "EdDSA")))
+            (strcmp(m->alg, "RS256") && strcmp(m->alg, "PS256") && strcmp(m->alg, "ES256") && strcmp(m->alg, "EdDSA") &&
+             strcmp(m->alg, "RS384") && strcmp(m->alg, "PS384") && strcmp(m->alg, "ES384")))   /* v1.41 */
             return false;
         for (uint32_t i = 0; i < m->nact; i++)
             if (!printable_field(m->act[i].sub, sizeof m->act[i].sub, true) ||

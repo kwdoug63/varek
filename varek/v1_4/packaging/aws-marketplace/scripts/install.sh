@@ -27,12 +27,13 @@ say "Patching the base image"
 dnf -y upgrade --releasever=latest
 
 say "Build and runtime packages"
-# libseccomp and libsodium are installed by name first so dnf records them as
+# libseccomp and openssl-libs are installed by name first so dnf records them as
 # wanted: removing the -devel packages later must not take the libraries with it.
-dnf -y install libseccomp libsodium openssl-libs python3 awscli-2
+# (v1.41: libsodium is no longer used.)
+dnf -y install libseccomp openssl-libs python3 awscli-2
 # glibc-static: `varek bench`'s workload is linked static, so its runs under
 # the Warden make no loader opens (v1.22).
-dnf -y install gcc make libseccomp-devel libsodium-devel openssl-devel glibc-static tar gzip
+dnf -y install gcc make libseccomp-devel openssl-devel glibc-static tar gzip
 
 say "Building VAREK ${VAREK_VERSION:-}"
 BUILD=$(mktemp -d /tmp/varek-build.XXXXXX)
@@ -66,7 +67,7 @@ else
 fi
 
 say "Removing the compiler and headers"
-dnf -y remove gcc make libseccomp-devel libsodium-devel openssl-devel glibc-static
+dnf -y remove gcc make libseccomp-devel openssl-devel glibc-static
 dnf -y autoremove
 if ldd "$PREFIX/warden" "$PREFIX/warden-proxy" "$PREFIX/tools/vdp_check" "$PREFIX/tools/vdp_cert_check" \
         "$PREFIX/tools/varek_keygen" | grep -q 'not found'; then

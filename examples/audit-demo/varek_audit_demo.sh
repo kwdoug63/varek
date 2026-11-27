@@ -54,12 +54,12 @@ say "Preflight"
 [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || die "needs Linux on x86_64"
 if [ "$INSTALL" = 1 ]; then
     if command -v apt-get >/dev/null; then
-        apt-get update -qq && apt-get install -y -qq git build-essential libseccomp-dev libsodium-dev libssl-dev \
+        apt-get update -qq && apt-get install -y -qq git build-essential libseccomp-dev libssl-dev \
             python3 python3-cryptography openssl >/dev/null || die "apt-get install failed"
     elif command -v dnf >/dev/null; then
-        dnf install -y -q git gcc make libseccomp-devel libsodium-devel openssl-devel glibc-static \
+        dnf install -y -q git gcc make libseccomp-devel openssl-devel glibc-static \
             python3 python3-cryptography openssl >/dev/null || die "dnf install failed"
-    else die "install git, gcc, make, libseccomp, libsodium and OpenSSL dev packages, python3, python3-cryptography, openssl"; fi
+    else die "install git, gcc, make, libseccomp and OpenSSL dev packages, python3, python3-cryptography, openssl"; fi
 fi
 for c in git gcc make python3 openssl; do command -v "$c" >/dev/null || die "missing $c (rerun with --install-deps)"; done
 python3 -c 'import cryptography' 2>/dev/null || die "missing the Python cryptography package (rerun with --install-deps)"

@@ -1,9 +1,10 @@
-# The shared soak: v1.28.1, v1.29.0 and v1.31.0
+# The shared soak: v1.28.1, v1.29.0, v1.31.0 and v1.42.0
 
-One 24-hour soak for the three releases after v1.28.0, run from the v1.31
-branch: its Warden is all three. Three runs side by side, each a turn a
-minute, every tenth turn a probe; then `soak_check.py` judges them and
-writes `report.txt`. Everything they talk to runs on the same host, so what
+One 24-hour soak, first for the three releases after v1.28.0 (run from the
+v1.31 branch, its Warden all three), since run for each release; v1.42.0
+adds run D, its approvals. Four runs side by side, each a turn a minute,
+every tenth turn a probe; then `soak_check.py` judges them and writes
+`report.txt`. Everything they talk to runs on the same host, so what
 each run let through can be checked where it arrives.
 
 | Run | Releases | What it does |
@@ -11,6 +12,7 @@ each run let through can be checked where it arrives.
 | A | v1.28.1, v1.31.0 | An agent on behalf of a user whose token the Warden verified (`trust issuer`, `require on-behalf-of`), the egress proxy in inspecting mode. It launches two confined MCP servers once and keeps them all run: `fs` reads project files under its own rules; `gh` calls a remote MCP server with the run's MCP token (`credential mt ... audience=`), put in by the proxy only where a rule written `for=gh` names it. The agent also makes MCP calls of its own and launches sub-agents (`coder` launches `tester`). The user's token expires near the end, and the run is revoked by it. The OCSF export follows the stream the whole run. |
 | B | v1.29.0 | `varek run` with nothing set up (the baseline policy and the `python` profile): an agent's work in its project directory, each turn writing files, running `python3` and, every fifth turn, `git commit`. |
 | C | v1.29.0 | The same work as a dry run of a narrower policy (the project read-only but `build/` and `.git/`). At the end, `varek policy suggest` drafts a policy from the run, and a short dry run under the draft checks it. |
+| D | v1.42.0 | Approvals (`docs/security/v1.42-step-up-defer.md`). Each turn the agent (`agent_d.py`) reads a file a `step_up` rule holds (`mode=hold`) until `soak_approver.py`, as root, approves the runtime grant it proposes; and a file a standing grant allows, signed beforehand by the run's approver key (pinned in the policy, `--grants`). Every tenth turn it reads a file a `defer` rule holds until its marker, which is never written: its timeout refuses it. |
 
 **Run A's tasks**, in turn: `tools/list` and `tools/call search_code` by
 the agent; `fs` reads a project file; `gh` calls `get_issue` on the remote
@@ -52,6 +54,15 @@ launching a program the agent wrote (a copy of `true`): each EACCES.
   ENFORCED` (exit 3); the draft linting and loading in the certificate
   checker; under the draft, nothing let through but the system calls the
   draft notes no rule can admit (git's `link`).
+- D: every turn's held read approved and done, and its read under the
+  standing grant allowed; every tenth turn's deferred read refused at its
+  timeout. In the stream, one proposal, one approval and one runtime grant
+  a turn, each ending approved (at most one abandoned at the end); the
+  standing grant recorded once, signed, and used once a turn; each deferral
+  ending `timeout`, and no other call held or refused; the audit passing
+  (the standing grant's signature verified against the pinned key). A
+  run's live grants must not fill: 1,440 approvals over 24 hours, against
+  the 64 a run holds at once.
 
 It also reports each task's time at the agent, the Warden's time per
 decision for each subject, and each process's memory over the run
@@ -65,6 +76,7 @@ two MCP servers).
 | `fs_server.py`, `gh_server.py` | Run A's stdio MCP servers (confined). |
 | `soak_remote.py` | Run A's remote MCP server: checks the token where it arrives, and logs no value. |
 | `build_agent.py` | Runs B's and C's agent: the work, and B's probes. |
+| `agent_d.py`, `soak_approver.py` | Run D's agent, and its approver (as root, on the run's approvers' socket). |
 | `soak_check.py` | Judges the runs and writes `report.txt`. |
 
 It reuses `tests/v1310_as.py` (the user's issuer, which also mints the

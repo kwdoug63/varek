@@ -17,6 +17,8 @@ venv
 **/*.a
 **/*.so
 **/*.log
+# v1.41: but the v1.40 verdict stream test-cli verifies (tests/test_varek_v140_logs.py)
+!varek/v1_4/tests/v140_fixture/verdicts.log
 **/*.ipynb
 **/*-intercept.py
 **/*_intercept.py
@@ -29,6 +31,7 @@ varek-v1_6-release-staging.tar.gz
 varek/v1_4/warden
 varek/v1_4/warden-proxy
 varek/v1_4/warden-secrets
+varek/v1_4/warden-notify
 varek/v1_4/warden_faultinject
 varek/v1_4/target_demo
 varek/v1_4/target_conformance
