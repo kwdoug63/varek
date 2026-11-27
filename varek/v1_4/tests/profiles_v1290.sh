@@ -33,14 +33,19 @@ if ! id "$U" > /dev/null 2>&1; then
 fi
 H="$(getent passwd "$U" | cut -d: -f6)"
 UID_="$(id -u "$U")"; GID_="$(id -g "$U")"
-as_user() { runuser -u "$U" -- env -i HOME="$H" USER="$U" PATH="/usr/local/bin:/usr/bin:/bin:$H/.local/bin:$H/.npm-global/bin" "$@"; }
+as_user() { runuser -u "$U" -- env -i HOME="$H" USER="$U" PATH="/usr/local/bin:/usr/bin:/bin:$H/.local/bin:$H/.npm-global/lib/node_modules/.bin" "$@"; }
 
 echo "== installing the CLIs for $U (in $H) =="
 # installed by root (with root's network settings: a proxy, its CA) into the
 # user's home, then given to the user, as its own install would be
-if [ ! -x "$H/.npm-global/bin/codex" ]; then
-    npm install -g --prefix "$H/.npm-global" @anthropic-ai/claude-code @openai/codex @google/gemini-cli \
-        > "$OUT/npm.log" 2>&1 || { echo "npm install failed: $OUT/npm.log"; exit 2; }
+# the CLIs at the versions profiles_v1290/package.json names, every package
+# pinned by integrity hash (package-lock.json; npm ci installs exactly that),
+# into .npm-global/lib/node_modules, where the agent profiles allow them
+if [ ! -x "$H/.npm-global/lib/node_modules/.bin/codex" ]; then
+    mkdir -p "$H/.npm-global/lib" &&
+    cp "$(dirname "$(readlink -f "$0")")"/profiles_v1290/{package.json,package-lock.json,.npmrc} "$H/.npm-global/lib"/ &&
+    npm ci --prefix "$H/.npm-global/lib" --no-audit --no-fund \
+        > "$OUT/npm.log" 2>&1 || { echo "npm ci failed: $OUT/npm.log"; exit 2; }
 fi
 if [ ! -x "$H/.local/bin/aider" ]; then
     if command -v uv > /dev/null; then
@@ -72,7 +77,7 @@ vr() {
 direct() {
     local n="$1"; shift
     (cd "$H/proj" && timeout 90 runuser -u "$U" -- env -i HOME="$H" USER="$U" LOGNAME="$U" TERM=dumb \
-        PATH="/usr/local/bin:/usr/bin:/bin:$H/.local/bin:$H/.npm-global/bin" "$@" \
+        PATH="/usr/local/bin:/usr/bin:/bin:$H/.local/bin:$H/.npm-global/lib/node_modules/.bin" "$@" \
         < /dev/null > "$OUT/$n.out" 2> "$OUT/$n.err")
     echo $? > "$OUT/$n.rc"
 }
@@ -87,12 +92,12 @@ norm() {
 }
 
 CASES=(
-    "claude-version:claude:$H/.npm-global/bin/claude --version"
-    "claude-prompt:claude:$H/.npm-global/bin/claude -p hi"
-    "codex-version:codex:$H/.npm-global/bin/codex --version"
-    "codex-prompt:codex:$H/.npm-global/bin/codex exec --sandbox danger-full-access hi"
-    "gemini-version:gemini:$H/.npm-global/bin/gemini --version"
-    "gemini-prompt:gemini:$H/.npm-global/bin/gemini -p hi"
+    "claude-version:claude:$H/.npm-global/lib/node_modules/.bin/claude --version"
+    "claude-prompt:claude:$H/.npm-global/lib/node_modules/.bin/claude -p hi"
+    "codex-version:codex:$H/.npm-global/lib/node_modules/.bin/codex --version"
+    "codex-prompt:codex:$H/.npm-global/lib/node_modules/.bin/codex exec --sandbox danger-full-access hi"
+    "gemini-version:gemini:$H/.npm-global/lib/node_modules/.bin/gemini --version"
+    "gemini-prompt:gemini:$H/.npm-global/lib/node_modules/.bin/gemini -p hi"
     "aider-version:aider:$H/.local/bin/aider --version"
     "aider-prompt:aider:$H/.local/bin/aider --message hi --no-check-update --yes-always --no-gitignore"
 )

@@ -1,6 +1,6 @@
 # VAREK — Threat Model
 
-Version: current as of v1.36.3 (released November 4, 2026) · MIT · github.com/kwdoug63/varek
+Version: current as of v1.42.0 (released November 2026) · MIT · github.com/kwdoug63/varek
 
 This document states what VAREK defends, against whom, and what it explicitly
 does not defend. It is deliberately conservative: where a guarantee is
@@ -188,6 +188,82 @@ bounds, fails closed). The runtime proceeds only on a provable SATISFIED.
   from that node. Those sources, and the cluster's list of node keys kept
   by whoever audits, are trusted as the host's credential sources, issuer
   and key are on a host. The agent's pod never holds them.
+- **Trust boundary 20 (v1.37.0; v1.38.0):** a Mac, its hypervisor and the
+  VM. On a Mac with Apple silicon the agent and the Warden run in a RHEL 9
+  aarch64 VM, on Apple's Virtualization framework through vfkit; inside it
+  the Warden decides and enforces as on Linux. macOS, the Virtualization
+  framework, vfkit and the Mac's user are trusted as a host's kernel is.
+  The Mac shares one directory with the VM, the project, at the same path;
+  its other files are not in the VM. What the agent may write there is
+  input to the Mac's own tools: from v1.38.0 the baseline refuses every
+  write to the project's git settings and hooks, which git on the Mac
+  would run, and anything else the Mac's tools read from the project (an
+  IDE's task files, `.envrc`) is the policy's to keep from the agent. Root
+  in the VM is not under the Warden. From v1.38.0 the agent runs in the
+  VM as a user of its own, with no sudo, and a packet filter on the Mac
+  (its own pf anchor) keeps the VM from the Mac's addresses, its networks
+  and the instance metadata service, the Internet, DNS and DHCP passing.
+- **Trust boundary 21 (v1.39.0; v1.40.0):** the security tools a run's
+  evidence is sent to: an OpenTelemetry collector, a Splunk HTTP Event
+  Collector, and Microsoft Sentinel's Log Analytics workspace through the
+  Azure Monitor Logs Ingestion API, with a Microsoft Entra ID token. The
+  export audits the verdict stream first and sends the audit's verdict
+  with the events; the stream, not a collector's copy, remains the
+  evidence. What a collector or SIEM does with a row (keeps it, drops it,
+  alerts on it) is trusted as that tool's. Keys and secrets come from the
+  environment, never the command line; the Splunk collector's
+  certificate and name are always checked.
+- **Trust boundary 22 (v1.42.0):** the approvers. A `step_up` rule lets a
+  person approve a call the policy does not allow by itself; a `defer` rule
+  lets a marker file, or a plan extension, release one.
+  (`docs/security/v1.42-step-up-defer.md`.)
+  - *The approver is a principal who can be deceived or coerced.* VAREK
+    does not judge whether an approval is wise. It bounds what one can
+    authorise: a grant names one object, a count and a time, within the
+    `step_up` rule's envelope (its matchers), and the Warden allows a call
+    under it only when the decision procedure and the certificate checker
+    both hold, the policy plus the grant. An approver cannot widen a rule,
+    approve another run's call, or approve past the rule's `approvers=`
+    group.
+  - *Who approves* is the Unix user on the approvers' socket, from its
+    peer credentials (the kernel's word), never what the client says. A
+    rule without `approvers=` is approved by root alone; the agent's own
+    user is never an approver, even in the group. With `approver key=`
+    lines, a signature over the grant's text by a pinned key adds to that
+    (it never replaces it), and a standing grant or an approved plan is
+    taken only with a valid signature by a pinned key of the rule's group.
+    The private keys are the approvers'; their custody is trusted.
+  - *What the approver reads is the agent's.* A proposal names the object
+    the agent asked for, and `varek pending` shows the user's request
+    (`--intent`), which comes from the agent's framework. Both are
+    context, never part of the decision: no rule matches on the request,
+    and a grant is checked against the rule, not the request. From v1.42
+    step 8, `varek pending` writes control, format and bidirectional
+    characters as escapes, so neither can redraw the approver's terminal.
+  - *Markers* (`defer ... until=FILE`) are trusted as their owner's word:
+    a regular file reached without a symbolic link, owned by root or the
+    rule's `approvers=` group and never by the agent's user, writable by
+    its owner alone, at most 4 KiB, naming this run (or `*`). A policy
+    that lets the agent write a marker is refused at start. The record
+    holds the SHA-256 of the exact bytes checked.
+  - *The freeze* (`scope=run`) is the kernel's cgroup v2 freezer: the
+    run's control group stops while a call is held, the Warden and its
+    helpers outside it. It needs Linux 5.19's killable notification waits;
+    where the run cannot be frozen, a call that needs it is refused at
+    once, never held unfrozen.
+- **Trust boundary 23 (v1.42.0):** the approvers' webhook (`notify=URL`)
+  and what receives it (a chat, a ticketing system). It only tells: no
+  answer to it approves anything, and a failed post changes nothing but
+  its own record. The post goes from `warden-notify`, a helper of its own
+  (its own user, no capabilities, not the Warden's child), over TLS
+  verified against the host's trust store, or plain HTTP to a loopback
+  address only. It holds the grant's text and the run, rule, user and
+  expiry, never the call's data beyond the grant's object nor the user's
+  request. The URL can be its secret (Slack's is): the records and the
+  exports hold its host and SHA-256 only, and a policy whose webhook URL
+  is a secret must not be readable by the agent. From v1.42 step 8 the
+  chat's one line writes the object's `&`, `<` and `>` as Slack's mrkdwn
+  asks, so an object named like a link or a mention is neither.
 
 ## 3. Adversary models
 
@@ -280,7 +356,8 @@ Model-B techniques below, with the residual limits stated honestly.
   - *Authorization-record integrity.* Every agent-controlled string is escaped, so
     no input can begin, end, or forge a record in the verdict stream. Records
     carry the resolved object the decision was made on. From v1.16 records are
-    hash-chained, checkpoints are Ed25519-signed (`--sign-key`) and optionally
+    hash-chained, checkpoints are signed (`--sign-key`; Ed25519 through v1.40,
+    ECDSA P-384 over a SHA-384 chain from v1.41) and optionally
     appended to an external anchor (`--anchor`), so the log's holder cannot
     alter, insert, remove, reorder or truncate records undetected before the
     last signature (without the key) or before the last anchored checkpoint
@@ -570,11 +647,11 @@ Model-B techniques below, with the residual limits stated honestly.
   `subagent=` in the policy:
   - *The user is verified, not asserted.* The token given with
     `--on-behalf-of` (a root-owned file) is checked by `warden-secrets`:
-    a signature by the trusted issuer's key (RS256, PS256, ES256 or EdDSA;
-    `none`, every HMAC algorithm, `crit`, and keys the token carries or
-    points to refused), the issuer, the audience, at least 60 s before
-    its expiry, `nbf` and `iat`, a canonical encoding, an `act` chain at
-    most 8 deep. Only the verified claims reach the Warden; the token
+    a signature by the trusted issuer's key (RS256, PS256, ES256, RS384,
+    PS384, ES384 or EdDSA; `none`, every HMAC algorithm, `crit`, and keys
+    the token carries or points to refused), the issuer, the audience, at
+    least 60 s before its expiry, `nbf` and `iat`, a canonical encoding,
+    an `act` chain at most 8 deep. Only the verified claims reach the Warden; the token
     itself reaches no output, stream, export or agent environment. With
     `require on-behalf-of`, a run without a verified user does not start.
   - *The agent is verified.* An X.509-SVID given with `--agent-svid` must
@@ -778,6 +855,72 @@ Model-B techniques below, with the residual limits stated honestly.
   - *amd64 and arm64 (Graviton),* each built and checked on its own
     runner; each runtime and host the README calls supported is run in
     CI, and what the matrix does not cover is not called supported.
+- **macOS, through a Linux VM (v1.37.0), hardened (v1.38.0).** On a Mac
+  with Apple silicon the agent runs under the Warden in a RHEL 9 VM, with
+  the same policies, decisions, certificates, records and audit as on
+  Linux.
+  - *One Warden for both architectures.* x86-64 and arm64 build from one
+    source; open flags are recorded in one encoding, the Warden
+    translating arm64's where flags are decided, certified and recorded,
+    and `run_start` names the architecture, which the audit checks.
+  - *Only the project is shared* with the VM, mounted at the same path;
+    the Mac's other files are not in it.
+  - *The project's git settings and hooks are never written* under the
+    baseline (v1.38.0): every write to `.git/config`, `.git/hooks` and a
+    linked worktree's or submodule's settings is refused, so the agent
+    cannot plant code that git on the Mac would run.
+  - *The agent has no sudo in the VM* (v1.38.0): `varek vm run` runs it as
+    a user of its own, with a locked password and no ssh key, and refuses
+    the run if sudo would let that user run anything.
+  - *The VM cannot reach the Mac* (v1.38.0): a packet filter drops what
+    the VM sends to the Mac's addresses, link-local addresses (the
+    metadata service), the private ranges and shared address space. A
+    start whose rules do not load is refused.
+- **Security operations: the evidence sent where security teams look
+  (v1.39.0, v1.40.0).** `varek export` sends a run's OCSF events to an
+  OpenTelemetry collector (`otlp`), to Splunk (`splunk`) and to Microsoft
+  Sentinel (`sentinel`), finished runs or, with `--follow`, live ones.
+  - *Audited first.* The stream is audited before anything is sent, and
+    the audit's verdict is always sent: a stream the audit refuses raises
+    a failed-audit event (in Sentinel, a High incident).
+  - *Each refusal names its policy line.* Every event carries the
+    decision, the three-state verdict, the rule, the policy line and its
+    text, the run and the agent, and the whole OCSF event; in Sentinel a
+    refusal raises an incident naming the line that decided it.
+  - *Failures are loud.* A refusal a retry can mend is retried; any other
+    ends the export with exit 1, naming what was not taken. From v1.40.0
+    an export that fails partway names the position its unsent events
+    begin at, and `--from-position` sends the rest.
+- **The sector packs decide program launches (v1.40.0).** The healthcare,
+  finance, utility, national-defense and cybersecurity packs need
+  `require warden 1.27`: each names the programs an agent may launch, any
+  other is refused and held by Landlock, and every directory a pack lets
+  the agent write is mounted `noexec` for the run.
+- **Approvals and deferrals: STEP_UP and DEFER (v1.42.0).** A call a
+  `step_up` rule decides waits for a person, and one a `defer` rule (or
+  `on unknown defer escalate`, `on outside_plan defer`) decides waits for
+  its context (trust boundaries 22 and 23).
+  - *Nothing is allowed that the policy plus a checked grant does not
+    allow.* An approved call is decided again, with a certificate the
+    checker verifies against the policy and the grant; a call allowed
+    under a marker carries the `defer` rule's certificate and the
+    marker's SHA-256.
+  - *It fails closed.* A hold or proposal nobody answers is refused at its
+    timeout; at the run's end, and when its caller is gone, it ends
+    `abandoned`. A held call blocks only its own thread unless the rule
+    says `scope=run`, which freezes the whole run, or refuses where the run
+    cannot be frozen. `max_held` bounds the calls held at once.
+  - *Every step is a record,* chained and signed like the rest: the hold
+    or proposal, the grant (with its approver, its signature and its
+    text), the ending, each use, the freeze and the thaw, each webhook
+    post's outcome, and the user's request in `run_start`. The audit
+    replays them: each hold ends once, within its timeout; each grant is
+    within its rule and approved by one who may; each call under a grant
+    matches it within its count and time; a forged, widened, overused or
+    missing grant, signature, marker or ending fails the run's audit.
+  - *They reach the security tools* (v1.42 step 8): each of those records
+    is an OCSF event of its own, sent on by every export, and Sentinel
+    raises an incident for an approval nobody gave in time.
 
 The per-class status of every known bypass class is maintained in
 `docs/security/bypass-classes.md`.
@@ -1021,9 +1164,19 @@ are claimed as solved.
   - *A lookup through a file* (`dir/file/x`) is EACCES, not ENOTDIR; the
     working directory's ancestors and the shell's start-up files are not
     readable.
-  - *libcrypto in the Warden.* From v1.29.0 the Warden links OpenSSL's
-    libcrypto for the launch set's SHA-256 only, initialised so that it
-    reads no configuration file (no provider or module is loaded).
+  - *libcrypto in the Warden.* From v1.29.0 the Warden linked OpenSSL's
+    libcrypto for the launch set's SHA-256 only. From v1.41 every hash,
+    signature and random byte of the Warden and its tools is OpenSSL's,
+    through one backend (`varek_fips.c`), initialised without reading a
+    configuration file; on a host in FIPS mode it loads the FIPS provider.
+    VAREK implements no cryptographic algorithm of its own, so the log's
+    integrity rests on the host's OpenSSL (`docs/security/v1.41-cryptography.md`).
+  - *The audit verifies with the signer's library (v1.41).* Through v1.40
+    the audit checked libsodium's Ed25519 signatures with its own Python
+    code; from v1.41 the Warden signs and the audit verifies with OpenSSL,
+    as FIPS requires of both. A flaw in OpenSSL's ECDSA would not be caught
+    by the audit's signature check; the hash chain and the external anchor
+    still are.
   - *Review.* v1.29.0 had a correctness review (the code read, GCC's
     static analyzer, the suite under ASan and UBSan) and dry runs of four
     real agents. The adversarial review by AI review agents the ship gates
@@ -1256,6 +1409,88 @@ are claimed as solved.
     read as authorized. Sign the stream for evidence that holds.
   - *Review.* v1.35.0 was reviewed by six AI review agents, each on one
     part; its findings are listed in its release notes. No human or
+    third-party review has been made.
+- macOS, through a Linux VM (v1.37.0 and v1.38.0, `v1.30-macos.md`,
+  `RELEASE-v1.37.0.md`, `RELEASE-v1.38.0.md`):
+  - *Root in the VM is not under the Warden.* The agent's connections are
+    the Warden's to decide; from v1.38.0 the agent has no sudo and the
+    packet filter keeps the VM from the Mac, but a process that gains root
+    in the VM is outside both.
+  - *The packet filter's rules name the Mac's addresses when they load;*
+    an address the Mac gets later, from another network, is not among
+    them until the next start (the private ranges still are). Its IPv6
+    rule is the bridge's, so other vmnet VMs lose IPv6 while this VM
+    runs. On a VM's first boot there are a few seconds before the rules
+    load, with no project mounted.
+  - *The baseline's git rules* do not cover a nested submodule's settings
+    (`.git/modules/a/modules/b/...`); an IDE's task files and `.envrc` in
+    the project are the policy's to keep from the agent; `mv .git` by the
+    agent falls back to copying and leaves `config` and `hooks`.
+  - *The VM persists between runs,* and stays up after `varek vm run`
+    with the project shared, until `varek vm stop`. The guest can fill the
+    Mac's disk through its serial log.
+  - *Review.* v1.37.0 was reviewed by three AI review agents; v1.38.0 was
+    tested as its release notes state, without a separate review pass. No
+    human or third-party review has been made.
+- Security operations (v1.39.0 and v1.40.0, `v1.39-security-operations.md`):
+  - *An exported copy is a copy.* A collector or SIEM holds what it was
+    sent; whether it keeps every row, and what its rules raise, is that
+    tool's. The verdict stream, audited with `varek audit`, is the
+    evidence.
+  - *Sentinel's analytics rules judge rows that arrive within a day of
+    their decisions;* a run exported later reaches the table and the
+    workbook but raises no incident, and a row two rule runs see raises a
+    second alert in the same incident. At release it was tested in one
+    workspace with a client secret, a managed identity only against a
+    stand-in.
+  - *Events may be sent twice.* An export run again, or resumed with
+    `--from-position` after a batch split or near the run's end, can send
+    events the tool already holds; each event's `metadata.uid` tells them
+    apart. Nothing is buffered on disk between attempts.
+  - *OpenTelemetry* is OTLP/HTTP with JSON only, logs only. *Splunk* was
+    tested on Splunk Enterprise with a private CA's certificate, not on
+    Splunk Cloud; its default HEC certificate names no host, so the HEC
+    needs one of its own.
+  - *The sector packs' `python3`* (healthcare, finance, utility,
+    national-defense) is a general-purpose interpreter: any code it can
+    read runs, under the pack's file and network rules. The start-up
+    reads were checked with Python 3.9, 3.12 and 3.13.
+  - *The Enterprise license check (v1.39.1)* is a compliance check, not
+    copy protection: the packs are readable text on the buyer's instance.
+  - *Review.* v1.39.0 and v1.40.0 were tested as their release notes
+    state, against real instances (an OpenTelemetry collector, Splunk
+    Enterprise, a Sentinel workspace), without a separate review pass. No
+    human or third-party review has been made.
+- Approvals and deferrals (v1.42.0):
+  - *An approver can be deceived.* A proposal is exactly what it
+    authorises, but whether the object should be read or sent is the
+    approver's call, made on the agent's own naming of it and on a request
+    the agent's framework supplied. Approval fatigue is the usual failure:
+    plan approval and standing grants, ahead of time, are the main tools,
+    and `step_up` belongs on destructive writes, payments and data
+    leaving.
+  - *A held call is held, not paused.* Under `scope=thread` the run's
+    other threads go on; a dependency across threads is invisible to
+    VAREK, which `scope=run` covers by freezing the whole run. A kernel
+    before 5.19 cannot keep a held call waiting through a signal, so there
+    `scope=run` refuses instead of holding.
+  - *Markers are as good as their owners.* Whoever can write a marker as
+    root or as the approvers' group releases the deferred call; the
+    Warden checks who owns it, not who wrote it.
+  - *The webhook is best effort.* A post is tried twice; one that fails,
+    or that a short run ends first, is recorded and lost. Approvers who
+    rely on it should also watch `varek pending` or Sentinel's
+    expired-approval rule. Only Slack's mrkdwn is escaped in the chat's
+    line; another receiver that renders its text (Teams' Markdown) may
+    format an object's name.
+  - *The exports name the call from its decisions.* The Warden's v1.42
+    records name the call they are about but not its `obo`; the OCSF
+    export takes it from the call's own decision record (by its sequence
+    number, its process or its proxy connection). A held call whose
+    process has made no decision before is exported as the agent's.
+  - *Review.* Built and tested as the plan document's steps state, on
+    GitHub's runners and in local containers, not yet against a real
+    Slack, Teams or Sentinel workspace for these records. No human or
     third-party review has been made.
 - Some bypass classes remain partial; see `docs/security/bypass-classes.md`.
 - The verification chain's soundness rests on components currently trusted (§5.6).

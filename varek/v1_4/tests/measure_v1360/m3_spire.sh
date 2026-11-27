@@ -168,52 +168,13 @@ SOCK="/proc/$apid/root$adm"
 
 # --- the delegate: SPIRE's API SDK, asking by process id. To be confirmed
 # on the first run: the request's Pid field (SPIRE 1.9 and later).
+# The program and its modules are m3delegate/ beside this script, each
+# module pinned by version and hash (go.mod, go.sum), at the versions the
+# node agent itself builds with (varek/v1_4/k8s/go.mod).
 D="$OUT/delegate"
 mkdir -p "$D"
-cat > "$D/main.go" <<'EOF'
-package main
-
-import (
-	"context"
-	"fmt"
-	"os"
-	"strconv"
-	"time"
-
-	delegated "github.com/spiffe/spire-api-sdk/proto/spire/api/agent/delegatedidentity/v1"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-)
-
-func main() {
-	pid, _ := strconv.Atoi(os.Args[2])
-	conn, err := grpc.NewClient("unix://"+os.Args[1], grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		fmt.Println("error:", err)
-		return
-	}
-	defer conn.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	st, err := delegated.NewDelegatedIdentityClient(conn).SubscribeToX509SVIDs(ctx,
-		&delegated.SubscribeToX509SVIDsRequest{Pid: int32(pid)})
-	if err == nil {
-		var r *delegated.SubscribeToX509SVIDsResponse
-		if r, err = st.Recv(); err == nil {
-			if len(r.X509Svids) == 0 {
-				fmt.Println("none")
-			}
-			for _, s := range r.X509Svids {
-				fmt.Printf("spiffe://%s%s\n", s.X509Svid.Id.TrustDomain, s.X509Svid.Id.Path)
-			}
-			return
-		}
-	}
-	fmt.Println("error:", err)
-}
-EOF
-(cd "$D" && go mod init varek/m3delegate && go get github.com/spiffe/spire-api-sdk@latest google.golang.org/grpc@latest &&
-    go mod tidy && go build -o delegate .) >> "$LOG" 2>&1 || { measure delegated_svid "not measured (the client did not build)"; exit 0; }
+cp "$(dirname "$(readlink -f "$0")")"/m3delegate/{go.mod,go.sum,main.go} "$D"/
+(cd "$D" && go build -mod=readonly -o delegate .) >> "$LOG" 2>&1 || { measure delegated_svid "not measured (the client did not build)"; exit 0; }
 measure sdk "$(cd "$D" && go list -m github.com/spiffe/spire-api-sdk 2>/dev/null)"
 
 cpid() {

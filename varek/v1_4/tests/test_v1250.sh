@@ -43,6 +43,7 @@ SDT="$(cd "$(dirname "$3")" && pwd)/$(basename "$3")"
 WARDEN="${4:-}"
 [ -n "$WARDEN" ] && WARDEN="$(cd "$(dirname "$WARDEN")" && pwd)/$(basename "$WARDEN")"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+export VAREK_TESTS="$HERE/tests"   # tests/varek_logfmt.py, for the re-chainers: chain-1 or chain-2, as the stream says
 T="$HERE/tests"
 PSL="$HERE/data/public_suffix_list.dat"
 VL="$HERE/data/varek_shared_domains.txt"
@@ -323,7 +324,7 @@ S(("0.0.0.0", int(sys.argv[1])), http.server.SimpleHTTPRequestHandler).serve_for
         python3 "$HERE/tools/varek_audit.py" --policy "$POL" --checker "$CERT" "$OUT/a.log"
     python3 - "$OUT/a.log" "$OUT/forged.log" <<'PY'
 import hashlib, sys
-head = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
+sys.path.insert(0, __import__("os").environ["VAREK_TESTS"]); F = __import__("varek_logfmt").of_file(sys.argv[1]); head = F["iv"]   # the stream's own format
 out, done = [], False
 for line in open(sys.argv[1], encoding="utf-8", errors="surrogateescape"):
     if line.startswith("{") and ',"chain":"' in line:
@@ -332,8 +333,8 @@ for line in open(sys.argv[1], encoding="utf-8", errors="surrogateescape"):
         if not done and '"rule":"dns_stub"' in body:
             body = body.replace('"resolved":"127.53.53.53:53"', '"resolved":"127.0.0.1:53"')
             done = True
-        head = hashlib.sha256(head + body.encode("utf-8", "surrogateescape")).digest()
-        line = body + ',"chain":"' + head.hex() + line[cut + 10 + 64:]
+        head = F["hash"](head + body.encode("utf-8", "surrogateescape")).digest()
+        line = body + ',"chain":"' + head.hex() + line[cut + 10 + F["chain_hex"]:]
     out.append(line)
 open(sys.argv[2], "w", encoding="utf-8", errors="surrogateescape").write("".join(out))
 PY
@@ -492,7 +493,7 @@ PY
         python3 - "$1" "$3" "$2" <<'PY'
 import hashlib, sys
 src, dst, expr = sys.argv[1], sys.argv[2], sys.argv[3]
-head = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
+sys.path.insert(0, __import__("os").environ["VAREK_TESTS"]); F = __import__("varek_logfmt").of_file(src); head = F["iv"]   # the stream's own format
 out, state = [], {"done": False}
 for line in open(src, encoding="utf-8", errors="surrogateescape"):
     if line.startswith("{") and ',"chain":"' in line:
@@ -500,8 +501,8 @@ for line in open(src, encoding="utf-8", errors="surrogateescape"):
         body = eval(expr, {"body": line[:cut], "state": state})
         if body is None:
             continue
-        head = hashlib.sha256(head + body.encode("utf-8", "surrogateescape")).digest()
-        line = body + ',"chain":"' + head.hex() + line[cut + 10 + 64:]
+        head = F["hash"](head + body.encode("utf-8", "surrogateescape")).digest()
+        line = body + ',"chain":"' + head.hex() + line[cut + 10 + F["chain_hex"]:]
     out.append(line)
 open(dst, "w", encoding="utf-8", errors="surrogateescape").write("".join(out))
 PY
@@ -585,7 +586,7 @@ PY
     # Forged: one name's resolution moved to another address, chain recomputed.
     python3 - "$OUT/m.log" "$OUT/m_forged.log" "$HOSTIP" <<'PY'
 import hashlib, sys
-head = hashlib.sha256(b"VAREK-LOG-CHAIN-1").digest()
+sys.path.insert(0, __import__("os").environ["VAREK_TESTS"]); F = __import__("varek_logfmt").of_file(sys.argv[1]); head = F["iv"]   # the stream's own format
 out = []
 for line in open(sys.argv[1], encoding="utf-8", errors="surrogateescape"):
     if line.startswith("{") and ',"chain":"' in line:
@@ -593,8 +594,8 @@ for line in open(sys.argv[1], encoding="utf-8", errors="surrogateescape"):
         body = line[:cut]
         if '"event":"resolution"' in body and '"name":"n7.many.example.com"' in body:
             body = body.replace('"addresses":["' + sys.argv[3] + '"]', '"addresses":["198.51.100.9"]')
-        head = hashlib.sha256(head + body.encode("utf-8", "surrogateescape")).digest()
-        line = body + ',"chain":"' + head.hex() + line[cut + 10 + 64:]
+        head = F["hash"](head + body.encode("utf-8", "surrogateescape")).digest()
+        line = body + ',"chain":"' + head.hex() + line[cut + 10 + F["chain_hex"]:]
     out.append(line)
 open(sys.argv[2], "w", encoding="utf-8", errors="surrogateescape").write("".join(out))
 PY

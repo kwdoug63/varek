@@ -47,8 +47,12 @@ type NodeKey struct {
 // a node's name as Kubernetes has it (a DNS subdomain), and a key as the
 // Warden writes it (tools/varek_keygen's .pub)
 var (
-	nodeName  = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$`)
-	publicKey = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	nodeName = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$`)
+	// v1.41: a node's key is ECDSA P-384, published as its uncompressed point
+	// (04 || X || Y, 194 lowercase hex characters). A key a node agent of
+	// v1.40 or earlier published (Ed25519, 64) still reads: the streams it
+	// signed stay auditable.
+	publicKey = regexp.MustCompile(`^(04[0-9a-f]{192}|[0-9a-f]{64})$`)
 )
 
 // NodeKeyName is the VarekNodeKey of a node's key: the node's name and the
@@ -74,7 +78,7 @@ func NodeKeyProblem(k *NodeKey) string {
 		return fmt.Sprintf("spec.node %q is not a node's name (1 to 253 of a-z, 0-9, . and -)", k.Spec.Node)
 	}
 	if !publicKey.MatchString(k.Spec.PublicKey) {
-		return "spec.publicKey is not a key as the Warden writes it (64 lowercase hex characters)"
+		return "spec.publicKey is not a key as the Warden writes it (a P-384 point: 194 lowercase hex characters beginning 04; or, from v1.40 or earlier, an Ed25519 key: 64 lowercase hex characters)"
 	}
 	if want := NodeKeyName(k.Spec.Node, k.Spec.PublicKey); k.Metadata.Name != want {
 		return fmt.Sprintf("a VarekNodeKey is named for its node and key: %s, not %q", want, k.Metadata.Name)
@@ -93,7 +97,7 @@ func ReadPublicKey(path string) (string, error) {
 	}
 	k := strings.TrimSuffix(string(b), "\n")
 	if !publicKey.MatchString(k) {
-		return "", fmt.Errorf("%s is not a public key as the Warden writes it (64 lowercase hex characters)", path)
+		return "", fmt.Errorf("%s is not a public key as the Warden writes it (a P-384 point: 194 lowercase hex characters beginning 04; or, from v1.40 or earlier, an Ed25519 key: 64 lowercase hex characters)", path)
 	}
 	return k, nil
 }

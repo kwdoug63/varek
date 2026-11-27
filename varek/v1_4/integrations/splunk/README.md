@@ -42,11 +42,14 @@ It adds:
   | `varek_policy_name`, `varek_policy_sha256` | the policy |
   | `varek_mode` | `dry_run` for what a dry run let through |
   | `varek_event`, `varek_audit_passed` | lifecycle events (`run_start`, `run_end`, `audit`) and the audit's result |
+  | `varek_step_up`, `varek_defer`, `varek_grant`, `varek_state`, `varek_ending`, `varek_approvers` | v1.42: an approval or a deferral (`varek_event` `step_up`, `step_up_end`, `grant`, `defer`, `defer_end`, `notify`), its id, its state or ending, and the approvers' group; `varek_target` is the call it is about |
 
 - **the macros `varek_events`** (`index=varek sourcetype="varek:ocsf"`),
   which the dashboard reads: change it if the events go to another index;
-  **and `varek_refused`** (`varek_decision=DENY NOT varek_mode=dry_run`): a
-  refusal, not what a dry run let through;
+  **`varek_refused`** (`varek_decision=DENY NOT varek_mode=dry_run`): a
+  refusal, not what a dry run let through; **and `varek_approval_expired`**
+  (v1.42): an approval nobody gave in time, or a deferral whose context
+  never came (`varek_ending=timeout`), as Sentinel's rule of that name;
 - **the dashboard *VAREK: the Warden's decisions***.
 
 ## 2. An index and an HEC token

@@ -113,6 +113,10 @@ VERDICT = {"ALLOW": "SATISFIED", "DENY": "UNSATISFIED", "UNKNOWN": "UNKNOWN"}
 DNS_TYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV",
              65: "HTTPS"}
 O_CREAT = 0o100
+# v1.42 step 8: the records of approvals, deferrals, the freeze and the
+# approvers' webhook, each an Application Lifecycle event of its own
+V142_EVENTS = ("step_up", "step_up_end", "grant", "defer", "defer_end", "run_frozen", "run_thawed",
+               "plan_extended", "notify")
 
 
 class ExportError(Exception):
@@ -139,6 +143,13 @@ def _file(path, dirop=False):
     name = os.path.basename(path.rstrip("/")) or path or "unknown"
     return {"name": name, "path": path, "type_id": 2 if dirop else 0,
             "type": "Folder" if dirop else "Unknown"}
+
+
+def _no_webhook_url(text):
+    """v1.42 step 8: a policy line's text, its notify= webhook's URL cut to
+    its scheme and host (a webhook's URL can be its secret, as Slack's is; the
+    Warden records only its host and SHA-256)"""
+    return re.sub(r"(?<!\S)notify=(https?://[^/\s?#]*)\S*", lambda m: f"notify={m.group(1)}/...", text)
 
 
 def _policy_grammar(lines, warden):
@@ -169,6 +180,11 @@ class Exporter:
         self.handoffs = {}             # v1.36 step 12: proxy_conn -> the connect handed to the proxy, until decided
         self.plan_steps = []           # v1.35 step 7: plan_step records, folded into their gate's event
         self.plan_step_n = {}
+        # v1.42 step 8: the call each proposal or deferral is about, by its id
+        # (its obo, process and object, from the call's own records)
+        self.calls = {}                # ("step_up" | "defer", id) -> the call's context
+        self.pid_obo = {}              # agent_pid -> the obo of its last decision
+        self.conn_obo = {}             # proxy_conn -> the obo of its connection's decisions
         self.queue = []                # [event, waiting-for key or None, records left to wait]
         self.n = 0                     # chained records seen
         self.last_ts = 0
@@ -255,6 +271,17 @@ class Exporter:
                                 "check": rec.get("check"), "subject": rec.get("cert_subject", 0)}
         if dry:
             v["mode"] = "dry_run"
+        # v1.42 step 8: the proposal or deferral the call is under, and the
+        # grant or marker it is allowed by (its certificate's other half)
+        for k in ("step_up", "held", "unheld", "defer", "defer_why", "defer_marker"):
+            if k in rec:
+                v[k] = rec[k]
+        if rec.get("cert_grant"):
+            v["grant"] = rec["cert_grant"]
+            v.setdefault("certificate", {})["grant"] = {"id": rec.get("cert_grant"), "rule": rec.get("cert_grant_rule"),
+                                                        "witness": rec.get("cert_grant_witness")}
+        if rec.get("cert_defer") is True:
+            v.setdefault("certificate", {})["defer"] = True
         hold = (self.rs or {}).get("hold")
         if rec.get("rule") == "outside_plan" and isinstance(hold, dict):      # v1.35 step 7
             v["plan"] = {"plan": hold.get("plan"), "plan_sha256": hold.get("plan_sha256"), "held": True}
@@ -338,14 +365,14 @@ class Exporter:
                "uid": self.policy_sha, "is_applied": True,
                "version": _policy_grammar(self.policy_lines, (self.rs or {}).get("warden"))}
         if isinstance(line, int) and 1 <= line <= len(self.policy_lines):
-            pol["desc"] = self.policy_lines[line - 1].strip()
+            pol["desc"] = _no_webhook_url(self.policy_lines[line - 1].strip())
         return pol
 
     def _plan_step(self, rec):
         st = {k: rec.get(k) for k in ("label", "kind", "target", "resolved", "decision", "policy_line", "why")}
         line = rec.get("policy_line")
         if isinstance(line, int) and 1 <= line <= len(self.policy_lines):
-            st["policy_text"] = self.policy_lines[line - 1].strip()
+            st["policy_text"] = _no_webhook_url(self.policy_lines[line - 1].strip())
         st["chain"] = rec.get("chain")
         return st
 
@@ -373,6 +400,228 @@ class Exporter:
         self.plan_steps = [x for x in self.plan_steps if x.get("plan") != rec.get("plan")]
         return ev
 
+    # ---- v1.42 step 8: approvals, deferrals, the freeze, notifications ----
+
+    def _note_call(self, rec):
+        """a decision record: the obo of its process and connection, and the
+        proposal or deferral it names (the call the later records are about)"""
+        obo = rec.get("obo") if isinstance(rec.get("obo"), list) else None
+        pid, conn = rec.get("agent_pid"), rec.get("proxy_conn")
+        if obo is not None and type(pid) is int:
+            self.pid_obo[pid] = obo
+        if obo is not None and type(conn) is int:
+            self.conn_obo[conn] = obo
+        ctx = {"obo": obo, "agent_pid": pid, "action": rec.get("action"),
+               "object": rec.get("resolved") or rec.get("target"), "decision_seq": rec.get("seq")}
+        if isinstance(rec.get("step_up"), str):
+            self.calls.setdefault(("step_up", rec["step_up"]), dict(ctx))
+        if isinstance(rec.get("defer"), str) and rec["defer"] not in ("none", "outside_plan"):
+            self.calls.setdefault(("defer", rec["defer"]), dict(ctx))
+
+    def _held_call(self, kind, rec):
+        """the call a step_up or defer record holds or proposes: its context
+        from the decision that named it, or else from the record itself"""
+        ctx = self.calls.get((kind, rec.get("id")))
+        if ctx is None:
+            pid, conn = rec.get("agent_pid"), rec.get("proxy_conn")
+            obo = self.pid_obo.get(pid) if type(pid) is int else self.conn_obo.get(conn) if type(conn) is int else None
+            ctx = {"obo": obo, "agent_pid": pid, "action": rec.get("action"), "object": rec.get("resolved")}
+            self.calls[(kind, rec.get("id"))] = ctx
+        for k in ("action", "resolved"):
+            if rec.get(k) and not ctx.get("object" if k == "resolved" else k):
+                ctx["object" if k == "resolved" else k] = rec[k]
+        if type(rec.get("proxy_conn")) is int:
+            ctx.setdefault("proxy_conn", rec["proxy_conn"])
+        for k in ("rule_line", "approvers", "timeout", "scope"):
+            if k in rec:
+                ctx[k] = rec[k]
+        ctx.setdefault("t", rec.get("timestamp_ns"))
+        return ctx
+
+    def _call_parts(self, ev, ctx, approver=None):
+        """who and what: the call's process and agent (its obo), or the
+        approver as the actor of an approval"""
+        v = ev["unmapped"]["varek"]
+        if ctx and ctx.get("obo") is not None:
+            self._who(ev, {"obo": ctx["obo"], "agent_pid": ctx.get("agent_pid")})
+        elif ctx is not None:
+            v["obo"] = []
+        if ctx:
+            if ctx.get("object"):
+                v["object"] = str(ctx["object"])
+            if ctx.get("action"):
+                v["call_action"] = ctx["action"]
+            if type(ctx.get("decision_seq")) is int:
+                v["decision_seq"] = ctx["decision_seq"]
+            if type(ctx.get("proxy_conn")) is int:
+                v["proxy_conn"] = ctx["proxy_conn"]
+        if approver:
+            ev["actor"] = {"user": approver}
+
+    @staticmethod
+    def _approver(rec):
+        if isinstance(rec.get("signed_by"), dict) and type(rec.get("approver_uid")) is not int:
+            sb = rec["signed_by"]                          # a standing grant: its signer
+            u = {"uid": str(sb.get("key", "")), "name": str(sb.get("name") or sb.get("key", "")), "type_id": 99,
+                 "type": "Other"}
+            if sb.get("group"):
+                u["groups"] = [{"name": str(sb["group"])}]
+            return u
+        if type(rec.get("approver_uid")) is int:
+            u = {"uid": str(rec["approver_uid"]), "uid_numeric": rec["approver_uid"],
+                 "name": str(rec.get("approver") or rec["approver_uid"]), "type_id": 1, "type": "User"}
+            if rec.get("approvers"):
+                u["groups"] = [{"name": str(rec["approvers"])}]
+            return u
+        return None
+
+    def _set(self, ev, disposition=None, status=None, detail=None, severity=None):
+        dispositions = {1: "Allowed", 2: "Blocked", 8: "Approved", 14: "Delayed", 16: "No Action", 23: "Challenge",
+                        25: "Rejected"}
+        if disposition:
+            ev["disposition_id"], ev["disposition"] = disposition, dispositions[disposition]
+        if status:
+            ev["status_id"], ev["status"] = status if isinstance(status, tuple) else \
+                (status, {1: "Success", 2: "Failure"}[status])
+        if detail:
+            ev["status_detail"] = str(detail)
+        if severity:
+            ev["severity_id"], ev["severity"] = severity, {1: "Informational", 2: "Low", 3: "Medium"}[severity]
+
+    def _rule_of(self, ev, line, rule):
+        v = ev["unmapped"]["varek"]
+        if type(line) is int:
+            v["policy_line"] = line
+            ev["policy"] = self._policy_obj(line)
+        v["rule"] = rule
+
+    def _v142_event(self, rec, what):
+        ev = self._life(99, rec, what)
+        v = ev["unmapped"]["varek"]
+        ts = rec.get("timestamp_ns")
+        line = rec.get("rule_line")
+        rid = rec.get("id")
+        if what == "step_up":
+            ctx = self._held_call("step_up", rec)
+            held = rec.get("state") == "held"
+            v.update({"step_up": rid, "state": rec.get("state"), "step_up_mode": rec.get("mode"),
+                      "timeout": rec.get("timeout"), "approvers": rec.get("approvers"),
+                      "proposal": rec.get("proposal")})
+            for k in ("scope", "defer", "unheld"):
+                if k in rec:
+                    v[k] = rec[k]
+            if "held" in rec:
+                v["held_calls"] = rec["held"]
+            self._rule_of(ev, line, "step_up")
+            self._call_parts(ev, ctx)
+            self._set(ev, 14 if held else 23)
+            ev["message"] = (f"{'held' if held else 'refused, with a proposal'}: approval asked under policy line "
+                             f"{line} for {v.get('object', 'a call')}, {rec.get('timeout')} s to answer")
+        elif what == "step_up_end":
+            ctx = self.calls.get(("step_up", rid))
+            end = rec.get("ending")
+            v.update({"step_up": rid, "ending": end})
+            for k in ("grant", "reason"):
+                if k in rec:
+                    v[k] = rec[k]
+            if ctx:
+                self._rule_of(ev, ctx.get("rule_line"), "step_up")
+            self._call_parts(ev, ctx, self._approver(rec) if end in ("approved", "denied") else None)
+            if ctx and isinstance(ctx.get("t"), int) and isinstance(ts, int):
+                ev["duration"] = max(0, (ts - ctx["t"]) // 1000000)
+            self._set(ev, *{"approved": (8, 1, None, 1), "denied": (25, 2, "denied", 1),
+                            "timeout": (2, 2, "timeout: no approver answered in time", 2),
+                            "abandoned": (16, 2, "abandoned", 1)}.get(end, (None, (99, "Other"), end, 1)))
+            who = (ev.get("actor") or {}).get("user", {}).get("name")
+            ev["message"] = {"approved": f"approved by {who}", "denied": f"denied by {who}",
+                             "timeout": "no approver answered in time: the call refused",
+                             "abandoned": "abandoned (the call, or the run, ended first)"}.get(end, str(end)) + \
+                (f": {v['object']}" if v.get("object") else "")
+        elif what == "grant":
+            ctx = self.calls.get(("step_up", rec.get("proposal"))) if rec.get("proposal") else None
+            v.update({"grant": rid, "grant_text": rec.get("text")})
+            for k in ("proposal", "approvers", "reason", "standing", "file", "signed_by", "sig"):
+                if k in rec:
+                    v["step_up" if k == "proposal" else k] = rec[k]
+            if ctx:
+                self._rule_of(ev, ctx.get("rule_line"), "step_up")
+            self._call_parts(ev, ctx, self._approver(rec))
+            self._set(ev, 8, 1)
+            ev["message"] = ("a standing grant, signed" if rec.get("standing") else "a grant approved") + \
+                (f", for {v['object']}" if v.get("object") else "")
+        elif what == "defer":
+            ctx = self._held_call("defer", rec)
+            v.update({"defer": rid, "state": rec.get("state"), "until": rec.get("until"),
+                      "timeout": rec.get("timeout"), "scope": rec.get("scope"), "escalate": rec.get("escalate")})
+            for k in ("unknown", "outside_plan"):
+                if rec.get(k) is True:
+                    v[k] = True
+            if "held" in rec:
+                v["held_calls"] = rec["held"]
+            ctx["rule"] = "on_unknown" if rec.get("unknown") else "outside_plan" if rec.get("outside_plan") else "defer"
+            self._rule_of(ev, line, ctx["rule"])
+            self._call_parts(ev, ctx)
+            self._set(ev, 14)
+            ev["message"] = f"deferred: {v.get('object', 'a call')} held, " + (
+                "no rule naming it" if rec.get("unknown") else "outside the run's plan" if rec.get("outside_plan")
+                else f"until {rec.get('until')} passes") + f", {rec.get('timeout')} s at most"
+        elif what == "defer_end":
+            ctx = self.calls.get(("defer", rid))
+            end = rec.get("ending")
+            v.update({"defer": rid, "ending": end})
+            for k in ("marker_sha256", "plan_extension", "step_up", "why"):
+                if k in rec:
+                    v[k] = rec[k]
+            if ctx:
+                self._rule_of(ev, ctx.get("rule_line"), ctx.get("rule", "defer"))
+            self._call_parts(ev, ctx)
+            if ctx and isinstance(ctx.get("t"), int) and isinstance(ts, int):
+                ev["duration"] = max(0, (ts - ctx["t"]) // 1000000)
+            self._set(ev, *{"resolved": (None, 1, None, 1), "escalated": (23, (99, "Other"), "escalated", 1),
+                            "timeout": (2, 2, "timeout: the context did not come in time", 2),
+                            "abandoned": (16, 2, "abandoned", 1)}.get(end, (None, (99, "Other"), end, 1)))
+            ev["message"] = {"resolved": "the deferral resolved: the call decided again",
+                             "escalated": "the deferral escalated to an approval",
+                             "timeout": "the deferral timed out: the call refused",
+                             "abandoned": "the deferral abandoned (the call, or the run, ended first)"}.get(end, str(end)) + \
+                (f": {v['object']}" if v.get("object") else "")
+        elif what == "notify":
+            ctx = self.calls.get(("step_up", rid))
+            out = rec.get("outcome")
+            v.update({"step_up": rid, "notify": {k: rec[k] for k in ("outcome", "host", "url_sha256", "status",
+                                                                     "attempts", "why") if k in rec}})
+            self._rule_of(ev, line, "step_up")
+            self._call_parts(ev, ctx)
+            if type(rec.get("status")) is int:
+                ev["status_code"] = str(rec["status"])
+            self._set(ev, None, 1 if out == "sent" else 2, None if out == "sent" else (rec.get("why") or out),
+                      1 if out != "failed" else 2)
+            ev["message"] = f"the approvers' webhook ({rec.get('host')}): {out}"
+        elif what == "run_frozen":
+            hid = rec.get("step_up")                       # the hold's id: a proposal's, or a deferral's
+            kind = "defer" if ("defer", hid) in self.calls and ("step_up", hid) not in self.calls else "step_up"
+            ctx = self.calls.get((kind, hid))
+            v.update({kind: hid, "cgroup": rec.get("cgroup")})
+            self._call_parts(ev, ctx)
+            ev["message"] = "the run frozen while a call is held (scope=run)"
+        elif what == "run_thawed":
+            v.update({"cgroup": rec.get("cgroup"), "frozen_ms": rec.get("frozen_ms")})
+            if type(rec.get("frozen_ms")) is int:
+                ev["duration"] = rec["frozen_ms"]
+            if rec.get("error"):
+                self._set(ev, None, 2, f"cannot thaw: {rec['error']}", 3)
+            ev["message"] = f"the run thawed after {rec.get('frozen_ms')} ms"
+        elif what == "plan_extended":
+            ok = rec.get("verdict") == "SATISFIED"
+            v["plan_extension"] = {k: rec[k] for k in ("sha256", "actions", "verdict", "entries", "why") if k in rec}
+            v["decision"] = rec.get("verdict") if rec.get("verdict") in VERDICT.values() else "UNKNOWN"
+            ev["policy"] = self._policy_obj(None)
+            self._call_parts(ev, None, self._approver(rec))
+            self._set(ev, 8 if ok else 25, 1 if ok else 2, None if ok else f"the plan gate's verdict is "
+                      f"{rec.get('verdict')}", 1 if ok else 2)
+            ev["message"] = f"the plan extended ({rec.get('entries')} entries)" if ok else "a plan extension refused"
+        return ev
+
     # ---- feeding ----
 
     def feed(self, rec):
@@ -392,6 +641,14 @@ class Exporter:
                 self.agent["uid"] = str(boot[0]["sha256"])
                 self.agent["name"] = os.path.basename(str(boot[0].get("name") or boot[0].get("path") or "agent"))
             out_ev = self._life(3, rec, "run_start")
+            v = out_ev["unmapped"]["varek"]
+            for k in ("intent", "plan_approved_by", "plan_approval_note", "scope_run"):    # v1.42
+                if k in rec:
+                    v[k] = rec[k]
+            if isinstance(rec.get("notify"), dict):
+                v["notify_helper"] = rec["notify"]
+        elif ev_name in V142_EVENTS:                                       # v1.42 step 8
+            out_ev = self._v142_event(rec, ev_name)
         elif ev_name == "run_end":
             out_ev = self._life(4, rec, "run_end")
             out_ev["unmapped"]["varek"]["exit_status"] = rec.get("exit_status")
@@ -463,6 +720,7 @@ class Exporter:
             if a == "process.exec" and rec.get("rule") == "bootstrap_exec_allow" and self.agent and \
                     "uid" not in self.agent:          # the agent's program, by its name (no hash recorded)
                 self.agent["name"] = os.path.basename(str(rec.get("target") or "agent")) or "agent"
+            self._note_call(rec)                                          # v1.42 step 8
             out_ev = self._decision_event(rec)
             if a == "process.exec" and rec.get("decision_final") == "ALLOW":
                 wait = ("exec", rec.get("seq"))
@@ -540,6 +798,24 @@ def private_copy(path):
     cp = os.path.join(d, "stream.log")
     with open(path, "rb") as src, open(cp, "wb") as dst:
         shutil.copyfileobj(src, dst)
+    # v1.42 step 8: a user's request too long for run_start is in a file
+    # beside the stream (STREAM.intent, by its name in run_start), which the
+    # audit reads beside the copy
+    with open(cp, encoding="utf-8", errors="surrogateescape") as fh:
+        for i, raw in enumerate(fh):
+            if i >= 64:
+                break
+            try:
+                rec = json.loads(raw) if raw.startswith("{") else None
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("event") == "run_start":
+                it = rec.get("intent")
+                name = it.get("file") if isinstance(it, dict) else None
+                if isinstance(name, str) and name and "/" not in name and name not in (".", "..") and \
+                        os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(path)), name)):
+                    shutil.copyfile(os.path.join(os.path.dirname(os.path.abspath(path)), name), os.path.join(d, name))
+                break
     return cp, d
 
 
@@ -720,6 +996,11 @@ def cmd_follow(args):
                 if rec.get("event") != "run_start":
                     continue
                 run = rec.get("run")
+                # v1.41: the chain's format (chain-2, or a v1.40 stream's chain-1)
+                fmt = cdx.log_format(rec.get("log"))
+                if fmt is None:
+                    fail(lineno, f"run_start's integrity format {rec.get('log')!r} is not one this exporter reads")
+                chained["head"], chained["fmt"] = fmt["iv"], fmt
                 ex = Exporter(args.policy, args.device)
             if "run" not in rec and rec.get("event") != "run_start":
                 continue                # step 9 (review): as batch mode does (a Warden before 1.35's

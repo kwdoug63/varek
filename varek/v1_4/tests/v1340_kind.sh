@@ -281,9 +281,10 @@ for _ in $(seq 60); do [ "$(keys_of "$OUT/node-keys.json")" = 1 ] && break; slee
 NKPUB="$(on_node cat /var/lib/varek/key-pub/node.key.pub 2>/dev/null)"
 say "  node key: $NODE $NKPUB"
 check "the node agent made the node's key, and the plugin published it: the node's VarekNodeKey, its key the node's" \
-    python3 -c 'import json,sys
+    python3 -c 'import json,re,sys
 items = [i for i in json.load(open(sys.argv[1]))["items"] if i["spec"]["node"] == sys.argv[2]]
-sys.exit(0 if len(items) == 1 and items[0]["spec"]["publicKey"] == sys.argv[3] and len(sys.argv[3]) == 64 and
+# v1.41: the node agent makes a P-384 key (its uncompressed point, 04 || X || Y)
+sys.exit(0 if len(items) == 1 and items[0]["spec"]["publicKey"] == sys.argv[3] and re.fullmatch("04[0-9a-f]{192}", sys.argv[3]) and
          items[0]["metadata"]["name"] == sys.argv[2] + "-" + sys.argv[3][:16] else 1)' "$OUT/node-keys.json" "$NODE" "$NKPUB"
 
 # the policy: v1340_crio.sh's, for busybox (its commands hardlinks of one

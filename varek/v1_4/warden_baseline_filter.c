@@ -51,6 +51,18 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+
+#ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
+#define SECCOMP_FILTER_FLAG_NEW_LISTENER (1UL << 3)
+#endif
+#ifndef SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV
+#define SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV (1UL << 5)   // Linux 5.19
+#endif
 
 // Older glibc <sched.h> (Amazon Linux 2023 and RHEL 9 ship glibc 2.34) lacks
 // CLONE_NEWTIME although their kernels support time namespaces.
@@ -607,6 +619,30 @@ fail:
     return rc;
 }
 
+#ifndef SCMP_FLTATR_CTL_WAITKILL
+// v1.42 step 4: ctx's program, loaded with the listener and
+// SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV: the listener's fd, or -1
+static int load_waitkill(scmp_filter_ctx ctx) {
+    int mfd = (int)syscall(SYS_memfd_create, "varek-filter", 1u /* MFD_CLOEXEC */);
+    if (mfd < 0) return -1;
+    int rc = -1;
+    unsigned char *buf = NULL;
+    if (seccomp_export_bpf(ctx, mfd) == 0) {
+        off_t len = lseek(mfd, 0, SEEK_END);
+        if (len > 0 && len % (off_t)sizeof(struct sock_filter) == 0 && len <= 65536 &&
+            (buf = malloc((size_t)len)) != NULL && pread(mfd, buf, (size_t)len, 0) == len) {
+            struct sock_fprog prog = { .len = (unsigned short)(len / (off_t)sizeof(struct sock_filter)),
+                                       .filter = (struct sock_filter *)buf };
+            rc = (int)syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
+                              SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV, &prog);
+        }
+    }
+    free(buf);
+    close(mfd);
+    return rc;
+}
+#endif
+
 int install_baseline_user_notif_filter(int observe) {
     return install_baseline_user_notif_filter_ex(observe, 0);
 }
@@ -617,6 +653,21 @@ int install_baseline_user_notif_filter_ex(int observe, int flags) {
     scmp_filter_ctx ctx;
     if (build(&ctx, observe, flags) < 0) return -1;
 
+#ifdef SCMP_FLTATR_CTL_WAITKILL
+    // v1.42 step 3: a held call's wait ends only on a fatal signal; a kernel
+    // without it (before 5.19) refuses the attribute: loaded without it
+    if ((flags & WD_FILTER_WAITKILL) && seccomp_attr_set(ctx, SCMP_FLTATR_CTL_WAITKILL, 1) < 0)
+        (void)0;
+#else
+    // v1.42 step 4: libseccomp before 2.6 cannot ask for it; the program it
+    // built is loaded here with the flag, as seccomp_load would load it
+    // (the listener, no other flag). A kernel without the flag (before
+    // 5.19) refuses it (EINVAL): libseccomp's own load then.
+    if (flags & WD_FILTER_WAITKILL) {
+        int lfd = load_waitkill(ctx);
+        if (lfd >= 0) { seccomp_release(ctx); return lfd; }
+    }
+#endif
     if (seccomp_load(ctx) < 0) { seccomp_release(ctx); return -1; }
 
     // libseccomp installs with SECCOMP_FILTER_FLAG_NEW_LISTENER because the
@@ -625,4 +676,27 @@ int install_baseline_user_notif_filter_ex(int observe, int flags) {
     int notify_fd = seccomp_notify_fd(ctx);
     seccomp_release(ctx);
     return notify_fd;   // >=0 on success, -1 if no listener was created
+}
+
+int wd_filter_waitkill_built(void) {
+    return 1;                // v1.42 step 4: with libseccomp before 2.6 too (load_waitkill)
+}
+
+// v1.42 step 4: does this kernel end a received notification's wait on a
+// fatal signal only? A child installs a filter that allows every call,
+// with the listener and the flag (Linux 5.19 and later accept it), and
+// says. 1, or 0.
+int wd_filter_waitkill_kernel(void) {
+    pid_t c = fork();
+    if (c < 0) return 0;
+    if (c == 0) {
+        struct sock_filter allow = BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+        struct sock_fprog prog = { .len = 1, .filter = &allow };
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) _exit(1);
+        _exit(syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
+                      SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV, &prog) >= 0 ? 0 : 1);
+    }
+    int st = 0;
+    while (waitpid(c, &st, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
 }

@@ -1,0 +1,431 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "serialNumber": "urn:uuid:00000000-0000-4000-8000-000000000140",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-11-22T12:12:01Z",
+    "lifecycles": [
+      {
+        "phase": "operations"
+      }
+    ],
+    "tools": {
+      "components": [
+        {
+          "type": "application",
+          "bom-ref": "tool:varek-warden",
+          "publisher": "Sober Agentic Infrastructure, Inc.",
+          "name": "VAREK Warden",
+          "version": "1.40.0",
+          "description": "Kernel-enforced, proof-checked authorization for what an AI agent's process actually does: each file open, lookup, connect, program launch and datagram send is decided at the kernel (seccomp-BPF and seccomp user-notify).",
+          "licenses": [
+            {
+              "license": {
+                "id": "MIT"
+              }
+            }
+          ],
+          "properties": [
+            {
+              "name": "varek:patent:smt-layer",
+              "value": "USPTO Provisional 64/006,104 (SMT decision layer)"
+            },
+            {
+              "name": "varek:patent:warden-architecture",
+              "value": "USPTO Provisional 64/059,592 (Warden kernel architecture)"
+            },
+            {
+              "name": "varek:patent:action-graph",
+              "value": "USPTO Provisional 64/062,549 (compositional action-graph verification)"
+            },
+            {
+              "name": "varek:status",
+              "value": "patent-pending"
+            }
+          ]
+        }
+      ]
+    },
+    "component": {
+      "type": "application",
+      "bom-ref": "agent-run",
+      "name": "cat",
+      "version": "2026-11-22T12:12:01Z",
+      "description": "Autonomous agent run whose process's actions the VAREK Warden decided at the kernel.",
+      "properties": [
+        {
+          "name": "varek:mode",
+          "value": "enforcing"
+        },
+        {
+          "name": "varek:policy",
+          "value": "/tmp/varek_v140_fixture/policy.txt"
+        },
+        {
+          "name": "varek:policy.sha256",
+          "value": "b0a146d91ff72df0aad9b4c534051a8f301c003e2fd13a7bd947c24de81b1e70"
+        },
+        {
+          "name": "varek:run.id",
+          "value": "29ca8e8de6925b63e7992cd45dd0bbcb"
+        },
+        {
+          "name": "varek:log.chain",
+          "value": "66356e707a5ff18d592c1b9e2cb0d1fa612eddfca5220dc5a07b68f77d29ec47"
+        },
+        {
+          "name": "varek:log.pubkey",
+          "value": "724778fa88452299ffdcd75c1a63630847292bb85391efb18f408dd87e7cd1bd"
+        },
+        {
+          "name": "varek:run.complete",
+          "value": "true"
+        },
+        {
+          "name": "varek:run.start",
+          "value": "2026-11-22T12:12:01Z"
+        },
+        {
+          "name": "varek:run.end",
+          "value": "2026-11-22T12:12:01Z"
+        },
+        {
+          "name": "varek:decisions.total",
+          "value": "9"
+        },
+        {
+          "name": "varek:decisions.authorized",
+          "value": "7"
+        },
+        {
+          "name": "varek:decisions.refused",
+          "value": "2"
+        },
+        {
+          "name": "varek:views.answered",
+          "value": "0"
+        },
+        {
+          "name": "varek:unknown.total",
+          "value": "1"
+        },
+        {
+          "name": "varek:unknown.authorized",
+          "value": "0"
+        },
+        {
+          "name": "varek:authorized.files",
+          "value": "6"
+        },
+        {
+          "name": "varek:authorized.files.resolved",
+          "value": "6"
+        },
+        {
+          "name": "varek:authorized.certified",
+          "value": "6"
+        },
+        {
+          "name": "varek:certificates.refused",
+          "value": "0"
+        },
+        {
+          "name": "varek:policy.sha256.check",
+          "value": "b0a146d91ff72df0aad9b4c534051a8f301c003e2fd13a7bd947c24de81b1e70, equal to the file named"
+        },
+        {
+          "name": "varek:on_behalf_of.operator",
+          "value": "uid 0 (root) (not verified)"
+        }
+      ]
+    },
+    "properties": [
+      {
+        "name": "varek:mode",
+        "value": "enforcing"
+      },
+      {
+        "name": "varek:verdict.allow",
+        "value": "7"
+      },
+      {
+        "name": "varek:verdict.deny",
+        "value": "1"
+      },
+      {
+        "name": "varek:verdict.unknown",
+        "value": "1"
+      }
+    ]
+  },
+  "components": [
+    {
+      "type": "data",
+      "bom-ref": "authorized-object:4282424e-f461-59ba-9f2a-88ef866f98da",
+      "name": "/bin/cat",
+      "description": "Object the agent was authorized to reach via process.exec.",
+      "properties": [
+        {
+          "name": "varek:action",
+          "value": "process.exec"
+        },
+        {
+          "name": "varek:rule",
+          "value": "bootstrap_exec_allow"
+        },
+        {
+          "name": "varek:requested",
+          "value": "/bin/cat"
+        },
+        {
+          "name": "varek:kernel_verdict",
+          "value": "ALLOW"
+        }
+      ]
+    },
+    {
+      "type": "data",
+      "bom-ref": "authorized-object:a249e0ac-0a01-596b-83b8-f541ed563348",
+      "name": "/etc/ld.so.cache",
+      "description": "Object the agent was authorized to reach via file.open.",
+      "properties": [
+        {
+          "name": "varek:action",
+          "value": "file.open"
+        },
+        {
+          "name": "varek:rule",
+          "value": "resolved_fd_injection"
+        },
+        {
+          "name": "varek:requested",
+          "value": "/etc/ld.so.cache"
+        },
+        {
+          "name": "varek:kernel_verdict",
+          "value": "ALLOW"
+        },
+        {
+          "name": "varek:certificate.rule",
+          "value": "4"
+        },
+        {
+          "name": "varek:certificate.witness",
+          "value": "-"
+        },
+        {
+          "name": "varek:certificate.check",
+          "value": "ok"
+        }
+      ]
+    },
+    {
+      "type": "data",
+      "bom-ref": "authorized-object:c995f53c-5c48-5e27-a82e-d69c6e3320f0",
+      "name": "/tmp/varek_v140_fixture/data/f1",
+      "description": "Object the agent was authorized to reach via file.open.",
+      "properties": [
+        {
+          "name": "varek:action",
+          "value": "file.open"
+        },
+        {
+          "name": "varek:rule",
+          "value": "resolved_fd_injection"
+        },
+        {
+          "name": "varek:requested",
+          "value": "/tmp/varek_v140_fixture/data/f1"
+        },
+        {
+          "name": "varek:kernel_verdict",
+          "value": "ALLOW"
+        },
+        {
+          "name": "varek:certificate.rule",
+          "value": "6"
+        },
+        {
+          "name": "varek:certificate.witness",
+          "value": "-"
+        },
+        {
+          "name": "varek:certificate.check",
+          "value": "ok"
+        }
+      ]
+    },
+    {
+      "type": "data",
+      "bom-ref": "authorized-object:2eea87a5-f4dd-5bab-8c03-3f049f9bd9a7",
+      "name": "/tmp/varek_v140_fixture/data/f2",
+      "description": "Object the agent was authorized to reach via file.open.",
+      "properties": [
+        {
+          "name": "varek:action",
+          "value": "file.open"
+        },
+        {
+          "name": "varek:rule",
+          "value": "resolved_fd_injection"
+        },
+        {
+          "name": "varek:requested",
+          "value": "/tmp/varek_v140_fixture/data/f2"
+        },
+        {
+          "name": "varek:kernel_verdict",
+          "value": "ALLOW"
+        },
+        {
+          "name": "varek:certificate.rule",
+          "value": "6"
+        },
+        {
+          "name": "varek:certificate.witness",
+          "value": "-"
+        },
+        {
+          "name": "varek:certificate.check",
+          "value": "ok"
+        }
+      ]
+    },
+    {
+      "type": "data",
+      "bom-ref": "authorized-object:f1f3fc9c-7d40-5f9a-ab46-2eeebb3dad48",
+      "name": "/tmp/varek_v140_fixture/data/f3",
+      "description": "Object the agent was authorized to reach via file.open.",
+      "properties": [
+        {
+          "name": "varek:action",
+          "value": "file.open"
+        },
+        {
+          "name": "varek:rule",
+          "value": "resolved_fd_injection"
+        },
+        {
+          "name": "varek:requested",
+          "value": "/tmp/varek_v140_fixture/data/f3"
+        },
+        {
+          "name": "varek:kernel_verdict",
+          "value": "ALLOW"
+        },
+        {
+          "name": "varek:certificate.rule",
+          "value": "6"
+        },
+        {
+          "name": "varek:certificate.witness",
+          "value": "-"
+        },
+        {
+          "name": "varek:certificate.check",
+          "value": "ok"
+        }
+      ]
+    },
+    {
+      "type": "data",
+      "bom-ref": "authorized-object:fe932d03-43ea-56e6-8d38-b4a1b36a881a",
+      "name": "/tmp/varek_v140_fixture/data/f4",
+      "description": "Object the agent was authorized to reach via file.open.",
+      "properties": [
+        {
+          "name": "varek:action",
+          "value": "file.open"
+        },
+        {
+          "name": "varek:rule",
+          "value": "resolved_fd_injection"
+        },
+        {
+          "name": "varek:requested",
+          "value": "/tmp/varek_v140_fixture/data/f4"
+        },
+        {
+          "name": "varek:kernel_verdict",
+          "value": "ALLOW"
+        },
+        {
+          "name": "varek:certificate.rule",
+          "value": "6"
+        },
+        {
+          "name": "varek:certificate.witness",
+          "value": "-"
+        },
+        {
+          "name": "varek:certificate.check",
+          "value": "ok"
+        }
+      ]
+    },
+    {
+      "type": "data",
+      "bom-ref": "authorized-object:6407201f-046b-559b-a825-8ec21c517c32",
+      "name": "/usr/lib/x86_64-linux-gnu/libc.so.6",
+      "description": "Object the agent was authorized to reach via file.open.",
+      "properties": [
+        {
+          "name": "varek:action",
+          "value": "file.open"
+        },
+        {
+          "name": "varek:rule",
+          "value": "resolved_fd_injection"
+        },
+        {
+          "name": "varek:requested",
+          "value": "/lib/x86_64-linux-gnu/libc.so.6"
+        },
+        {
+          "name": "varek:kernel_verdict",
+          "value": "ALLOW"
+        },
+        {
+          "name": "varek:certificate.rule",
+          "value": "0"
+        },
+        {
+          "name": "varek:certificate.witness",
+          "value": "-"
+        },
+        {
+          "name": "varek:certificate.check",
+          "value": "ok"
+        }
+      ]
+    }
+  ],
+  "annotations": [
+    {
+      "bom-ref": "authorization-attestation",
+      "subjects": [
+        "agent-run"
+      ],
+      "annotator": {
+        "component": {
+          "type": "application",
+          "bom-ref": "annotator:varek-warden",
+          "name": "VAREK Warden",
+          "version": "1.40.0"
+        }
+      },
+      "timestamp": "2026-11-22T12:12:01Z",
+      "text": "VAREK authorization record for policy '/tmp/varek_v140_fixture/policy.txt' (SHA-256 b0a146d91ff72df0aad9b4c534051a8f301c003e2fd13a7bd947c24de81b1e70, equal to the file named). 9 decision(s) recorded between 2026-11-22T12:12:01Z and 2026-11-22T12:12:01Z: 7 authorized, 2 refused. Raw verdicts: ALLOW=7, DENY=1, UNKNOWN=1. All 1 UNKNOWN verdict(s) were refused (symmetric suppression). All 6 authorized file decision(s) name the resolved canonical object they were made on. 6 of 7 authorization(s) carry a certificate the independent checker accepted. The stream is hash-chained (this exporter checked the chain); all 6 of its signed records verify under the key 724778fa88452299ffdcd75c1a63630847292bb85391efb18f408dd87e7cd1bd, checked by this exporter. The record covers the system calls this Warden version pauses and decides: file opens and file lookups (stat, access, readlink), connects (each dialed by the Warden and handed over), program launches, and sends that name a destination or carry control data. Calls the kernel filter admits without asking the Warden (reads and writes on descriptors already held, memory, time, threads) and calls it refuses outright are not recorded. No user's token was given: the run acted for the agent alone."
+    }
+  ],
+  "signature": {
+    "algorithm": "Ed25519",
+    "publicKey": {
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "x": "ckd4-ohFIpn_3NdcGmNjCEcpK7hTke-xj0CN2H580b0"
+    },
+    "value": "jIchduyJ_nL9DFex6tVLyiobd4YY2RXUhRn8j1OkrloWgzsrnGQXDvMzVejwQpz3EA-_nTVqxhdcW4ASnmXKCA"
+  }
+}
