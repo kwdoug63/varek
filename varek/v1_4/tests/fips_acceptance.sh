@@ -77,7 +77,7 @@ ok()   { line PASS "$1"; }
 bad()  { line FAIL "$1"; fail=1; }
 note() { line INFO "$1"; }
 {
-    echo "VAREK v1.41 Defense build: acceptance on RHEL 9 in FIPS mode"
+    echo "VAREK Defense build (v1.41 and later): acceptance on RHEL 9 in FIPS mode"
     echo "host $(hostname -f 2>/dev/null || hostname), $(date -u)"
     # safe.directory: this runs as root on a checkout another user owns
     echo "checkout $(git -c safe.directory="$ROOT" -C "$ROOT" rev-parse HEAD 2>/dev/null || echo '(not a git checkout)')" \
