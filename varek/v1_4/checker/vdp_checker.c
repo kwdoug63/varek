@@ -860,7 +860,9 @@ static int parse_mcp_rule(const char *name, int ln, char **tok, int nt, int req_
             if (!(r->subj = subj_named(pol, t + 4))) return fail(err, en, name, ln, "for= names no confined subject");
             continue;
         }
-        if (!r->allow) return fail(err, en, name, ln, "an option on a deny mcp rule");
+        /* v1.43 (D10): credential= and header= on a step_up mcp rule too */
+        if (!r->allow && !(r->step_up && ver_ge(req_maj, req_min, 1, 43) && strncmp(t, "max_body=", 9)))
+            return fail(err, en, name, ln, "an option on a deny mcp rule");
         if (!strncmp(t, "credential=", 11)) {
             if (r->cred) return fail(err, en, name, ln, "credential given twice");
             for (size_t q = 0; q < pol->ncreds && !r->cred; q++)

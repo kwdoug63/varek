@@ -1026,7 +1026,9 @@ def parse_lines(raw_lines, path):
                             raise PolicyError(f"{where}: for= twice")
                         rsubj = for_opt(t, where)
                         continue
-                    if verb != "allow":
+                    # v1.43 (D10): credential= and header= on a step_up mcp rule too
+                    if verb != "allow" and not (verb == "step_up" and req >= (1, 43) and
+                                                not t.startswith("max_body=")):
                         raise PolicyError(f"{where}: option on a deny mcp rule")
                     if t.startswith("credential="):
                         names = [c[0] for c in creds]
@@ -2230,9 +2232,11 @@ def fuzz_gateway_policy(rng, path):
         name = rng.choice(["", " search-osdk-todo-task", " create-*", " delete-osdk-todo-task", " get-?"]) \
             if meth.startswith("tools/c") else ""
         verb = rng.choice(["allow", "allow", "deny", "step_up"])
-        tail = " credential=tok" if cred and verb == "allow" and rng.random() < 0.6 else ""
-        if verb == "step_up":
-            tail = rng.choice([" mode=hold timeout=30", " mode=grant", ""])
+        tail = " credential=tok" if cred and verb in ("allow", "step_up") and rng.random() < 0.6 else ""
+        if verb == "step_up":                            # v1.43 (D10): a held rule may carry the token too
+            tail += rng.choice([" mode=hold timeout=30", " mode=grant", ""])
+        if not valid and verb in ("deny", "step_up") and rng.random() < 0.15:
+            tail = rng.choice([" credential=tok", " max_body=1k"]) + tail   # deny: refused; max_body on step_up: refused
         L.append(f"{verb} mcp {u} {meth}{name}{tail}")
     if not valid and rng.random() < 0.3:
         L.append("allow mcp https://other.example.com/mcp tools/list")   # no gateway, no inspect: refused under proxy on

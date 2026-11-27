@@ -1977,9 +1977,16 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
                               "credential=NAME, header=HEADER[:SCHEME], for=NAME)", t);
                     goto out;
                 }
-                if (r->verb != VDP_ALLOW) {
-                    rc = perr(err, errlen, path, lineno, "%s applies only to allow mcp rules",
-                              is_cred ? "credential=" : is_hdr ? "header=" : "max_body=");
+                /* v1.43 (D10): a step_up mcp rule may carry a credential too,
+                 * released only into a call a person approved (a grant under
+                 * the rule allows it); never into one held or refused */
+                bool su_cred = r->verb == VDP_STEP_UP && !is_mb &&
+                               (req_maj > 1 || (req_maj == 1 && req_min >= 43));
+                if (r->verb != VDP_ALLOW && !su_cred) {
+                    rc = perr(err, errlen, path, lineno, "%s applies only to allow mcp rules%s",
+                              is_cred ? "credential=" : is_hdr ? "header=" : "max_body=",
+                              r->verb == VDP_STEP_UP && !is_mb ? " (and step_up mcp rules after `require warden "
+                              "1.43`)" : "");
                     goto out;
                 }
                 if (is_cred) {

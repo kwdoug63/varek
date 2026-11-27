@@ -78,7 +78,7 @@ jobs:
           chmod -R a+rX /var/tmp/varek-fw
       - name: Check the deployment scripts parse
         run: |
-          python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py varek/v1_4/tools/varek_bench.py varek/v1_4/tools/varek_node_export.py varek/v1_4/tools/varek_vm.py varek/v1_4/tools/varek_suggest.py varek/v1_4/tools/varek_mcp_tools.py varek/v1_4/integrations/palantir/omcp_measure.py varek/v1_4/integrations/palantir/omcp_token.py varek/v1_4/integrations/palantir/clients/omcp_agent.py
+          python3 -m py_compile varek/v1_4/tools/varek_anchor_forward.py varek/v1_4/tools/varek_audit.py varek/v1_4/tools/varek_cyclonedx.py varek/v1_4/tools/varek_bench.py varek/v1_4/tools/varek_node_export.py varek/v1_4/tools/varek_vm.py varek/v1_4/tools/varek_suggest.py varek/v1_4/tools/varek_mcp_tools.py varek/v1_4/integrations/palantir/omcp_measure.py varek/v1_4/integrations/palantir/omcp_token.py varek/v1_4/integrations/palantir/clients/omcp_agent.py varek/v1_4/integrations/palantir/demo_d5.py
           bash -n varek/v1_4/tools/varek_preflight.sh
           bash -n varek/v1_4/tools/varek_anchor_receiver.sh
       - name: Lint the shipped policies

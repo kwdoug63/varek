@@ -46,7 +46,14 @@ def _post(url, msg, token, proto, session, timeout):
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.headers, r.read()
     except urllib.error.HTTPError as e:
-        raise HttpFail(f"HTTP {e.code}: {e.read(300).decode('utf-8', 'replace').strip()}")
+        body = e.read(65536)
+        try:                       # VAREK refuses a call with a JSON-RPC error (HTTP 403): that is the answer
+            j = json.loads(body)
+            if isinstance(j, dict) and j.get("jsonrpc") == "2.0" and "error" in j:
+                return e.headers, body
+        except ValueError:
+            pass
+        raise HttpFail(f"HTTP {e.code}: {body[:300].decode('utf-8', 'replace').strip()}")
     except urllib.error.URLError as e:
         raise HttpFail(str(e.reason))
 

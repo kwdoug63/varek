@@ -259,11 +259,12 @@ def write_policy(url, tools, approvers=None, timeout=300, now=None, gateway=Fals
             f"mcp gateway {url}",
         ]
     else:
-        out += ["", "require warden 1.42", "proxy inspect",
+        out += ["", "require warden 1.43" if credential else "require warden 1.42", "proxy inspect",
                 *([] if port in (80, 443) else [f"proxy ports {port}"])]
     if cred_line:
         out += [f"# The agent holds only the placeholder ($VAREK_CRED_{credential[0].upper()}); the proxy",
-                "# releases the token into the calls an allow rule below names.", cred_line]
+                "# releases the token into the calls a rule below allows, and into a held call",
+                "# only once a person approves it (v1.43, D10).", cred_line]
     out += [
         f"allow host {host}:{port}",
         f"allow mcp {url} initialize{cred_opt}",
@@ -278,7 +279,7 @@ def write_policy(url, tools, approvers=None, timeout=300, now=None, gateway=Fals
         if verdict == "allow":
             out.append(f"allow mcp {url} tools/call {t['name']}{cred_opt}")
         elif verdict == "step_up":
-            out.append(f"step_up mcp {url} tools/call {t['name']}{hold}")
+            out.append(f"step_up mcp {url} tools/call {t['name']}{cred_opt}{hold}")
         else:
             out.append("#   no rule: refused, as every call no rule names is")
     return "\n".join(out) + "\n"

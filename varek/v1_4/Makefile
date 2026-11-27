@@ -715,7 +715,7 @@ install: warden warden-proxy warden-secrets warden-notify tools/vdp_check tools/
 	install -d -m 0755 $(DESTDIR)$(PREFIX)/integrations/palantir/clients
 	install -m 0644 integrations/palantir/README.md integrations/palantir/omcp.policy.example \
 	    integrations/palantir/varek-omcp-token.service $(DESTDIR)$(PREFIX)/integrations/palantir/
-	install -m 0755 integrations/palantir/omcp_token.py integrations/palantir/omcp_measure.py $(DESTDIR)$(PREFIX)/integrations/palantir/
+	install -m 0755 integrations/palantir/omcp_token.py integrations/palantir/omcp_measure.py integrations/palantir/demo_d5.py $(DESTDIR)$(PREFIX)/integrations/palantir/
 	install -m 0644 integrations/palantir/clients/vscode-mcp.json integrations/palantir/clients/claude_agent_sdk.py \
 	    $(DESTDIR)$(PREFIX)/integrations/palantir/clients/
 	install -m 0755 integrations/palantir/clients/omcp_agent.py $(DESTDIR)$(PREFIX)/integrations/palantir/clients/

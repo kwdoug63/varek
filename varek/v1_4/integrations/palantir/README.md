@@ -26,7 +26,8 @@ What is here:
 | `omcp.policy.example` | A policy for the stand-in, as `varek mcp tools --gateway` writes it |
 | `clients/vscode-mcp.json` | VS Code's MCP configuration, pointed at the gateway |
 | `clients/claude_agent_sdk.py` | A Claude Agent SDK agent, pointed at the gateway |
-| `clients/omcp_agent.py` | A headless MCP client for scripts and the recorded run |
+| `clients/omcp_agent.py` | A headless MCP client for scripts |
+| `demo_d5.py` | The recorded run's agent: a read, and writes approved, refused and timed out |
 
 Commands below run **on the Linux host that runs VAREK**, as root where
 they say `sudo`. Installed, these files are in `/opt/varek/integrations/palantir/`.
@@ -141,9 +142,23 @@ varek approve RUN ID --reason '...'  # allow it (a v1.42 grant: this tool, this 
 varek deny RUN ID --reason '...'     # refuse it
 ```
 
-Unanswered, it is refused when the rule's `timeout=` passes. Afterwards,
+The held rule names the token too (`credential=omcp`): it goes into the
+call only once a person approves it, never while it is held or after a
+refusal. Unanswered, it is refused when the rule's `timeout=` passes. Afterwards,
 `varek refusals` lists what was refused and why, and the run's verdict
 stream audits as every run's does.
+
+To show all of it in one run (the plan's D5, for a recording):
+
+```
+sudo varek run --policy /etc/varek/omcp.policy --env OMCP_GATEWAY_URL -- \
+  python3 /opt/varek/integrations/palantir/demo_d5.py # end
+```
+
+It makes five calls in turn: a read (allowed), a create (approve it), a
+status change (deny it), a delete (leave it until its timeout) and a tool
+no rule names (refused at once), printing each outcome and how long it
+took. `--tools` names an enrollment's own five tools.
 
 ## 7. Notice when the server's tools change
 
@@ -160,9 +175,6 @@ has no rule, so it is refused until the policy is rewritten and reviewed.
 - **Arguments are not decided** (plan, D6): a rule names the method and
   the tool, not which object an action changes. The approver sees the tool;
   `--intent` (v1.42) gives them the user's request.
-- **A held call and the token.** In v1.42's grammar only an `allow` rule
-  releases a credential, so a held action that a person approves reaches
-  the server without the token. Open as the plan's D10.
 - **A Host header with a port** (`HOST:80`) is refused; MCP clients send
   the name alone for the default port.
 - **The Defense build** refuses a policy with a gateway until the plan's

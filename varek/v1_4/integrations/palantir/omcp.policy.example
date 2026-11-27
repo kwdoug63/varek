@@ -20,7 +20,8 @@ proxy on
 proxy ports 80 443
 mcp gateway https://omcp.example.com/mcp/app1
 # The agent holds only the placeholder ($VAREK_CRED_OMCP); the proxy
-# releases the token into the calls an allow rule below names.
+# releases the token into the calls a rule below allows, and into a held call
+# only once a person approves it (v1.43, D10).
 credential omcp from file:/etc/varek/palantir/omcp.token audience=https://omcp.example.com/mcp/app1
 allow host omcp.example.com:443
 allow mcp https://omcp.example.com/mcp/app1 initialize credential=omcp
@@ -28,12 +29,12 @@ allow mcp https://omcp.example.com/mcp/app1 notifications/initialized credential
 allow mcp https://omcp.example.com/mcp/app1 tools/list credential=omcp
 
 # create-osdk-todo-task: no read-only annotation (Create Todo Task)
-step_up mcp https://omcp.example.com/mcp/app1 tools/call create-osdk-todo-task mode=hold timeout=300 approvers=ontology-approvers
+step_up mcp https://omcp.example.com/mcp/app1 tools/call create-osdk-todo-task credential=omcp mode=hold timeout=300 approvers=ontology-approvers
 # delete-osdk-todo-task: the server marks it destructive (Delete Todo Task)
-step_up mcp https://omcp.example.com/mcp/app1 tools/call delete-osdk-todo-task mode=hold timeout=300 approvers=ontology-approvers
+step_up mcp https://omcp.example.com/mcp/app1 tools/call delete-osdk-todo-task credential=omcp mode=hold timeout=300 approvers=ontology-approvers
 # get-overdue-osdk-todo-tasks: the server marks it read-only (Overdue tasks)
 allow mcp https://omcp.example.com/mcp/app1 tools/call get-overdue-osdk-todo-tasks credential=omcp
 # modify-osdk-todo-task-status: the server marks it as writing (Modify Todo Task Status)
-step_up mcp https://omcp.example.com/mcp/app1 tools/call modify-osdk-todo-task-status mode=hold timeout=300 approvers=ontology-approvers
+step_up mcp https://omcp.example.com/mcp/app1 tools/call modify-osdk-todo-task-status credential=omcp mode=hold timeout=300 approvers=ontology-approvers
 # search-osdk-todo-task: the server marks it read-only (Search Todo Task)
 allow mcp https://omcp.example.com/mcp/app1 tools/call search-osdk-todo-task credential=omcp

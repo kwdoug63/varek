@@ -16,6 +16,13 @@
 #      Host naming another port refused; TLS and plain HTTP straight to the
 #      server's port refused (gateway_host), so nothing reaches the server
 #      but the calls the policy allows; the records; and the audit.
+#      Then D10 and step 6's rehearsal: the policy `varek mcp tools --gateway`
+#      writes, with the token on its held rules, and the recorded run's agent
+#      (integrations/palantir/demo_d5.py) with an approver on the approvers'
+#      socket: a read allowed; a write approved and sent with the token; a
+#      write refused by the approver and one nobody answered, neither sent;
+#      a tool no rule names refused; and the audit. Section 1 also reads
+#      credential= on step_up mcp rules (1.43) in all three parsers.
 #   test_v1430.sh VDP_CHECK VDP_CERT_CHECK [WARDEN]
 set -u
 VDP="$1"; CERT="$2"; WARDEN="${3:-}"
@@ -73,6 +80,16 @@ bad_pol "one host on two ports" "require warden 1.43\nproxy on\nproxy ports 80 4
 bad_pol "no URL" "require warden 1.43\nproxy on\nmcp gateway\n"
 bad_pol "a query in the URL" "require warden 1.43\nproxy on\nmcp gateway https://omcp.example.com/mcp?x=1\n"
 bad_pol "an mcp rule under proxy on for another URL" "require warden 1.43\nproxy on\n$G\nallow mcp https://other.example.com/mcp tools/list\n"
+# D10: a held mcp rule may carry its server's token, released only once a person approves
+C='credential tok from file:/etc/varek/tok audience=https://omcp.example.com/mcp/app1 opaque'
+SU='step_up mcp https://omcp.example.com/mcp/app1 tools/call create'
+ok_pol  "D10: credential= on a step_up mcp rule, its options after" "require warden 1.43\nproxy on\n$C\n$G\n$R\n$SU credential=tok mode=hold timeout=60\n"
+ok_pol  "D10: credential= and header= on a step_up mcp rule" "require warden 1.43\nproxy inspect\ncredential k from file:/k\nallow host omcp.example.com:443\n$SU credential=k header=X-Api-Key mode=grant\n"
+bad_pol "D10: credential= on a step_up mcp rule before 1.43" "require warden 1.42\nproxy inspect\n$C\nallow host omcp.example.com:443\n$SU credential=tok mode=hold\n"
+bad_pol "D10: max_body= on a step_up mcp rule" "require warden 1.43\nproxy on\n$G\n$R\n$SU max_body=1k mode=hold\n"
+bad_pol "D10: credential= on a deny mcp rule" "require warden 1.43\nproxy on\n$C\n$G\n$R\ndeny mcp https://omcp.example.com/mcp/app1 tools/call create credential=tok\n"
+bad_pol "D10: a held rule's token for another server" "require warden 1.43\nproxy on\n$C\n$G\n$R\nstep_up mcp https://other.example.com/mcp tools/call create credential=tok\n"
+bad_pol "D10: credential= on a step_up request rule" "require warden 1.43\nproxy inspect\ncredential k from file:/k\nallow host a.example.com:443\nstep_up request POST https://a.example.com/x credential=k header=Authorization\n"
 printf "require warden 1.43\nproxy on\n$G\n$R\nstep_up mcp https://omcp.example.com/mcp/app1 tools/call create-* mode=hold timeout=60\n" > "$OUT/p.txt"
 q=$(printf 'mcp - %s\nmcp - %s\nmcp - %s\n' \
     "$(printf '%s' 'https://omcp.example.com:443/mcp/app1#tools/list#' | od -An -tx1 | tr -d ' \n')" \
@@ -144,7 +161,7 @@ for l in open(sys.argv[1]):
 sys.exit(0 if n == int(sys.argv[3]) else 1)
 PY
     }
-    rec() { python3 - "$OUT/g.log" "$1" <<'PY'
+    rec() { python3 - "${RECLOG:-$OUT/g.log}" "$1" <<'PY'
 import json, sys
 recs = [json.loads(l[l.index("{"):]) for l in open(sys.argv[1], errors="replace") if l.startswith("{")]
 M = [r for r in recs if r.get("action") == "net.mcp"]
@@ -183,6 +200,73 @@ PY
         rec "len(M) >= 9 and all(r.get('url', r.get('target', '')).startswith('https://omcp.example.com:$PS/mcp/app1') or 'https://omcp.example.com:$PS/mcp/app1' in json.dumps(r) for r in M)"
     check "the audit verifies the run (each call within the policy, the chain intact)" \
         sh -c "python3 '$HERE/tools/varek_audit.py' --policy '$POL' --checker '$CERT' '$OUT/g.log' > '$OUT/audit.out' 2>&1"
+
+    # v1.43 D10 and step 6's rehearsal: the policy as `varek mcp tools --gateway` writes it, the
+    # recorded run's agent (integrations/palantir/demo_d5.py), and an approver that approves the
+    # create, refuses the modify and leaves the delete to time out
+    cp "$X/tok" "$X/omcp.tok"; chmod 600 "$X/omcp.tok"
+    python3 -c "import sys,json; sys.path.insert(0,'$HERE/tests'); import v1430_omcp_server as s; print(json.dumps({'tools': s.tool_defs('base')}))" > "$OUT/tools.json"
+    POL3="$OUT/d5.policy"
+    python3 "$HERE/tools/varek" mcp tools "$U" --from "$OUT/tools.json" --gateway --credential omcp \
+        --credential-from "file:$X/omcp.tok" --opaque --timeout 20 > "$POL3.w" 2> "$OUT/d5.writer"
+    sed -e "s/\(tools\/call delete-osdk-todo-task .*\)timeout=20/\1timeout=3/" "$POL3.w" > "$POL3"
+    printf 'allow path /usr/ readonly\nallow path /lib readonly\nallow path /etc/ readonly\nallow path %s/ readonly\n' "$X/d5" >> "$POL3"
+    mkdir -p "$X/d5/clients"
+    cp "$HERE/integrations/palantir/demo_d5.py" "$X/d5/"; cp "$HERE/integrations/palantir/clients/omcp_agent.py" "$X/d5/clients/"
+    chmod 755 "$X/d5" "$X/d5/clients"; chmod 644 "$X/d5/demo_d5.py" "$X/d5/clients/omcp_agent.py"
+    : > "$OUT/got.jsonl"
+    env -i PATH=/usr/bin:/bin OMCP_GATEWAY_URL="http://omcp.example.com/mcp/app1" timeout 180 "$WARDEN" "$POL3" \
+        --dns-server "127.0.0.1:$DP" --trust-bundle "$X/bundle.pem" -- \
+        /usr/bin/python3 "$X/d5/demo_d5.py" > "$OUT/d5.out" 2> "$OUT/d5.log" &
+    WP3=$!
+    SOCK=""; for _ in $(seq 60); do SOCK="$(grep -o '/run/varek-approve/[0-9a-f]*\.sock' "$OUT/d5.log" 2>/dev/null | head -1)"; [ -n "$SOCK" ] && [ -S "$SOCK" ] && break; sleep 0.25; done
+    python3 -I - "$SOCK" > "$OUT/d5.apv" 2>&1 <<'PY' &
+import json, socket, sys, time
+def ask(req):
+    s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(req.encode()); s.shutdown(socket.SHUT_WR)
+    out = b""
+    while True:
+        b = s.recv(65536)
+        if not b: return out.decode()
+        out += b
+done = set()
+while True:
+    try:
+        for l in ask("pending").splitlines():
+            if not l.startswith("{"): continue
+            p = json.loads(l); i = p.get("id"); t = json.dumps(p)
+            if not i or i in done: continue
+            if "create-osdk-todo-task" in t: print("approve", ask(f"approve {i}\nreason demo").split()[0]); done.add(i)
+            elif "modify-osdk-todo-task-status" in t: print("deny", ask(f"deny {i}\nreason demo").split()[0]); done.add(i)
+    except OSError:
+        break
+    time.sleep(0.1)
+PY
+    APV=$!
+    wait $WP3; wait $APV 2>/dev/null
+    sed 's/^/     /' "$OUT/d5.out" | cut -c1-170
+    step() { grep -q "^STEP $1 $2 " "$OUT/d5.out"; }
+    rec5() { RECLOG="$OUT/d5.log" rec "$1"; }
+    check "D10: the writer's gateway policy loads, with the token on the held rules" \
+        sh -c "grep -q 'step_up mcp $U tools/call create-osdk-todo-task credential=omcp mode=hold' '$POL3' && '$HERE/tools/vdp_check' '$POL3' lint > /dev/null"
+    check "D5 read: allowed, sent with the token" step read ran
+    check "D5 write approved: held, approved, and run" step write-approved ran
+    check "D10: the approved write reached the server once, with the real token (a held call carries it once approved)" \
+        got "nm == 'create-osdk-todo-task'" 1
+    check "D5 write denied: held, refused by the approver, never sent; the agent is told why" \
+        sh -c "grep '^STEP write-denied refused ' '$OUT/d5.out' | grep -q 'which was not given' && ! grep -q 'modify-osdk-todo-task-status' '$OUT/got.jsonl'"
+    check "D5 write timed out: held about 3 s, then refused, never sent" \
+        sh -c "grep -Eq '^STEP write-timed-out refused [3-9]\.[0-9]s' '$OUT/d5.out' && ! grep -q 'delete-osdk-todo-task' '$OUT/got.jsonl'"
+    check "D5 unnamed tool: refused at once, never sent" \
+        sh -c "grep -Eq '^STEP unnamed-tool refused [0-2]\.[0-9]s' '$OUT/d5.out' && ! grep -q 'archive-osdk-todo-task' '$OUT/got.jsonl'"
+    check "D10: no request reached the server without the token" got "r.get('status') == 401" 0
+    check "D10: the approved write's record carries the credential, under its grant" \
+        rec5 "any(r.get('mcp_name') == 'create-osdk-todo-task' and r.get('decision_final') == 'ALLOW' and r.get('credential') == 'omcp' and r.get('cert_grant') for r in M)"
+    check "D10: the refused writes' records carry no credential" \
+        rec5 "all('credential' not in r for r in M if r.get('decision_final') != 'ALLOW')" 
+    check "the audit verifies the D5 run (a credential released only under its rule's grant)" \
+        sh -c "python3 '$HERE/tools/varek_audit.py' --policy '$POL3' --checker '$CERT' '$OUT/d5.log' > '$OUT/d5.audit' 2>&1"
+    check "the token is in no record of the D5 run" sh -c "! grep -q '$TOKV' '$OUT/d5.log' '$OUT/d5.out'"
 
     # a server whose certificate the bundle does not vouch for: 502, nothing sent
     kill $SRV 2>/dev/null; sleep 0.3

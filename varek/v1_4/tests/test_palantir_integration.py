@@ -246,6 +246,9 @@ def test_writer_gateway_and_credential_text():
     assert f"credential omcp from file:/etc/varek/palantir/omcp.token audience={URL} opaque" in lines
     assert f"allow mcp {URL} tools/call search-osdk-todo-task credential=omcp" in lines
     assert f"allow mcp {URL} tools/list credential=omcp" in lines
+    # D10: a held action carries the token too, released only once a person approves it
+    assert (f"step_up mcp {URL} tools/call create-osdk-todo-task credential=omcp mode=hold timeout=300 "
+            "approvers=ontology-approvers") in lines
     assert "http://omcp.example.com/mcp/app1 (port 80)" in t
 
 
@@ -328,6 +331,7 @@ def test_client_configs_point_at_the_gateway():
     assert s["url"] == gw and s["type"] == "http" and "VAREK_CRED_OMCP" in s["headers"]["Authorization"]
     sdk = open(os.path.join(PAL, "clients", "claude_agent_sdk.py")).read()
     assert gw in sdk and "VAREK_CRED_OMCP" in sdk
+    subprocess.run([sys.executable, "-m", "py_compile", os.path.join(PAL, "demo_d5.py")], check=True)
     for f in ("claude_agent_sdk.py", "omcp_agent.py"):
         subprocess.run([sys.executable, "-m", "py_compile", os.path.join(PAL, "clients", f)], check=True)
     subprocess.run([sys.executable, "-m", "py_compile", REFRESHER], check=True)

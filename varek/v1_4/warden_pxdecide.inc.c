@@ -1169,6 +1169,10 @@ static int px_mcpreq_decide(const struct policy *p, struct px_open *o, struct wp
         else if (!strcmp(rule, "outside_plan")) { }          /* v1.35 step 4: said above */
         else if (d_raw == DEC_DENY) snprintf(why, sizeof why, "the policy denies it (line %d)", a->policy_line);
         else snprintf(why, sizeof why, "no mcp rule allows it");
+        /* v1.43: a held call's refusal says so, as a held request's does */
+        if (hold == PXH_REFUSE)
+            snprintf(why, sizeof why, "held for a person's approval, which was not given (policy line %d)",
+                     a->policy_line);
     }
     /* v1.29: a dry run relays a call the policy refuses (not one that could
      * not be read), with no credential, as not enforced */
