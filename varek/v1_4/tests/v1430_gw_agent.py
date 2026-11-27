@@ -56,7 +56,9 @@ def call(tag, method, params=None, rid=None, path="/mcp/app1", host=H, port=80, 
     try:
         s = socket.create_connection((H, port), 15)
         if tls:
-            s = ssl.create_default_context().wrap_socket(s, server_hostname=H)
+            ctx = ssl.create_default_context()
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            s = ctx.wrap_socket(s, server_hostname=H)
         s.sendall(head.encode() + body)
         line, hd = response(s)
         s.close()
