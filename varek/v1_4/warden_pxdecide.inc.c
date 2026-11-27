@@ -32,6 +32,21 @@
  *   resolution_failed (no address), address_refused (every address special,
  *   synthetic or denied). */
 
+/* v1.42 step 3b: holding at the proxy (warden_grant.inc.c) */
+enum { PXH_DECIDE = 0, PXH_AGAIN = 1, PXH_REFUSE = 2 };     /* the decide functions' hold */
+enum { PXH_HTTP = 1, PXH_MCP = 2 };                         /* what is held */
+/* v1.42 step 5: the deciding rule of an allowed call, or (a grant under the
+ * `on unknown` line: no rule decided it) a rule with no body limit and no
+ * credential */
+static const vdp_rule_t *px_rl(const struct policy *p, const struct action *a) {
+    static const vdp_rule_t none;
+    return a->rule_index >= 0 && (size_t)a->rule_index < p->v.n ? &p->v.rules[a->rule_index] : &none;
+}
+static bool op_take(const struct action *a, decision_t d_raw, const char *rule_id, uint64_t latency_ns,
+                    int what, uint64_t conn, const void *msg, size_t len, bool f1, bool f2, int cred);   /* v1.42 step 5b */
+static bool px_hold_take(const struct action *a, decision_t d_raw, int what, uint64_t conn, const void *msg,
+                         size_t len, bool f1, bool f2);
+
 #define PX_MAX_DIAL   64                 /* requests waiting on a lookup or a dial */
 #define PX_DIAL_MS    5000               /* per address */
 #define PX_MAX_TRIES  4                  /* addresses tried per request */
@@ -221,7 +236,7 @@ static void px_close_record(uint64_t id, const char *why, const struct wp_close 
         static const uint8_t zero[32];
         if (memcmp(m->server_cert, zero, sizeof zero)) {
             char hx[65];
-            sodium_bin2hex(hx, sizeof hx, m->server_cert, sizeof m->server_cert);
+            vfips_bin2hex(hx, sizeof hx, m->server_cert, sizeof m->server_cert);
             fprintf(f, "\"server_cert_sha256\":\"%s\",", hx);
         }
         if (m->tls_why[0]) {
@@ -237,6 +252,9 @@ static void px_close_record(uint64_t id, const char *why, const struct wp_close 
 
 struct policy;
 static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m);
+static int px_httpreq_decide(const struct policy *p, struct px_open *o, const struct wp_httpreq *m, bool mcp_ep,
+                             bool mcp_var, int hold);                /* v1.42 step 3b */
+static int px_mcpreq_decide(const struct policy *p, struct px_open *o, struct wp_mcpreq *m, int hold);
 
 /* A close report: 0, or -1 (not a connection passed to the proxy and still
  * open, or a malformed report: the proxy is not behaving). */
@@ -811,6 +829,18 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
             return 0;
         }
     }
+    return px_httpreq_decide(p, o, m, mcp_ep, mcp_var, PXH_DECIDE);
+}
+
+/* v1.42 step 3b: an inspected request decided (after px_httpreq's checks,
+ * once). hold: PXH_DECIDE, and a request a mode=hold rule refuses is held
+ * (no verdict: px_hold_take); PXH_AGAIN, a held request decided again after
+ * its approval; PXH_REFUSE, a held request refused (denied, or past its
+ * time), recorded naming its proposal. */
+static int px_httpreq_decide(const struct policy *p, struct px_open *o, const struct wp_httpreq *m, bool mcp_ep,
+                             bool mcp_var, int hold) {
+    const char *ob = m->object;
+    size_t ol = strlen(ob);
     struct action *a = calloc(1, sizeof *a);
     if (!a) return -1;
     struct timespec t0, t1;
@@ -824,6 +854,12 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     decision_t d_final = d_raw == DEC_ALLOW ? DEC_ALLOW : DEC_DENY;
     const char *rule = mcp_ep ? "mcp_query" : mcp_var ? "mcp_endpoint_variant"
                      : d_raw == DEC_ALLOW ? "request_allowed" : decision_rule_id(a, d_raw);
+    /* v1.42 step 3b: held (no verdict yet), or a held one's refusal */
+    if (hold == PXH_DECIDE && !mcp_ep && !mcp_var && px_hold_take(a, d_raw, PXH_HTTP, m->id, m, sizeof *m, false, false)) {
+        free(a);
+        return 0;
+    }
+    if (hold == PXH_REFUSE) d_final = DEC_DENY;
     uint64_t maxb = 0;
     char why[96];
     if (d_final == DEC_ALLOW && !certify(p, a)) {
@@ -833,16 +869,22 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
         fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n", g_records, a->check_why);
     }
     if (d_final == DEC_ALLOW) {
-        maxb = p->v.rules[a->rule_index].max_body;
+        maxb = px_rl(p, a)->max_body;
         if (maxb && m->body == WP_BODY_LENGTH && m->body_len > maxb) {
             d_final = DEC_DENY;
             rule = "max_body";
         }
     }
     /* v1.35 step 4: a credential no step of the run's plan names */
-    if (d_final == DEC_ALLOW && hold_refuses_cred(p, a, p->v.rules[a->rule_index].cred)) {
+    if (d_final == DEC_ALLOW && hold_refuses_cred(p, a, px_rl(p, a)->cred)) {
         d_final = DEC_DENY;
         rule = "outside_plan";
+        /* v1.42 step 5b: deferred until a plan extension names the credential */
+        if (hold == PXH_DECIDE && op_take(a, d_raw, rule, 0, PXH_HTTP, m->id, m, sizeof *m, false, false,
+                                          px_rl(p, a)->cred)) {
+            free(a);
+            return 0;
+        }
     }
     /* v1.29: a dry run relays a request the policy refuses, with no
      * credential and no body limit, as not enforced */
@@ -857,6 +899,7 @@ static int px_httpreq(const struct policy *p, const struct wp_httpreq *m) {
     else if (mcp_var) snprintf(why, sizeof why, "another spelling of an MCP endpoint (its case or a trailing /)");
     else if (d_raw == DEC_DENY) snprintf(why, sizeof why, "the policy denies it (line %d)", a->policy_line);
     else snprintf(why, sizeof why, "no request rule allows it");
+    if (hold == PXH_REFUSE) snprintf(why, sizeof why, "held for a person's approval, which was not given");
     static const char *const kBody[] = { "none", "length", "chunked" };
     snprintf(a->extra, sizeof a->extra, "\"proxy_conn\":%llu,\"request_seq\":%llu,\"body\":\"%s\",",
              (unsigned long long)m->id, (unsigned long long)m->seq, kBody[m->body]);
@@ -961,10 +1004,10 @@ static const char *px_token_refused(const struct px_open *o, const struct wp_mcp
     if (m->token == WP_TOK_NONE || m->token == WP_TOK_PLACEHOLDER) return NULL;
     if (g_identity.has_user) {                /* a copy of the run's user token would be passthrough */
         char hx[65];
-        sodium_bin2hex(hx, sizeof hx, m->token_sha256, sizeof m->token_sha256);
+        vfips_bin2hex(hx, sizeof hx, m->token_sha256, sizeof m->token_sha256);
         char sx[65] = "";
         if (m->token == WP_TOK_JWT)           /* review: or the same claims, signed again (ECDSA's other s) */
-            sodium_bin2hex(sx, sizeof sx, m->token_sin_sha256, sizeof m->token_sin_sha256);
+            vfips_bin2hex(sx, sizeof sx, m->token_sin_sha256, sizeof m->token_sin_sha256);
         if (!strcmp(hx, g_identity.token_sha256) || (sx[0] && !strcmp(sx, g_identity.token_sin_sha256))) {
             snprintf(why, wn, "its bearer token is the run's user token, which no call may pass on");
             return "mcp_token_user";
@@ -1002,6 +1045,12 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
         return -1;
     for (uint32_t k = 0; k < WP_AUD_MAX; k++) if (!memchr(m->aud[k], 0, sizeof m->aud[k])) return -1;
     o->mcp_seq = 0;
+    return px_mcpreq_decide(p, o, m, PXH_DECIDE);
+}
+
+/* v1.42 step 3b: an MCP call decided (after px_mcpreq's checks, once);
+ * hold as px_httpreq_decide's */
+static int px_mcpreq_decide(const struct policy *p, struct px_open *o, struct wp_mcpreq *m, int hold) {
     struct action *a = calloc(1, sizeof *a);
     if (!a) return -1;
     struct timespec t0, t1;
@@ -1037,6 +1086,15 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
         d_raw = policy_decide(p, a);
         d_final = d_raw == DEC_ALLOW ? DEC_ALLOW : DEC_DENY;
         rule = d_raw == DEC_ALLOW ? "mcp_allowed" : decision_rule_id(a, d_raw);
+        /* v1.42 step 3b: held (no verdict yet), or a held one's refusal */
+        if (hold == PXH_DECIDE && px_hold_take(a, d_raw, PXH_MCP, m->id, m, sizeof *m, false, false)) {
+            free(a);
+            return 0;
+        }
+        if (hold == PXH_REFUSE) {
+            d_final = DEC_DENY;
+            snprintf(why, sizeof why, "held for a person's approval, which was not given");
+        }
         if (d_final == DEC_ALLOW && !certify(p, a)) {
             d_final = DEC_DENY;
             rule = "certificate_refused";
@@ -1044,7 +1102,7 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
             fprintf(g_log, "[warden] certificate refused (record seq %" PRIu64 "): %s\n", g_records, a->check_why);
         }
         if (d_final == DEC_ALLOW) {
-            maxb = p->v.rules[a->rule_index].max_body ? p->v.rules[a->rule_index].max_body : MCP_BODY_DEFAULT;
+            maxb = px_rl(p, a)->max_body ? px_rl(p, a)->max_body : MCP_BODY_DEFAULT;
             if (m->body_len > maxb) {
                 d_final = DEC_DENY;
                 rule = "max_body";
@@ -1052,21 +1110,29 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
         }
         /* v1.31 step 5: an MCP token past its expiry is not released (the
          * store is to hold a current one; VAREK does not refresh it, D8) */
-        int ce = d_final == DEC_ALLOW ? p->v.rules[a->rule_index].cred : 0;
+        int ce = d_final == DEC_ALLOW ? px_rl(p, a)->cred : 0;
         if (ce > 0 && p->v.creds[ce - 1].audience[0] && g_cred_meta[ce - 1].exp > 0 &&
             g_cred_meta[ce - 1].exp <= (int64_t)time(NULL)) {
             d_final = DEC_DENY;
             rule = "credential_expired";
         }
         /* v1.35 step 4: a call, or a credential it carries, no step of the run's plan names */
+        int opc = 0;
         if (d_final == DEC_ALLOW && hold_refuses(a)) {
             d_final = DEC_DENY;
             rule = "outside_plan";
             snprintf(why, sizeof why, "no step of the run's plan names this call");
-        } else if (d_final == DEC_ALLOW && hold_refuses_cred(p, a, p->v.rules[a->rule_index].cred)) {
+        } else if (d_final == DEC_ALLOW && hold_refuses_cred(p, a, px_rl(p, a)->cred)) {
             d_final = DEC_DENY;
             rule = "outside_plan";
+            opc = px_rl(p, a)->cred;
             snprintf(why, sizeof why, "it carries a credential no step of the run's plan names");
+        }
+        /* v1.42 step 5b: deferred until a plan extension covers it */
+        if (hold == PXH_DECIDE && !strcmp(rule, "outside_plan") &&
+            op_take(a, d_raw, rule, 0, PXH_MCP, m->id, m, sizeof *m, false, false, opc)) {
+            free(a);
+            return 0;
         }
         if (d_final == DEC_ALLOW) snprintf(why, sizeof why, "allowed");
         else if (!strcmp(rule, "max_body"))
@@ -1085,7 +1151,7 @@ static int px_mcpreq(const struct policy *p, struct wp_mcpreq *m) {
     bool dry_allow = m->ok == WP_MCP_OK && d_final != DEC_ALLOW && dry_let(a, rule);
     if (dry_allow) snprintf(why, sizeof why, "dry run");
     char hx[65];
-    sodium_bin2hex(hx, sizeof hx, m->sha256, sizeof m->sha256);
+    vfips_bin2hex(hx, sizeof hx, m->sha256, sizeof m->sha256);
     size_t el;
     bool cut = false;
     snprintf(a->extra, sizeof a->extra, "\"proxy_conn\":%llu,\"request_seq\":%llu,\"mcp_url\":\"%s\",",
@@ -1180,7 +1246,7 @@ static int px_httpbody(const struct wp_httpbody *m) {
     o->body_seq = 0;
     if (m->exceeded == 1) o->cut = true;
     char hx[65];
-    sodium_bin2hex(hx, sizeof hx, m->sha256, sizeof m->sha256);
+    vfips_bin2hex(hx, sizeof hx, m->sha256, sizeof m->sha256);
     FILE *f = rec_begin();
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

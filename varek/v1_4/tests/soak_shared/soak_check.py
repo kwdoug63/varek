@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""soak_check.py — judge a shared soak (soak.sh) of v1.28.1, v1.29.0 and
-v1.31.0. Three runs side by side:
+"""soak_check.py — judge a shared soak (soak.sh) of v1.28.1, v1.29.0,
+v1.31.0 and v1.42.0's approvals. Four runs side by side:
 
   A  (v1.28.1, v1.31.0) the agent on behalf of a verified user, two confined
      MCP servers kept for the run, MCP calls of its own, sub-agents. Shown:
@@ -27,6 +27,14 @@ v1.31.0. Three runs side by side:
      false), the audit says DRY RUN, NOT ENFORCED (exit 3); varek policy
      suggest's draft lints and loads in the checker, and a dry run under it
      lets through only the system calls the draft notes it cannot admit.
+  D  (v1.42.0) approvals: every turn a held read approved by the script
+     (soak_approver.py) through a runtime grant, and a read allowed under
+     the standing grant, signed by the run's approver key; every tenth turn
+     a deferred read refused at its timeout. Shown: each turn as expected;
+     one proposal, one approval and one grant a turn, each ending approved;
+     the standing grant recorded once, signed, and used once a turn; each
+     deferral ending timeout, its read refused; nothing else held or
+     refused; the audit passes (the standing grant's signature verified).
 
 It also reports the time each task took, the Warden's time per decision for
 each subject, and each process's memory over the run (rss.tsv).
@@ -397,6 +405,86 @@ def check_work(a, say, problems, D, name, dry):
                             f"{other[0].get('action')} {other[0].get('target')})")
 
 
+def check_d(a, say, problems, D):
+    W = os.path.join(D, "d")
+    agent = load(os.path.join(W, "agent.jsonl"))
+    recs = load(os.path.join(W, "verdicts.log"))
+    apv = load(os.path.join(W, "approvals.jsonl"))
+    rs = next((r for r in recs if r.get("event") == "run_start"), {})
+    say(f"D (v1.42.0): Warden {rs.get('warden', '?')}, run {rs.get('run', '?')}, {len(recs)} records"
+        + ("" if any(r.get("event") == "run_end" for r in recs) else " (no run_end)"))
+    if not rs:
+        problems.append("D: no run_start (see d/verdicts.log)")
+        return
+    if not any(r.get("event") == "run_end" for r in recs):
+        problems.append("D: the stream has no run_end")
+    try:
+        if tuple(int(x) for x in str(rs.get("warden", "0.0")).split(".")[:2]) < (1, 42):
+            problems.append(f"D: the Warden is {rs.get('warden')}, not 1.42 or later")
+    except ValueError:
+        problems.append(f"D: the Warden's version {rs.get('warden')!r}")
+    turns = [r for r in agent if "task" in r]
+    want = int(a.hours * 3600 / a.interval)
+    held_ok = sum(1 for r in turns if r.get("held") is True)
+    st_ok = sum(1 for r in turns if r.get("standing") is True)
+    dturns = [r for r in turns if "defer" in r]
+    d_ref = sum(1 for r in dturns if r.get("defer") == 13)
+    say(f"  turns: {len(turns)} (about {want} expected); held reads approved {held_ok}/{len(turns)}, "
+        f"under the standing grant {st_ok}/{len(turns)}, deferred reads refused at the timeout {d_ref}/{len(dturns)}")
+    if len(turns) < 0.9 * want:
+        problems.append(f"D: only {len(turns)} turns of about {want}")
+    for r in [r for r in turns if not r.get("ok")][:10]:
+        problems.append(f"D: turn {r.get('turn')} not as expected: {r}")
+    if len(turns) >= 10 and not dturns:
+        problems.append("D: no deferral ran")
+    hl = sorted(r["held_ms"] for r in turns if r.get("held") is True)
+    if hl:
+        say(f"  a held read, proposed to approved and done: p50 {pct(hl, .5)} ms, p99 {pct(hl, .99)} ms")
+    dl = sorted(r["defer_ms"] for r in dturns if "defer_ms" in r)
+    if dl:
+        say(f"  a deferred read, to its refusal: p50 {pct(dl, .5)} ms")
+    ends = {}
+    for r in recs:
+        if r.get("event") == "step_up_end":
+            ends[r.get("ending")] = ends.get(r.get("ending"), 0) + 1
+    grants = [r for r in recs if r.get("event") == "grant"]
+    runtime = [r for r in grants if not r.get("standing")]
+    standing = [r for r in grants if r.get("standing") is True]
+    props = [r for r in recs if r.get("event") == "step_up"]
+    dends = {}
+    for r in recs:
+        if r.get("event") == "defer_end":
+            dends[r.get("ending")] = dends.get(r.get("ending"), 0) + 1
+    say(f"  records: {len(props)} proposals (held), endings {ends}, {len(runtime)} runtime grants, "
+        f"{len(standing)} standing; deferrals' endings {dends}")
+    approved = sum(1 for r in apv if str(r.get("answer", "")).startswith("approved"))
+    say(f"  the approver: {approved} approvals" + (f", {sum(1 for r in apv if 'error' in r)} errors"
+                                                   if any("error" in r for r in apv) else ""))
+    if ends.get("approved", 0) != held_ok or len(runtime) != held_ok or approved != held_ok:
+        problems.append(f"D: {held_ok} held reads approved, but {ends.get('approved', 0)} approved endings, "
+                        f"{len(runtime)} runtime grants and {approved} approvals")
+    if len(props) != ends.get("approved", 0) + ends.get("abandoned", 0) or ends.get("abandoned", 0) > 1 \
+            or ends.get("denied") or ends.get("timeout"):
+        problems.append(f"D: proposals {len(props)}, endings {ends}: a proposal not approved")
+    if len(standing) != 1 or not standing[0].get("signed_by") or not standing[0].get("sig"):
+        problems.append(f"D: the standing grant is not recorded once, signed ({len(standing)})")
+    else:
+        uses = sum(1 for r in recs if r.get("cert_grant") == standing[0]["id"] and r.get("decision_final") == "ALLOW")
+        say(f"  the standing grant {standing[0]['id'][:16]}, signed by {standing[0]['signed_by'].get('name')}: used {uses} times")
+        if uses != st_ok:
+            problems.append(f"D: the standing grant used {uses} times for {st_ok} reads")
+    if dends.get("timeout", 0) != len(dturns) or set(dends) - {"timeout", "abandoned"} or dends.get("abandoned", 0) > 1:
+        problems.append(f"D: {len(dturns)} deferred reads, but the deferrals' endings are {dends}")
+    held_ref = sum(1 for r in recs if r.get("held") is True and r.get("decision_final") == "DENY")
+    if held_ref != d_ref:
+        problems.append(f"D: {held_ref} held calls refused, for {d_ref} deferred reads refused")
+    lat = sorted(r["latency_us"] for r in recs if isinstance(r.get("latency_us"), int) and "step_up" not in r
+                 and not r.get("held") and r.get("cert_grant") is None)
+    if lat:
+        say(f"  the Warden's decision, calls not held: p50 {pct(lat, .5)} us, p99 {pct(lat, .99)} us ({len(lat)})")
+    audit(say, problems, "D", os.path.join(W, "policy.txt"), a.checker, os.path.join(W, "verdicts.log"), a.pubkey, 0)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", required=True)
@@ -414,10 +502,11 @@ def main():
     say = out.append
     D = a.dir
     values = json.load(open(a.values))
-    say(f"soak_check: the shared soak (v1.28.1, v1.29.0, v1.31.0) in {D}: {a.hours} h, a turn every {a.interval} s")
+    say(f"soak_check: the shared soak (v1.28.1, v1.29.0, v1.31.0, v1.42.0) in {D}: {a.hours} h, a turn every {a.interval} s")
     check_a(a, say, problems, values, D)
     check_work(a, say, problems, D, "b", False)
     check_work(a, say, problems, D, "c", True)
+    check_d(a, say, problems, D)
     try:
         lines = open(os.path.join(D, "rss.tsv")).read().splitlines()
         head = lines[0].split("\t")

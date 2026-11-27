@@ -56,12 +56,18 @@ import subprocess
 import sys
 import time
 
+# v1.41: a chain-2 line (SHA-384 chain, 96 hex; a DER ECDSA P-384 signature,
+# 8 to 104 bytes) or a chain-1 line (SHA-256, 64; Ed25519, 128), each whole
 LINE = re.compile(rb'^\{"run":"[0-9a-f]{32}","event":"(run_start|checkpoint|run_end)",'
-                  rb'"records":(0|[1-9][0-9]{0,19}),"chain":"[0-9a-f]{64}"(,"sig":"[0-9a-f]{128}")?,'
+                  rb'"records":(0|[1-9][0-9]{0,19}),'
+                  rb'(?:"chain":"[0-9a-f]{96}"(?:,"sig":"(?:[0-9a-f]{2}){8,104}")?'
+                  rb'|"chain":"[0-9a-f]{64}"(?:,"sig":"[0-9a-f]{128}")?),'
                   rb'"timestamp_ns":(0|[1-9][0-9]{0,18})\}$')
-# v1.36 step 9 (D10): the node agent's key, announced at each start
+# v1.36 step 9 (D10): the node agent's key, announced at each start; v1.41: a
+# P-384 key (its uncompressed point) with its sigalg, or a v1.40 Ed25519 key
 NODE_KEY_LINE = re.compile(rb'^\{"event":"node_key","node":"[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?",'
-                           rb'"key":"[0-9a-f]{64}","timestamp_ns":(0|[1-9][0-9]{0,18})\}$')
+                           rb'(?:"key":"04[0-9a-f]{192}","sigalg":"ecdsa-p384-sha384"|"key":"[0-9a-f]{64}"),'
+                           rb'"timestamp_ns":(0|[1-9][0-9]{0,18})\}$')
 MAX_LINE = 1024
 ROTATE_AT = 16 << 20            # rotate the spool once fully sent and this large
 BATCH_MAX = 1 << 20

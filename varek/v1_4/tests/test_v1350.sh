@@ -141,7 +141,7 @@ check "a kind the Warden does not decide: UNKNOWN, said so" \
     grep -q '"label":"c","kind":"no_such_kind".*"why":"the Warden decides no step of this kind"' "$OUT/mixed.log"
 check "the outcome: a plan_gate record (gate plan, 3 actions, 1 edge, UNSATISFIED)" \
     grep -q '^{"event":"plan_gate","run":"[0-9a-f]*","gate":"plan","plan":"[^"]*mixed.txt","actions":3,"edges":1,"verdict":"UNSATISFIED"' "$OUT/mixed.log"
-[ "$(rec plan_step | grep -c '"chain":"[0-9a-f]\{64\}"')" = 3 ] && rec plan_gate | grep -q '"chain":"[0-9a-f]\{64\}"' \
+[ "$(rec plan_step | grep -c '"chain":"[0-9a-f]\{96\}"')" = 3 ] && rec plan_gate | grep -q '"chain":"[0-9a-f]\{96\}"' \
     && pass "each plan record is chained" || flunk "each plan record is chained"
 python3 "$HERE/tools/varek_audit.py" --policy "$LP" --checker "$CHECKER" "$OUT/mixed.log" > "$OUT/audit" 2>&1 \
     && grep -q 'varek_audit: PASS' "$OUT/audit" && pass "varek_audit accepts the stream (the chain holds)" \
