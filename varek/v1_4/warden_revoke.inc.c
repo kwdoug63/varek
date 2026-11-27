@@ -79,8 +79,11 @@ fail:
             "be revoked\n", strerror(errno));
 }
 
+static void apv_close(void);                     /* v1.42: warden_grant.inc.c */
+
 static void ctl_close(void) {
     if (g_ctl_owner && getpid() != g_ctl_owner) return;
+    apv_close();
     if (g_ctl_listen >= 0) close(g_ctl_listen);
     g_ctl_listen = -1;
     if (g_ctl_path[0]) {

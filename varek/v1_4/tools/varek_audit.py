@@ -21,8 +21,14 @@ policy file alone:
      holder cannot rewrite it), every signed record in the stream must appear
      in the anchor and every anchored record of this run must appear in the
      stream: history that reached the anchor cannot be rewritten even by the
-     key holder. Signatures are verified by tools/varek_ed25519.py (RFC 8032,
-     pure Python), not by the library that made them.
+     key holder. v1.41: the stream says its format in run_start ("log"):
+     chain-2 (SHA-384 chain, ECDSA P-384 signatures, the Warden from v1.41) or
+     chain-1 (SHA-256, Ed25519, v1.16 to v1.40); both are checked.
+     Signatures are verified through the `cryptography` package on the host's
+     OpenSSL (tools/varek_ed25519.py), so on a host in FIPS mode by the FIPS
+     140-3 validated module. (Through v1.40 they were verified by a pure-Python
+     Ed25519, separate from the library that made them; now the Warden signs
+     and this verifies with the same validated library, as FIPS requires.)
   2. The policy file given here must hash to the policy_sha256 in run_start:
      the certificates are checked against exactly the text the Warden used.
   3. The only authorizations are certified file opens and the agent's one
@@ -88,6 +94,7 @@ says, by the node's own clock, as the report says.
 import argparse
 import bisect
 import collections
+import datetime
 import hashlib
 import ipaddress
 import json
@@ -100,7 +107,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from varek_cyclonedx import StreamError, _iter_log, _version_at_least, LOG_SIG_DOMAIN, LOG_CHAIN_FORMAT, \
-    CRED_EVENTS  # noqa: E402
+    CRED_EVENTS, log_format, pubkey_from_hex  # noqa: E402
 import varek_ed25519  # noqa: E402
 
 # Record rules for an authorized file open (the policy decided ALLOW).
@@ -270,15 +277,27 @@ class Spool:
         for _ in range(self.n):
             yield pickle.load(self.ctx)
 
-    def ask(self, checker, policy, mode):
+    def ask(self, checker, policy, mode, extra=()):
         """Run the checker's mode over the rows. Returns (ok, its answers in a
         file, how many, stderr): "holds" answers one word a row, "batch" one
-        JSON object a line."""
+        JSON object a line. v1.42: extra, the grant files a batch's rows may
+        name."""
         self.rows.flush()
         self.rows.seek(0)
         out = tempfile.TemporaryFile("w+", encoding="utf-8", errors="surrogateescape")
         err = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")
-        rc = subprocess.run([checker, policy, mode], stdin=self.rows, stdout=out, stderr=err).returncode
+        extra, lst = list(extra), None
+        if len(extra) > 64:              # v1.42 step 9: a long run's grants, named in a file (batch @LIST)
+            lst = tempfile.NamedTemporaryFile("w", suffix=".grants", encoding="utf-8", errors="surrogateescape",
+                                              delete=False)
+            lst.write("".join(f + "\n" for f in extra))
+            lst.close()
+            extra = ["@" + lst.name]
+        try:
+            rc = subprocess.run([checker, policy, mode, *extra], stdin=self.rows, stdout=out, stderr=err).returncode
+        finally:
+            if lst is not None:
+                os.unlink(lst.name)
         out.seek(0)
         err.seek(0)
         n = 0
@@ -397,7 +416,7 @@ def policy_rules(checker, policy):
         f = ln.split()
         if len(f) != 11:
             raise ValueError(f"unexpected checker output {ln!r}")
-        out.append({"kind": f[0], "allow": f[1] == "a", "name": f[2] == "n", "mask": f[3],
+        out.append({"kind": f[0], "allow": f[1] == "a", "step_up": f[1] == "s", "defer": f[1] == "f", "name": f[2] == "n", "mask": f[3],
                      "value": f[4], "wild": f[5] == "w", "line": int(f[6]), "names": int(f[7]),
                      "rate": int(f[8]), "max_body": int(f[9]),
                      "c": "" if f[10] == "=" else bytes.fromhex(f[10]).decode("latin-1")})
@@ -406,6 +425,138 @@ def policy_rules(checker, policy):
     for r, m in zip(out, matches):
         r["match"] = m
     return out
+
+
+def policy_approvers(checker, policy):
+    """v1.42 step 6: the policy's approver keys, and the approvers= group of
+    each rule a grant may be under, as the checker reads the file (its
+    "approvers" mode): {"keys": {KEY: (group, name)}, "rules": {LINE: group},
+    "unknown": LINE}, a group "" where the rule names none."""
+    q = subprocess.run([checker, policy, "approvers"], capture_output=True, text=True)
+    if q.returncode != 0:
+        raise ValueError(q.stderr.strip() or "the checker failed")
+    out = {"keys": {}, "rules": {}, "unknown": 0}
+    for ln in q.stdout.splitlines():
+        f = ln.split()
+        if len(f) == 5 and f[0] == "approver":
+            out["keys"][f[1]] = (f[2], "" if f[3] == "-" else f[3])
+        elif len(f) == 3 and f[0] in ("rule", "unknown") and f[1].isdigit():
+            out["rules"][int(f[1])] = "" if f[2] == "-" else f[2]
+            if f[0] == "unknown":
+                out["unknown"] = int(f[1])
+        else:
+            raise ValueError(f"unexpected checker output {ln!r}")
+    return out
+
+
+def policy_notify(checker, policy):
+    """v1.42 step 7: each step_up rule's notify= URL, as the checker reads
+    the file (its "notify" mode): {LINE: URL}"""
+    q = subprocess.run([checker, policy, "notify"], capture_output=True, text=True)
+    if q.returncode != 0:
+        raise ValueError(q.stderr.strip() or "the checker failed")
+    out = {}
+    for ln in q.stdout.splitlines():
+        f = ln.split()
+        if len(f) != 3 or f[0] != "notify" or not f[1].isdigit():
+            raise ValueError(f"unexpected checker output {ln!r}")
+        out[int(f[1])] = bytes.fromhex(f[2]).decode("ascii")
+    return out
+
+
+def notify_host(url):
+    """v1.42 step 7: a notify= URL's host, as warden-notify reads it (no
+    brackets, no port)"""
+    m = re.match(r"https?://([^/?#]*)", url)
+    hp = m.group(1) if m else ""
+    if hp.startswith("["):
+        return hp[1:hp.find("]")] if "]" in hp else hp
+    return hp.rsplit(":", 1)[0] if ":" in hp else hp
+
+
+def check_intent(rs, logs, problems):
+    """v1.42 step 7: run_start's intent, the user's request: its SHA-256 and
+    length those of its text (at most 4 KiB), or of the file it names beside
+    the stream (STREAM.intent, at most 1 MiB)"""
+    it = rs.get("intent")
+    if it is None:
+        return
+    if not isinstance(it, dict) or not isinstance(it.get("sha256"), str) or \
+            not re.fullmatch(r"[0-9a-f]{64}", it["sha256"]) or type(it.get("bytes")) is not int:
+        problems.append("run_start's intent is malformed")
+        return
+    if "text" in it:
+        b = it["text"].encode("utf-8", errors="surrogateescape") if isinstance(it["text"], str) else None
+        if b is None or "file" in it or len(b) > 4096:
+            problems.append("run_start's intent: a text of over 4 KiB, or with a file too")
+            return
+        where = "its text"
+    else:
+        f = it.get("file")
+        if not isinstance(f, str) or not f or "/" in f or f in (".", "..") or not logs:
+            problems.append("run_start's intent names no file beside the stream")
+            return
+        path = os.path.join(os.path.dirname(os.path.abspath(logs[0])), f)
+        try:
+            with open(path, "rb") as fh:
+                b = fh.read((1 << 20) + 1)
+        except OSError as e:
+            problems.append(f"run_start's intent: cannot read {path}: {e.strerror}")
+            return
+        where = path
+    if len(b) != it["bytes"] or hashlib.sha256(b).hexdigest() != it["sha256"]:
+        problems.append(f"run_start's intent: {where} is not the request the Warden recorded (its SHA-256 or "
+                        f"length differs)")
+
+
+APPROVAL_DOMAIN = b"varek-approval-v1\0"
+
+
+def approval_verify(kind, key, sig, body):
+    """v1.42 step 6: True if sig (DER hex) is key's (the uncompressed P-384
+    point, hex) signature of body as kind, over the domain-separated message
+    "varek-approval-v1" NUL KIND NUL BODY the Warden verifies"""
+    try:
+        kb, sb = bytes.fromhex(key), bytes.fromhex(sig)
+    except (TypeError, ValueError):
+        return False
+    return varek_ed25519.verify_p384(kb, APPROVAL_DOMAIN + kind.encode() + b"\0" + body, sb)
+
+
+def check_plan_approval(meta, apv, plan_file, problems):
+    """v1.42 step 6: run_start's plan_approved_by. Its key is one the policy
+    pins, its name and group the policy's for that key, its plan_sha256 the
+    plan the run decided; with --plan, its signature is verified over the
+    plan's bytes (without, it cannot be, and the report says so)."""
+    rs = meta.get("run_start", {})
+    pa = rs.get("plan_approved_by")
+    if pa is None:
+        return None
+    if not isinstance(pa, dict) or not all(isinstance(pa.get(x), str) for x in ("key", "group", "sig", "plan_sha256")):
+        problems.append("run_start's plan_approved_by is not a signed approval the Warden writes")
+        return None
+    pin = (apv or {}).get("keys", {}).get(pa["key"])
+    if pin is None:
+        problems.append("the plan's approval is signed by a key the policy does not pin")
+        return None
+    if (pa["group"], pa.get("name") or "") != pin:
+        problems.append(f"the plan's approval names its signer {pa.get('name')!r} of group {pa['group']!r}; the "
+                        f"policy pins that key as {pin[1]!r} of group {pin[0]!r}")
+    hold = rs.get("hold") or {}
+    if hold.get("plan_sha256") and hold["plan_sha256"] != pa["plan_sha256"]:
+        problems.append("the plan approved is not the plan the run is held to")
+    if plan_file is None:
+        return "not verified: give --plan to verify the plan approval's signature over the plan's bytes"
+    try:
+        with open(plan_file, "rb") as fh:
+            body = fh.read()
+    except OSError:
+        return None                          # check_plan_gate says so
+    if hashlib.sha256(body).hexdigest() != pa["plan_sha256"]:
+        problems.append(f"the plan {plan_file} is not the plan approved (SHA-256 {pa['plan_sha256']})")
+    elif not approval_verify("plan", pa["key"], pa["sig"], body):
+        problems.append("the plan's approval signature does not verify over the plan")
+    return None
 
 
 def check_shared_lists(meta, a, problems):
@@ -595,6 +746,518 @@ class HoldCheck:
                             f"not the run's {hold.get('plan')!r}")
 
 
+class GrantsCheck:
+    """v1.42 step 2 (docs/security/v1.42-step-up-defer.md): runtime grants.
+    A refusal by a step_up rule names its proposal ("step_up"), recorded by
+    the step_up record that follows it; each proposal ends once (approved,
+    denied, timeout or abandoned); a grant is its approval's, its id the
+    SHA-256 of its text; an ALLOW under a grant names it (cert_grant), within
+    its count, its time and its run, and its certificate's two halves are
+    re-checked by the checker (MainLoop's rows name the grant's file). The
+    checker reads each grant itself: one it refuses fails the batch.
+
+    v1.42 step 4 (scope=run): a call held with scope=run freezes the run.
+    run_start says whether it can be frozen (scope_run); a hold with
+    scope=run where it cannot is a problem. The freeze is recorded
+    (run_frozen) right after the hold that began it, and the thaw
+    (run_thawed) only once no call held with scope=run is open, and after
+    an approved one is decided again; the run does not end frozen. A call
+    refused at once because the run cannot be frozen says why (unheld).
+
+    v1.42 step 5 (DEFER): a deferral (`defer`, held) has a unique id and
+    ends once (`defer_end`: resolved, with its marker's SHA-256; timeout;
+    escalated, naming the step_up proposal whose record comes next;
+    abandoned). A held deferral timed out was refused (its record naming it,
+    held) before its ending; one resolved is decided again after its ending,
+    allowed only under its marker (cert_defer, defer_marker, the same
+    SHA-256). An ALLOW under a marker with no deferral names the marker
+    too, and its certificate is re-checked as a defer rule's (MainLoop's row
+    ends in `defer`). A deferral with scope=run freezes the run as a held
+    step_up call does.
+
+    v1.42 step 5b (on outside_plan defer): a deferral of a call outside the
+    run's plan (`"outside_plan":true`) never escalates; it ends resolved by
+    a plan extension (plan_extension, the SHA-256 of a plan_extended record
+    before it whose verdict is SATISFIED), and its call, decided again after
+    that ending, is allowed as any call the plan covers (no marker). Each
+    plan_extended record names its text's SHA-256, its verdict and its
+    approver.
+
+    v1.42 step 6 (signed approvals): a standing grant (`"standing":true`,
+    from --grants) approves no proposal; it is signed (signed_by, sig) by a
+    key the policy pins, whose group is the approvers= group of the rule it
+    is under (one that names none takes no standing grant), names no run=
+    and had not expired when recorded. A runtime grant that carries
+    signed_by is signed by a pinned key of the rule's approvers= group, if
+    it names one. Each signature is verified over the grant's text, as kind
+    grant: a forged or missing one is a problem.
+
+    v1.42 step 7 (notify=): each proposal of a rule with notify= has one
+    `notify` record after its step_up record (by the run's end, when it is
+    complete), and no other proposal has one: its rule's line, the host of
+    the rule's URL and the URL's SHA-256, and an outcome the Warden writes
+    (sent: a 2xx status, in 1 or 2 attempts; failed: why; abandoned). The
+    user's request (run_start's intent) is in no other record."""
+
+    def __init__(self, run, problems, rs=None, apv=None, nt=None):
+        self.run, self.problems = run, problems
+        self.nt = nt or {}                   # v1.42 step 7: notify= URL by rule line
+        self.notes = {}                      # ... proposal id -> its notify outcome
+        if self.nt:
+            ntr = (rs or {}).get("notify")
+            if not isinstance(ntr, dict) or not isinstance(ntr.get("helper_sha256"), str) or \
+                    not re.fullmatch(r"[0-9a-f]{64}", ntr["helper_sha256"]):
+                problems.append("the policy has notify= rules, and run_start names no warden-notify that posted for them")
+        self.apv = apv if apv is not None else {"keys": {}, "rules": {}, "unknown": 0}
+        sr = (rs or {}).get("scope_run")
+        self.can_freeze = isinstance(sr, dict) and sr.get("freeze") is True
+        self.frozen = False
+        self.await_frz = None                # a hold with scope=run whose run_frozen comes next
+        self.runheld = set()                 # held with scope=run, not yet thawed after
+        self.replays = set()                 # approved, held with scope=run: decided again before the thaw
+        self.defers = {}                     # v1.42 step 5: deferral id -> its state
+        self.exts = {}                       # v1.42 step 5b: a plan extension's SHA-256 -> its verdict
+        self.await_prop = None               # an escalated deferral's proposal, whose step_up record comes next
+        self.ndefer = 0
+        self.props = {}                      # id -> {"seq", "ended", "text"}
+        self.named = {}                      # proposal id named by a decision -> its seq
+        self.grants = {}                     # id -> {"index", "count", "until", "run", "used", "text"}
+        self.dir = None
+        self.files = []
+        self.nprop = self.nuse = 0
+
+    def _parse(self, text):
+        g = {"count": 0, "until": 0, "run": ""}
+        for ln in text.splitlines():
+            w = ln.split()
+            if len(w) == 2 and w[0] == "count" and w[1].isdigit():
+                g["count"] = int(w[1])
+            elif len(w) == 2 and w[0] == "until":
+                try:
+                    g["until"] = int(datetime.datetime.strptime(w[1], "%Y-%m-%dT%H:%M:%SZ")
+                                     .replace(tzinfo=datetime.timezone.utc).timestamp())
+                except ValueError:
+                    return None
+            elif w and w[0] == "for":
+                for x in w[1:]:
+                    if x.startswith("run="):
+                        g["run"] = x[4:]
+        return g
+
+    def _signed(self, gid, text, e, standing, g):
+        """v1.42 step 6: a grant's signature, as the Warden checked it"""
+        p, what = self.problems, ("standing grant" if standing else "grant")
+        sb, sig = e.get("signed_by"), e.get("sig")
+        if not isinstance(sb, dict) or not isinstance(sb.get("key"), str) or not isinstance(sig, str):
+            p.append(f"{what} {gid[:16]}: no signature")
+            return
+        pin = self.apv["keys"].get(sb["key"])
+        if pin is None:
+            p.append(f"{what} {gid[:16]}: signed by a key the policy does not pin")
+            return
+        if (sb.get("group"), sb.get("name") or "") != pin:
+            p.append(f"{what} {gid[:16]}: names its signer {sb.get('name')!r} of group {sb.get('group')!r}; the "
+                     f"policy pins that key as {pin[1]!r} of group {pin[0]!r}")
+        line = None
+        for ln in text.splitlines():
+            w = ln.split()
+            if len(w) == 3 and w[0] == "step_up" and w[1] == "line" and w[2].isdigit():
+                line = int(w[2])
+        grp = self.apv["rules"].get(line)
+        if grp is None:
+            p.append(f"{what} {gid[:16]}: under line {line}, which is no rule a grant may be under")
+        elif standing and not grp:
+            p.append(f"{what} {gid[:16]}: under line {line}, which names no approvers= group to sign for it")
+        elif grp and grp != pin[0]:
+            p.append(f"{what} {gid[:16]}: signed by an approver of group {pin[0]!r}; line {line}'s approvers "
+                     f"are {grp!r}")
+        if standing:
+            if g["run"]:
+                p.append(f"{what} {gid[:16]}: names a run (run=), which a standing grant does not")
+            ts = e.get("timestamp_ns")
+            if g["until"] and isinstance(ts, int) and g["until"] * 1_000_000_000 <= ts:
+                p.append(f"{what} {gid[:16]}: recorded after its until")
+        if not approval_verify("grant", sb["key"], sig,
+                               text.encode("utf-8", errors="surrogateescape")):
+            p.append(f"{what} {gid[:16]}: its signature does not verify over its text")
+
+    def _freeze_due(self):
+        if self.await_frz is not None and not self.frozen:
+            self.problems.append(f"step_up {self.await_frz}: held with scope=run, but no run_frozen follows it")
+        self.await_frz = None
+
+    def _prop_due(self):
+        if self.await_prop is not None:
+            self.problems.append(f"a deferral escalated to proposal {self.await_prop}, whose step_up record does not "
+                                 f"follow its ending")
+        self.await_prop = None
+
+    def _ended(self, sid):
+        x = self.props.get(sid) or self.defers.get(sid)
+        return x is None or x["ended"]
+
+    def rec(self, r):
+        p = self.problems
+        if "intent" in r:                    # v1.42 step 7
+            p.append(f"seq {r.get('seq')}: a decision record holds the user's request (intent), which is run_start's alone")
+        self._freeze_due()
+        self._prop_due()
+        self._defer_rec(r)
+        if "unheld" in r and (not isinstance(r.get("unheld"), str) or r.get("decision_final") == "ALLOW" or
+                              "step_up" not in r):
+            p.append(f"seq {r.get('seq')}: an unheld note on a call not refused by a step_up rule")
+        if self.replays:                     # v1.42 step 4: an approved call held with scope=run, decided again
+            g = self.grants.get(r.get("cert_grant")) if r.get("cert_grant") else None
+            if g is not None and self.replays & g["props"]:
+                self.replays.discard(next(iter(self.replays & g["props"])))
+            elif str(r.get("step_up_why", "")).startswith("held and approved"):
+                self.replays.pop()
+        if "step_up" in r:
+            if r.get("decision_final") == "ALLOW" or r.get("decision_raw") not in ("DENY", "UNKNOWN"):
+                p.append(f"seq {r.get('seq')}: a step_up proposal on a call not refused by a step_up rule")
+            sid = r.get("step_up")
+            if sid != "none":
+                if not isinstance(sid, str):
+                    p.append(f"seq {r.get('seq')}: a malformed step_up id")
+                elif sid in self.props and self.props[sid]["ended"]:
+                    p.append(f"seq {r.get('seq')}: names proposal {sid}, which has ended")
+                elif r.get("held") is True:
+                    # v1.42 step 3: a held call's refusal, recorded when it ends (denied or timeout)
+                    pr = self.props.get(sid)
+                    if pr is None or not pr["held"] or pr["refused"]:
+                        p.append(f"seq {r.get('seq')}: a held call's refusal naming {sid}, which is not a call held "
+                                 f"and not yet refused")
+                    else:
+                        pr["refused"] = True
+                elif sid in self.props and self.props[sid]["held"]:
+                    p.append(f"seq {r.get('seq')}: names held proposal {sid} without being its refusal")
+                elif sid not in self.props:
+                    self.named.setdefault(sid, r.get("seq"))
+        cg = r.get("cert_grant")
+        if cg is None:
+            return
+        g = self.grants.get(cg)
+        if g is None:
+            p.append(f"seq {r.get('seq')}: allowed under grant {cg!r}, which no grant record before it holds")
+            return
+        if r.get("decision_final") != "ALLOW":
+            return
+        g["used"] += 1
+        self.nuse += 1
+        ts = r.get("timestamp_ns")
+        if g["count"] and g["used"] > g["count"]:
+            p.append(f"seq {r.get('seq')}: grant {cg[:16]} used {g['used']} times, past its count {g['count']}")
+        if g["until"] and (type(ts) is not int or ts // 1000000000 >= g["until"]):
+            p.append(f"seq {r.get('seq')}: grant {cg[:16]} used after its time")
+        if g["run"] and g["run"] != self.run:
+            p.append(f"seq {r.get('seq')}: grant {cg[:16]} is for run {g['run']!r}, not this one")
+
+    def _defer_rec(self, r):
+        """v1.42 step 5: a decision record's deferral fields"""
+        p, d = self.problems, r.get("defer")
+        seq = r.get("seq")
+        dfo = self.defers.get(d) if isinstance(d, str) else None
+        op = dfo is not None and dfo.get("op")            # v1.42 step 5b: released by a plan extension
+        if r.get("cert_defer") is True:
+            m = r.get("defer_marker")
+            if r.get("decision_final") != "ALLOW":
+                pass
+            elif not isinstance(m, dict) or not isinstance(m.get("path"), str) or \
+                    not re.fullmatch(r"[0-9a-f]{64}", str(m.get("sha256", ""))):
+                p.append(f"seq {seq}: allowed under a defer rule's marker, which it does not name")
+        elif r.get("decision_final") == "ALLOW" and d is not None and d != "none" and not op:
+            p.append(f"seq {seq}: allowed after deferral {d!r}, but not under its marker")
+        if d is None:
+            return
+        if d == "none":
+            if not isinstance(r.get("defer_why"), str) or r.get("decision_final") == "ALLOW":
+                p.append(f"seq {seq}: a defer note on a call not refused")
+            return
+        df = self.defers.get(d)
+        if r.get("held") is True:
+            if df is None or df["ended"] or df["refused"] or r.get("decision_final") == "ALLOW":
+                p.append(f"seq {seq}: a deferred call's refusal naming {d!r}, which is not a deferral open and not yet "
+                         f"refused")
+            else:
+                df["refused"] = True
+            return
+        if df is None or df["ending"] != "resolved" or df["decided"]:
+            p.append(f"seq {seq}: decided again after deferral {d!r}, which has not ended resolved (or was decided "
+                     f"again already)")
+            return
+        df["decided"] = True
+        self.replays.discard(d)
+        if r.get("decision_final") == "ALLOW" and not op:
+            m = r.get("defer_marker")
+            if not isinstance(m, dict) or m.get("sha256") != df["sha"]:
+                p.append(f"seq {seq}: allowed after deferral {d}, under a marker other than the one that resolved it")
+
+    def _notify(self, e):
+        """v1.42 step 7: a post's outcome"""
+        p, sid = self.problems, e.get("id")
+        pr = self.props.get(sid)
+        if pr is None:
+            p.append(f"notify for {sid!r}, which no step_up record before it holds")
+            return
+        line = pr.get("line")
+        if sid in self.notes:
+            p.append(f"notify for {sid}: recorded twice")
+            return
+        self.notes[sid] = e.get("outcome")
+        url = self.nt.get(line)
+        if url is None:
+            p.append(f"notify for {sid}: its rule (line {line}) has no notify=")
+            return
+        if e.get("rule_line") != line:
+            p.append(f"notify for {sid}: names line {e.get('rule_line')!r}; its proposal is line {line}'s")
+        if e.get("host") != notify_host(url) or e.get("url_sha256") != hashlib.sha256(url.encode()).hexdigest():
+            p.append(f"notify for {sid}: names a host or URL other than line {line}'s notify=")
+        if "url" in e:
+            p.append(f"notify for {sid}: holds the URL itself")
+        out, st, at = e.get("outcome"), e.get("status"), e.get("attempts")
+        if out == "sent":
+            if type(st) is not int or not 200 <= st <= 299 or at not in (1, 2):
+                p.append(f"notify for {sid}: sent, without a 2xx status in 1 or 2 attempts")
+        elif out == "failed":
+            if not isinstance(e.get("why"), str) or (at is not None and at not in (1, 2)) or \
+                    (st is not None and (type(st) is not int or 200 <= st <= 299)):
+                p.append(f"notify for {sid}: failed, without why, or with a status or attempts the Warden does not write")
+        elif out != "abandoned":
+            p.append(f"notify for {sid}: an outcome {out!r} the Warden does not write")
+
+    def ev(self, e):
+        p = self.problems
+        ev = e.get("event")
+        if "intent" in e:                    # v1.42 step 7: in run_start only
+            p.append(f"a {ev} record holds the user's request (intent), which is run_start's alone")
+        if ev == "notify":                   # v1.42 step 7: written between other records' groups
+            self._notify(e)
+            return
+        if ev != "run_frozen":
+            self._freeze_due()
+        if not (ev == "step_up" and self.await_prop is not None and e.get("id") == self.await_prop):
+            self._prop_due()
+        else:
+            self.await_prop = None
+        if ev == "defer":                     # v1.42 step 5
+            did = e.get("id")
+            if not isinstance(did, str) or did in self.defers or did in self.props:
+                p.append(f"a defer record with a malformed or repeated id {did!r}")
+                return
+            if e.get("state") != "held":
+                p.append(f"defer {did}: a state the Warden does not write")
+            sc = e.get("scope")
+            self.defers[did] = {"ended": False, "ending": None, "refused": False, "decided": False, "sha": None,
+                                "unknown": e.get("unknown") is True, "escalate": e.get("escalate") is True,
+                                "op": e.get("outside_plan") is True}
+            if e.get("outside_plan") is True and e.get("escalate") is not False:
+                p.append(f"defer {did}: outside the plan, and escalating (a plan extension resolves it)")
+            self.ndefer += 1
+            if sc not in ("run", "thread"):
+                p.append(f"defer {did}: held with a scope the Warden does not write ({sc!r})")
+            elif sc == "run":
+                if not self.can_freeze:
+                    p.append(f"defer {did}: held with scope=run, where run_start says the run cannot be frozen")
+                self.runheld.add(did)
+                if not self.frozen:
+                    self.await_frz = did
+            return
+        if ev == "defer_end":
+            did, end = e.get("id"), e.get("ending")
+            df = self.defers.get(did)
+            if df is None or df["ended"]:
+                p.append(f"defer_end for {did!r}, which is not an open deferral")
+                return
+            df["ended"], df["ending"] = True, end
+            if end == "resolved":
+                if df["unknown"]:
+                    p.append(f"defer_end for {did}: resolved, but nothing resolves a call deferred as UNKNOWN")
+                if df["op"]:                         # v1.42 step 5b: by a plan extension
+                    ext = e.get("plan_extension")
+                    if ext not in self.exts:
+                        p.append(f"defer_end for {did}: resolved by a plan extension {ext!r} no plan_extended "
+                                 f"record before it holds")
+                    elif self.exts[ext] != "SATISFIED":
+                        p.append(f"defer_end for {did}: resolved by plan extension {str(ext)[:16]}, which the plan "
+                                 f"gate did not authorize ({self.exts[ext]})")
+                    sha = None
+                else:
+                    sha = e.get("marker_sha256")
+                    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+                        p.append(f"defer_end for {did}: resolved, with no marker's SHA-256")
+                df["sha"] = sha
+                if did in self.runheld:
+                    self.replays.add(did)
+            elif end == "timeout":
+                if not df["refused"]:
+                    p.append(f"defer_end for {did}: timed out, with no record of its call's refusal before")
+            elif end == "escalated":
+                sid = e.get("step_up")
+                if not df["escalate"]:
+                    p.append(f"defer_end for {did}: escalated, but its rule does not escalate")
+                if not isinstance(sid, str):
+                    p.append(f"defer_end for {did}: escalated to no proposal")
+                else:
+                    self.await_prop = sid
+            elif end != "abandoned":
+                p.append(f"defer_end for {did}: an ending {end!r} the Warden does not write")
+            return
+        if ev == "plan_extended":             # v1.42 step 5b
+            sha, vd = e.get("sha256"), e.get("verdict")
+            if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha) or not isinstance(vd, str) or \
+                    not isinstance(e.get("approver_uid"), int):
+                p.append(f"a plan_extended record with a malformed SHA-256, verdict or approver ({sha!r})")
+                return
+            if vd != "SATISFIED" and self.exts.get(sha) == "SATISFIED":
+                return                               # a refused resend of an authorized one keeps it
+            self.exts[sha] = vd
+            return
+        if ev == "run_frozen":               # v1.42 step 4
+            self._prop_due()
+            if self.frozen:
+                p.append("run_frozen while the run was frozen already")
+            elif self.await_frz is None or e.get("step_up") != self.await_frz:
+                p.append(f"run_frozen for {e.get('step_up')!r}, which is not the hold with scope=run just recorded")
+            self.frozen, self.await_frz = True, None
+            return
+        if ev == "run_thawed":
+            if not self.frozen:
+                p.append("run_thawed while the run was not frozen")
+            for sid in sorted(self.runheld):
+                if not self._ended(sid):
+                    p.append(f"run_thawed while {sid}, held with scope=run, was still held")
+            if self.replays:
+                p.append(f"run_thawed before {sorted(self.replays)[0]}, approved and held with scope=run, was "
+                         f"decided again")
+            self.frozen, self.runheld, self.replays = False, set(), set()
+            return
+        if ev == "step_up":
+            sid = e.get("id")
+            if not isinstance(sid, str) or sid in self.props:
+                p.append(f"a step_up record with a malformed or repeated id {sid!r}")
+                return
+            held = e.get("mode") == "hold" and e.get("state") == "held"   # v1.42 step 3: no decision yet
+            if not held and self.named.pop(sid, None) is None:
+                p.append(f"step_up {sid}: no decision record before it names it")
+            if held and sid in self.named:
+                p.append(f"step_up {sid}: held, but a decision record before it names it")
+            if e.get("mode") not in ("grant", "hold") or e.get("state") not in ("proposed", "held") or \
+                    (e.get("mode") == "hold") != (e.get("state") == "held"):
+                p.append(f"step_up {sid}: a mode and state the Warden does not write")
+            if not isinstance(e.get("proposal"), str):
+                p.append(f"step_up {sid}: no proposal")
+            self.props[sid] = {"ended": False, "text": e.get("proposal"), "held": held, "refused": False,
+                               "line": e.get("rule_line")}
+            self.nprop += 1
+            if held:                             # v1.42 step 4: its scope
+                sc = e.get("scope")
+                if sc not in ("run", "thread"):
+                    p.append(f"step_up {sid}: held with a scope the Warden does not write ({sc!r})")
+                elif sc == "run":
+                    if not self.can_freeze:
+                        p.append(f"step_up {sid}: held with scope=run, where run_start says the run cannot be frozen")
+                    self.runheld.add(sid)
+                    if not self.frozen:
+                        self.await_frz = sid
+        elif ev == "grant":
+            gid, text, prop = e.get("id"), e.get("text"), e.get("proposal")
+            if not isinstance(text, str) or not isinstance(gid, str) or \
+                    hashlib.sha256(text.encode("utf-8", errors="surrogateescape")).hexdigest() != gid:
+                p.append(f"grant {gid!r}: its id is not the SHA-256 of its text")
+                return
+            standing = e.get("standing") is True              # v1.42 step 6
+            if standing:
+                prop = None
+                if "proposal" in e or "approver_uid" in e:
+                    p.append(f"grant {gid[:16]}: a standing grant, which approves no proposal, names one")
+            elif prop not in self.props or self.props[prop]["ended"]:
+                p.append(f"grant {gid[:16]}: approves {prop!r}, which is not an open proposal")
+            if gid in self.grants:
+                old = self.grants[gid]
+                if standing or old["standing"] or prop is None or prop in old["props"]:
+                    p.append(f"grant {gid[:16]} recorded twice")
+                    return
+                # v1.42 step 9: the same text approved again, for another open proposal (two proposals of
+                # one call made within a second propose the same grant): one grant, its counts summed
+                g2 = self._parse(text)
+                old["count"] = old["count"] + g2["count"] if old["count"] and g2 and g2["count"] else 0
+                old["props"].add(prop)
+                if not isinstance(e.get("approver_uid"), int):
+                    p.append(f"grant {gid[:16]}: no approver")
+                if "signed_by" in e or "sig" in e:
+                    self._signed(gid, text, e, False, old)
+                return
+            g = self._parse(text)
+            if g is None:
+                p.append(f"grant {gid[:16]}: its until is not a time")
+                return
+            if not standing and not isinstance(e.get("approver_uid"), int):
+                p.append(f"grant {gid[:16]}: no approver")
+            if standing or "signed_by" in e or "sig" in e:
+                self._signed(gid, text, e, standing, g)
+            if self.dir is None:
+                self.dir = tempfile.TemporaryDirectory()
+            path = os.path.join(self.dir.name, f"g{len(self.files)}.txt")
+            with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
+                fh.write(text)
+            g.update(index=len(self.files), used=0, prop=prop, props={prop}, standing=standing)
+            self.files.append(path)
+            self.grants[gid] = g
+        elif ev == "step_up_end":
+            sid, end = e.get("id"), e.get("ending")
+            pr = self.props.get(sid)
+            if pr is None or pr["ended"]:
+                p.append(f"step_up_end for {sid!r}, which is not an open proposal")
+                return
+            pr["ended"] = True
+            # v1.42 step 3: a held call denied or timed out was refused, recorded before its proposal ends
+            if pr["held"] and end in ("denied", "timeout") and not pr["refused"]:
+                p.append(f"step_up_end for {sid}: a held call {end}, with no record of its refusal before")
+            if pr["held"] and end in ("approved", "abandoned") and pr["refused"]:
+                p.append(f"step_up_end for {sid}: {end}, but its held call was refused")
+            if end not in ("approved", "denied", "timeout", "abandoned"):
+                p.append(f"step_up_end for {sid}: an ending {end!r} the Warden does not write")
+            elif end == "approved":
+                g = self.grants.get(e.get("grant"))
+                if g is None or sid not in g["props"]:
+                    p.append(f"step_up_end for {sid}: approved, but no grant record of its approval before it")
+                if sid in self.runheld and pr["held"]:
+                    self.replays.add(sid)        # v1.42 step 4: decided again before the thaw
+            elif end == "denied" and not isinstance(e.get("approver_uid"), int):
+                p.append(f"step_up_end for {sid}: denied by no one")
+
+    def finish(self, complete):
+        self._freeze_due()
+        self._prop_due()
+        if complete:
+            for did, df in self.defers.items():
+                if not df["ended"]:
+                    self.problems.append(f"defer {did}: never ended")
+        if complete and self.frozen:
+            self.problems.append("the run ended frozen (no run_thawed after its last run_frozen)")
+        for sid, seq in self.named.items():
+            self.problems.append(f"seq {seq}: names proposal {sid}, which no step_up record holds")
+        if complete:
+            for sid, pr in self.props.items():
+                if not pr["ended"]:
+                    self.problems.append(f"step_up {sid}: never ended")
+                if pr.get("line") in self.nt and sid not in self.notes:     # v1.42 step 7
+                    self.problems.append(f"step_up {sid}: under line {pr['line']}'s notify=, with no notify outcome")
+
+    def row(self, rec):
+        """MainLoop's certificate row's grant part, or None"""
+        if rec.get("cert_defer") is True:                  # v1.42 step 5: a defer rule's certificate
+            return " defer"
+        cg = rec.get("cert_grant")
+        if cg is None:
+            return ""
+        g = self.grants.get(cg)
+        gr, gw = rec.get("cert_grant_rule"), rec.get("cert_grant_witness")
+        if g is None or type(gr) is not int or not isinstance(gw, str) or " " in gw or not gw:
+            return None
+        return f" grant={g['index']}:{gr}:{gw}"
+
+
 PLAN_VERDICTS = ("SATISFIED", "UNSATISFIED", "UNKNOWN")
 
 
@@ -745,6 +1408,15 @@ class DryCheck:
                             f"but has none")
         elif "arch" in rs and not _version_at_least(rs.get("warden"), (1, 33)):
             problems.append(f"run_start records an architecture, but names the Warden {rs.get('warden')!r}, "
+                            f"which records none")
+        # v1.41: the provider that computed the chain and the signatures
+        if "crypto_provider" in rs and rs.get("crypto_provider") not in ("fips", "default"):
+            problems.append(f"run_start's crypto_provider {rs.get('crypto_provider')!r} is not one the Warden writes")
+        elif "crypto_provider" not in rs and _version_at_least(rs.get("warden"), (1, 41)):
+            problems.append(f"run_start names the Warden {rs.get('warden')!r}, which records its crypto provider, "
+                            f"but has none")
+        elif "crypto_provider" in rs and not _version_at_least(rs.get("warden"), (1, 41)):
+            problems.append(f"run_start records a crypto provider, but names the Warden {rs.get('warden')!r}, "
                             f"which records none")
         end = meta.get("run_end")
         if isinstance(end, dict) and end.get("mode") != rs.get("mode"):
@@ -1042,7 +1714,7 @@ def path_rule_writable(r):
     access mode of write or read-write, O_TRUNC or O_CREAT)? As the Warden
     reads it (warden_noexec.inc.c): the flags the rule requires, the rest
     free."""
-    if r["kind"] != "p" or not r["allow"]:
+    if r["kind"] != "p" or not (r["allow"] or r.get("step_up") or r.get("defer")):    # v1.42: a step_up rule writes under a grant (step 5: a defer rule under its marker)
         return False
     mask, value = int(r["mask"], 16), int(r["value"], 16)      # the checker prints them in hex
     for c in (1, 2, O_TRUNC, O_CREAT, 1 | O_TRUNC, 2 | O_TRUNC, 1 | O_CREAT, 2 | O_CREAT,
@@ -1855,7 +2527,7 @@ class TokenScan:
         echo = "decision_final" in rec or rec.get("event") == "dns_question"
         for k, x in rec.items():
             walk(x, k, echo, f"line {i}")
-JWT_ALGS = ("RS256", "PS256", "ES256", "EdDSA")
+JWT_ALGS = ("RS256", "PS256", "ES256", "EdDSA", "RS384", "PS384", "ES384")      # v1.41: the SHA-384 forms
 
 
 class ChainCheck:
@@ -3736,14 +4408,17 @@ def policy_ancestors(path):
 
 
 def _hex_key(txt):
-    """Exactly 64 lowercase hex characters, or None."""
-    if not isinstance(txt, str) or len(txt) != 64 or any(c not in "0123456789abcdef" for c in txt):
+    """A log public key as the Warden writes it, in lowercase hex: a P-384
+    point (194 characters, 04 || X || Y; v1.41) or an Ed25519 key (64; v1.40
+    and earlier). Its bytes, or None."""
+    if not isinstance(txt, str) or not re.fullmatch(r"04[0-9a-f]{192}|[0-9a-f]{64}", txt):
         return None
     return bytes.fromhex(txt)
 
 
 def _cli_pubkey(arg):
-    """--pubkey: 64 hex characters, or a file holding them (tools/varek_keygen's .pub)."""
+    """--pubkey: the key's hex (194 characters, P-384; or 64, Ed25519), or a file
+    holding it (tools/varek_keygen's .pub)."""
     if os.path.isfile(arg):
         with open(arg) as fh:
             arg = fh.read()
@@ -3784,8 +4459,8 @@ def _node_keys(path):
             return None, f"--node-keys {path}: an item that is not a VarekNodeKey"
         k, t, node = _hex_key(sp.get("publicKey")), _rfc3339_ns(md.get("creationTimestamp")), sp.get("node")
         if k is None or t is None or not isinstance(node, str) or not node:
-            return None, (f"--node-keys {path}: VarekNodeKey {md.get('name')!r} has no node, no 64-hex publicKey, "
-                          f"or no creationTimestamp")
+            return None, (f"--node-keys {path}: VarekNodeKey {md.get('name')!r} has no node, no publicKey "
+                          f"(194 hex, P-384; or 64, Ed25519), or no creationTimestamp")
         keys.setdefault(node, []).append((t, k, str(md.get("name"))))
     for v in keys.values():
         v.sort(key=lambda e: (e[0], e[2]))
@@ -3853,6 +4528,8 @@ class Integrity:
         self.rs = None
         self.early = []                      # the signed records before run_start was read (run_start's own)
         self.mode = None                     # "signed", "malformed" (a bad log_pubkey) or None
+        self.fmt, self.chained = None, False  # v1.41: the stream's integrity format (start())
+        self.unavailable = None              # v1.41: why its signatures cannot be checked on this host
         self.pk = self.pinned = None
         self.nsigned = self.bad = 0
         self.last_event = None
@@ -3877,21 +4554,25 @@ class Integrity:
         lines for this run"""
         self.rs, self.run = rs, run
         a, head = self.a, self.sec["integ_head"]
-        self.chained = rs.get("log") == LOG_CHAIN_FORMAT
+        self.fmt = log_format(rs.get("log"))         # v1.41: chain-1 or chain-2
+        self.chained = self.fmt is not None
         stream_key = rs.get("log_pubkey")
         if not self.chained:
             return
         if stream_key is not None:
             self.pk = _hex_key(stream_key)
-            if self.pk is None:
-                head.append("run_start carries a malformed log_pubkey")
+            if self.pk is None or len(self.pk) != self.fmt["key_len"] or \
+                    rs.get("sigalg", self.fmt["sigalg"]) != self.fmt["sigalg"]:
+                head.append(f"run_start carries a malformed log_pubkey (or one not of its format, "
+                            f"{self.fmt['name']}: {self.fmt['sigalg']})")
                 self.mode = "malformed"
                 return
             self.mode = "signed"
             if a.pubkey:
                 self.pinned = _cli_pubkey(a.pubkey)
                 if self.pinned is None:
-                    head.append("--pubkey is not 64 hex characters (or a file holding them)")
+                    head.append("--pubkey is not a public key (194 hex characters, P-384; or 64, Ed25519) "
+                                "or a file holding one")
                 elif self.pinned != self.pk:
                     head.append(f"the stream is signed by {self.pk.hex()}, not by the pinned key "
                                 f"{self.pinned.hex()}")
@@ -3937,10 +4618,15 @@ class Integrity:
                     if skey is not None:
                         ch, sig = str(e.get("chain")), e.get("sig")
                         try:
-                            good = isinstance(sig, str) and len(ch) == 64 and \
-                                varek_ed25519.verify(skey, LOG_SIG_DOMAIN + bytes.fromhex(ch), bytes.fromhex(sig))
+                            good = isinstance(sig, str) and len(ch) == self.fmt["chain_hex"] and \
+                                self.fmt["verify"](skey, self.fmt["domain"] + bytes.fromhex(ch), bytes.fromhex(sig))
                         except ValueError:
                             good = False
+                        except varek_ed25519.AlgorithmUnavailable as ex:    # v1.41 (e is the line)
+                            good = False
+                            if self.unavailable is None:
+                                self.unavailable = str(ex)
+                                self.sec["integ_aread"].append(f"anchor {a.anchor}: {ex}")
                         if not good:
                             self.ignored += 1
                     self.anchor.add(e, good)
@@ -3966,9 +4652,17 @@ class Integrity:
         if self.mode == "signed":
             if c["sig"] is None:
                 self.sec["integ_sigs"].append(f"line {c['line']}: {c['event']} record is not signed")
-            elif not varek_ed25519.verify(self.pk, LOG_SIG_DOMAIN + c["chain"], bytes.fromhex(c["sig"])):
-                self.bad += 1
-                self.sec["integ_sigs"].append(f"line {c['line']}: {c['event']} signature does not verify")
+            else:
+                try:
+                    good = self.fmt["verify"](self.pk, self.fmt["domain"] + c["chain"], bytes.fromhex(c["sig"]))
+                except varek_ed25519.AlgorithmUnavailable as e:
+                    good = None                  # v1.41: not checkable here (not a forgery): said once
+                    if self.unavailable is None:
+                        self.unavailable = str(e)
+                        self.sec["integ_sigs"].append(f"line {c['line']}: {e}")
+                if good is False:
+                    self.bad += 1
+                    self.sec["integ_sigs"].append(f"line {c['line']}: {c['event']} signature does not verify")
             if c["sig"]:
                 # The Warden signs at least every checkpoint_every decision records. A
                 # longer stretch without a signature means checkpoints were removed
@@ -4254,6 +4948,7 @@ class MainLoop:
         self.handoff_ids = IdSet()       # v1.26: connects handed to the proxy
         self.certs, self.view_recs, self.others, self.handoff_cands = Spool(), Spool(), Spool(), Spool()
         self.nothers = 0                 # connects decided over candidates
+        self.grants = None               # v1.42: the run's GrantsCheck
 
     def rec(self, rec, pos):
         a, meta, problems = self.a, self.meta, self.problems
@@ -4480,8 +5175,10 @@ class MainLoop:
             problems.append(f"seq {rec.get('seq')}: authorized open of {rec.get('resolved')!r} "
                             f"without an accepted certificate")
             return
-        if prules and (type(cr) is not int or not 0 <= cr < len(prules) or
-                       rec.get("policy_line") != prules[cr]["line"]):
+        # v1.42 step 5: a grant under the `on unknown` line has no policy rule (cert_rule -1, policy_line -1)
+        unk_grant = cr == -1 and rec.get("cert_grant") is not None and rec.get("policy_line") == -1
+        if prules and not unk_grant and (type(cr) is not int or not 0 <= cr < len(prules) or
+                                         rec.get("policy_line") != prules[cr]["line"]):
             # v1.31 review: the line a decision cites is its certificate's rule's
             self.cited.append(f"seq {rec.get('seq')}: a decision citing policy line {rec.get('policy_line')!r}, "
                             f"but its certificate's rule is "
@@ -4532,8 +5229,13 @@ class MainLoop:
             problems.append(f"seq {rec.get('seq')}: certificate recorded for subject {rec.get('cert_subject', 0)!r}, "
                             f"but the decision was for subject {ks} (its chain {rec.get('obo')!r})")
             return
+        gpart = self.grants.row(rec) if self.grants is not None else ""       # v1.42
+        if gpart is None:
+            problems.append(f"seq {rec.get('seq')}: an ALLOW under a grant without its grant or its certificate's "
+                            f"second half")
+            return
         self.certs.add(f"{'mcp' if is_mcp else 'request' if is_req else 'exec' if is_exec else 'host' if is_conn_like else 'path'} "
-                       f"{fl} {hx} {cr} {cw}" + (f" @{ks}" if ks else ""), (rec.get("seq"), rec.get("resolved")))
+                       f"{fl} {hx} {cr} {cw}" + (f" @{ks}" if ks else "") + gpart, (rec.get("seq"), rec.get("resolved")))
         if is_conn and ("candidates" in rec or "candidates_sha256" in rec):
             try:
                 oc = check_names(rec, pos, self.res, problems, exact_grace=exact_grace)
@@ -4551,7 +5253,7 @@ SECTIONS = (
     "integ_head", "integ_sigs", "integ_end", "integ_every", "integ_gaps", "integ_tail", "integ_aread",
     "integ_unanchored", "integ_anchor",
     "run", "testbuild", "phash", "prules", "pproxy", "plaunch", "execset", "popenas", "changes", "openas",
-    "baseline", "dry_head", "dry_recs", "dry_dns", "dry_refused", "dry_tail", "hold_head", "hold", "plan",
+    "baseline", "dry_head", "dry_recs", "dry_dns", "dry_refused", "dry_tail", "hold_head", "hold", "grants", "plan",
     "noexec", "noexec_loop", "noexec_exec", "noexec_fail", "shared",
     "dns_head", "dns_syn", "dns_loop", "dns_tail", "dns_exc", "hostnames",
     "loop", "views", "certs", "cited", "others",
@@ -4573,10 +5275,14 @@ def main(argv=None):
     ap.add_argument("--checker", help="tools/vdp_cert_check (required to audit)")
     ap.add_argument("--allow-incomplete", action="store_true",
                     help="audit a stream with no run_end record")
+    ap.add_argument("--require-fips", action="store_true",
+                    help="v1.41: fail unless run_start, signed under the pinned key, says the stream's hashing "
+                         "and signing were the host's FIPS provider's (a Defense build, or a host in FIPS mode)")
     ap.add_argument("--allow-test-build", action="store_true",
                     help="audit a stream from the test-only fault-injected Warden (testing)")
-    ap.add_argument("--pubkey", help="the Warden's signing public key (64 hex characters, "
-                    "or a .pub file from tools/varek_keygen): signatures must verify under it")
+    ap.add_argument("--pubkey", help="the Warden's signing public key (194 hex characters, P-384; 64 for an "
+                    "Ed25519 key of v1.40 or earlier; or a .pub file from tools/varek_keygen): signatures must "
+                    "verify under it")
     ap.add_argument("--node-keys", metavar="LIST", help="v1.36 (D10): the cluster's VarekNodeKey resources "
                     "(kubectl get vareknodekeys -o json): the stream must be signed by the key listed for its "
                     "node, and not one retired before the run began")
@@ -4763,6 +5469,17 @@ def main(argv=None):
     meta["plan_events"] = plan_events
 
     integrity = integ.finish(meta, complete)
+    # v1.41: --require-fips. The provider run_start names is believed as far as
+    # run_start's signature, under a key the caller pinned, vouches for it.
+    cprov = meta.get("run_start", {}).get("crypto_provider")
+    if a.require_fips:
+        if cprov != "fips":
+            sec["integ_head"].append(f"--require-fips: run_start says the stream's hashing and signing were the "
+                                     f"{cprov or 'unrecorded'} provider's, not the host's FIPS provider's")
+        if not integrity.startswith("signed") or "not pinned" in integrity:
+            sec["integ_head"].append("--require-fips: the provider run_start names is vouched for only by its "
+                                     "signature under a pinned key (give --pubkey or --node-keys; the stream "
+                                     "must be signed)")
     if a.run and a.run != run:
         sec["run"].append(f"the stream is run {run}, not the run asked for ({a.run})")
     # An incomplete signed stream is audited only as far as its last signature:
@@ -4803,6 +5520,19 @@ def start_checks(a, meta, rs, run, sec, res, prules, rules, names_policy, proxy_
     k["changes"] = ChangesCheck(openas_policy, sec["changes"])
     k["dry"] = DryCheck(rs, sec)
     k["hold"] = HoldCheck(rs, sec["hold_head"], sec["hold"])
+    try:                                                                  # v1.42 step 6
+        apv = policy_approvers(a.checker, a.policy)
+    except (OSError, ValueError) as e:
+        sec["grants"].append(f"cannot read the policy's approver keys: {e}")
+        apv = None
+    k["apv"] = apv
+    try:                                                                  # v1.42 step 7
+        nt = policy_notify(a.checker, a.policy)
+    except (OSError, ValueError) as e:
+        sec["grants"].append(f"cannot read the policy's notify= URLs: {e}")
+        nt = None
+    check_intent(rs, a.log, sec["grants"])                                # v1.42 step 7
+    k["grants"] = GrantsCheck(run, sec["grants"], rs, apv, nt)            # v1.42
     try:                                                                  # v1.27.1
         nx = check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, Section(), quiet=True)
     except (OSError, ValueError):
@@ -4817,6 +5547,7 @@ def start_checks(a, meta, rs, run, sec, res, prules, rules, names_policy, proxy_
                          openas_policy,
                          # v1.25 review: from 1.25 the Warden records the end of every grace
                          _version_at_least(rs.get("warden"), (1, 25)))
+    k["loop"].grants = k["grants"]
     k["dialed"] = Spool()
     k["proxied"] = ProxiedCheck(res, sec["proxied"], k["dialed"], upstream, exact_hosts, passthrough)
     k["closes"] = ClosesCheck(sec["closes"])
@@ -4830,6 +5561,7 @@ def start_checks(a, meta, rs, run, sec, res, prules, rules, names_policy, proxy_
             lambda r, pos, line: k["changes"].rec(r),
             lambda r, pos, line: k["dry"].rec(r),
             lambda r, pos, line: k["hold"].rec(r),
+            lambda r, pos, line: k["grants"].rec(r),
             lambda r, pos, line: k["loop"].rec(r, pos),
             lambda r, pos, line: k["proxied"].rec(r, pos),
             lambda r, pos, line: k["closes"].rec(r, pos),
@@ -4842,6 +5574,7 @@ def start_checks(a, meta, rs, run, sec, res, prules, rules, names_policy, proxy_
     if k["launches"] is not None:
         recs.append(lambda r, pos, line: k["launches"].rec(r))
     evs = [lambda e, before, line: k["execset"].ev(e),
+           lambda e, before, line: k["grants"].ev(e),                     # v1.42
            lambda e, before, line: k["dry"].ev(e),
            lambda e, before, line: k["dns"].ev(e),
            lambda e, before, line: k["proxied"].ev(e),
@@ -4865,9 +5598,13 @@ def report(a, meta, sec, k, integrity, run, warden, complete, nrec, prules, rule
     k["changes"].finish()
     check_open_as(meta, openas_policy, sec["openas"])                     # v1.29
     check_baseline(meta, a.policy, sec["baseline"])
+    k["grants"].finish(complete)                                          # v1.42
     k["dry"].head(meta, sec["dry_head"])
     dry_run = k["dry"].finish(meta, sec["dry_tail"])
     plan_gate = check_plan_gate(meta, Count(nrec), sec["plan"], a.plan, complete)    # v1.35 step 7
+    pa_note = check_plan_approval(meta, k.get("apv"), a.plan, sec["plan"])   # v1.42 step 6
+    if pa_note:
+        cnotes.append(f"plan approval: {pa_note}")
     try:
         check_noexec(meta, policy_rules(a.checker, a.policy), launches_policy, sec["noexec"])      # v1.27.1
         check_noexec_exec(meta, policy_rules(a.checker, a.policy), openas_policy, sec["noexec_exec"])  # v1.29
@@ -4891,13 +5628,13 @@ def report(a, meta, sec, k, integrity, run, warden, complete, nrec, prules, rule
                 for i, r in enumerate(rules):
                     if i < len(row) and row[i] == "1" and r[0] == "p" and \
                             (flv & int(r[3], 16)) == int(r[4], 16):
-                        if r[1] == "d":
+                        if r[1] != "a":                      # v1.42: or a step_up rule ('s')
                             sec["views"].append(f"seq {seq}: a {rule} served, but policy "
                                                 f"rule {i} denies {resolved}")
                         break
     checked = 0
     if len(loop.certs) and not sec.before("certs"):
-        ok, out, n, err = loop.certs.ask(a.checker, a.policy, "batch")
+        ok, out, n, err = loop.certs.ask(a.checker, a.policy, "batch", k["grants"].files)   # v1.42
         if not ok:
             sec["certs"].append(f"checker failed: {err.strip()}")
         else:
@@ -4992,6 +5729,10 @@ def report(a, meta, sec, k, integrity, run, warden, complete, nrec, prules, rule
     for n_ in cnotes:
         print(f"varek_audit: note: {n_}")
     print(f"varek_audit: integrity: {integrity}")
+    cprov = meta.get("run_start", {}).get("crypto_provider")
+    if isinstance(cprov, str):                                                           # v1.41
+        print(f"varek_audit: crypto provider: {cprov}"
+              f"{' (the host FIPS 140-3 validated module)' if cprov == 'fips' else ''}")
     if isinstance(meta.get("run_start", {}).get("arch"), str):                          # v1.33.0
         print(f"varek_audit: architecture: {meta['run_start']['arch']}")
     t0 = meta.get("run_start", {}).get("timestamp_ns")

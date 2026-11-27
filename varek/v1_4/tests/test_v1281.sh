@@ -50,7 +50,13 @@ fail=0 skips=0
 pass()  { printf '  PASS   %s\n' "$1"; }
 flunk() { printf '  FAIL   %s\n' "$1"; fail=1; }
 skip()  { printf '  SKIP   %s\n' "$1"; skips=$((skips + 1)); }
-check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else flunk "$d"; fi; }
+check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$d"; else flunk "$d"; return 1; fi; }
+# why RUN: two lines for a failed run's check, right after its FAIL line (the
+# node-agent sweep copies them into the job's log): its exit code and the
+# Warden's last words. The run's files are gone after the suite.
+why()   { printf '     why: rc=%s; %s\n' "$(cat "$OUT/$1.rc" 2>/dev/null || echo '?')" \
+            "$(grep -v '^$' "$OUT/$1.out" 2>/dev/null | tail -2 | tr '\n' '|' | cut -c1-240)"
+          printf '     why: %s\n' "$(grep -i 'token\|refus\|error' "$OUT/$1.out" 2>/dev/null | tail -1 | cut -c1-240)"; }
 trap '[ -n "${KEEP:-}" ] && echo "kept $OUT" || rm -rf "$OUT"' EXIT
 
 echo "== 1. the grammar =="
@@ -199,13 +205,20 @@ for l in open(sys.argv[1]):
     (cd "$T" && timeout 60 "$WARDEN" "$T/p.txt" --secrets-conf "$T/conf" --on-behalf-of "$T/tok" -- /usr/bin/env > "$OUT/env.out" 2> "$OUT/env.err")
     check "nor in the agent's environment" sh -c "grep -q '^PATH=' '$OUT/env.out' && ! grep -qF -- '$TOKSIG' '$OUT/env.out' && ! grep -qF -- '$TOKPAY' '$OUT/env.out'"
     check "the helper is gone once the identities are verified" sh -c "! pgrep -fx 'warden-secrets [0-9]+:[0-9]+'"
-    for c in rs256:RS256:rsa1 ps256:PS256:rsa1 eddsa:EdDSA:ed1; do
+    # v1.41: and the SHA-384 forms (CNSA's), ES384 on the issuer's P-384 key
+    # (EdDSA only where the host's provider offers Ed25519: not in FIPS mode)
+    ED=0; [ -s "$T/key-ed1.pem" ] && ED=1
+    for c in rs256:RS256:rsa1 ps256:PS256:rsa1 eddsa:EdDSA:ed1 rs384:RS384:rsa1 ps384:PS384:rsa1 es384:ES384:ec384; do
         n="${c%%:*}"; a="$(echo "$c" | cut -d: -f2)"; k="${c##*:}"
+        if [ "$n" = eddsa ] && [ "$ED" = 0 ]; then skip "an EdDSA token (this host's provider offers no Ed25519: FIPS mode)"; continue; fi
         mint "$n"; go "$n" "$T/p.txt" --on-behalf-of "$T/tok"
-        check "a $a token: verified with the issuer's key $k" sh -c "grep -qx 0 '$OUT/$n.rc' && grep -q 'token verified ($a, key $k)' '$OUT/$n.out'"
+        check "a $a token: verified with the issuer's key $k" sh -c "grep -qx 0 '$OUT/$n.rc' && grep -q 'token verified ($a, key $k)' '$OUT/$n.out'" ||
+            why "$n"
     done
     mint es256-nokid; go nokid "$T/p.txt" --on-behalf-of "$T/tok"
     check "a token naming no key, with one key for its algorithm: verified" sh -c "grep -qx 0 '$OUT/nokid.rc' && grep -q 'token verified (ES256)' '$OUT/nokid.out'"
+    mint es384-nokid; go nokid384 "$T/p.txt" --on-behalf-of "$T/tok"
+    check "an ES384 token naming no key: the issuer's one P-384 key (its P-256 key passed over)" sh -c "grep -qx 0 '$OUT/nokid384.rc' && grep -q 'token verified (ES384)' '$OUT/nokid384.out'"
     check "the keys from the issuer's discovery document" sh -c "grep -q 'GET /.well-known/openid-configuration' '$T/requests.log' && grep -q 'GET /jwks$' '$T/requests.log'"
     mint aud-array; go audarr "$T/p.txt" --on-behalf-of "$T/tok"
     check "an audience array holding the policy's audience: verified" ok audarr
@@ -237,6 +250,7 @@ no-sub|no subject|it has no subject (sub)
 sub-ctl|a subject with a control byte|its subject (sub) is not printable ASCII
 crit|a crit header|its header has crit
 act9|an act chain 9 deep|its act chain is nested deeper than 8
+es384-p256|an ES384 token naming the issuer's P-256 key (passed over, as a key of another type)|its key ec1 is not among the issuer's keys
 CASES
     # minted a moment before: 20 s less the second boundaries crossed since
     check "... the reason, with what is left of the 20 s" grep -Eq "the user's token: it expires in (18|19|20) s, under 60 s" "$OUT/t_near-expiry.out"
@@ -791,7 +805,8 @@ sys.exit(0 if P.get("varek:on_behalf_of.user.subject") == "alice@example.test" a
     VL() { python3 -c 'import importlib.machinery,sys
 m = importlib.machinery.SourceFileLoader("varekcli", sys.argv[1]).load_module()
 print(*m.issuer_keys(sys.argv[2], None, sys.argv[3]))' "$HERE/tools/varek" "$@"; }
-    check "varek doctor's issuer check: the stand-in's keys" sh -c "$(declare -f VL); HERE='$HERE' VL '$ISS' '$T/conf' | grep -q '^True 3 key(s) (EC, OKP, RSA) at $ISS/jwks'"
+    if [ "$ED" = 1 ]; then KEYS='4 key(s) (EC, OKP, RSA)'; else KEYS='3 key(s) (EC, RSA)'; fi
+    check "varek doctor's issuer check: the stand-in's keys" sh -c "$(declare -f VL); HERE='$HERE' VL '$ISS' '$T/conf' | grep -q '^True $KEYS at $ISS/jwks'"
     check "... and an issuer whose discovery names another" sh -c "$(declare -f VL); HERE='$HERE' VL '$ISS/liar' '$T/conf' | grep -q 'names another issuer'"
 fi
 

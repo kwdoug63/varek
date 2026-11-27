@@ -48,12 +48,12 @@ mkdir -p "$OUT"
 if [ "$DEPS" = 1 ]; then
     if command -v apt-get > /dev/null; then
         apt-get update -q &&
-        apt-get install -y -q build-essential libseccomp-dev libsodium-dev libssl-dev openjdk-21-jdk-headless \
+        apt-get install -y -q build-essential libseccomp-dev libssl-dev openjdk-21-jdk-headless \
             musl-tools python3-cryptography python3-pip python3-pytest python3-yaml python3-venv git openssl &&
         apt-get install -y -q --no-install-recommends squid || { echo "arm64_sweep.sh: apt-get failed"; exit 1; }
     elif command -v dnf > /dev/null; then
-        # RHEL 9 or a rebuild: libsodium is EPEL's, glibc-static CodeReady
-        # Builder's (tests/vm_cell.sh enables both). Amazon Linux 2023 (v1.36,
+        # RHEL 9 or a rebuild: glibc-static is CodeReady Builder's
+        # (tests/vm_cell.sh enables it; v1.41: no EPEL). Amazon Linux 2023 (v1.36,
         # the matrix's host cells): its own repositories, Java as Corretto.
         # A name the host's repositories do not have is left out (strict=0)
         # and the build's own packages are checked after; --allowerasing:
@@ -62,9 +62,9 @@ if [ "$DEPS" = 1 ]; then
         java="java-21-openjdk-devel"
         grep -q '^ID="*amzn' /etc/os-release && java="java-21-amazon-corretto-devel"
         dnf -y --allowerasing --setopt=strict=0 install gcc make git openssl libseccomp-devel openssl-devel \
-            libsodium-devel python3 python3-pip python3-cryptography "$java" squid curl util-linux \
+            python3 python3-pip python3-cryptography python3-pytest "$java" squid curl util-linux \
             glibc-static libasan libubsan gcc-c++ cmake procps-ng iproute sudo runc || { echo "arm64_sweep.sh: dnf failed"; exit 1; }
-        missing="$(rpm -q gcc make libseccomp-devel libsodium-devel openssl-devel python3 | sed -n 's/^package \(.*\) is not installed$/\1/p' | tr '\n' ' ')"
+        missing="$(rpm -q gcc make libseccomp-devel openssl-devel python3 | sed -n 's/^package \(.*\) is not installed$/\1/p' | tr '\n' ' ')"
         [ -z "$missing" ] || { echo "arm64_sweep.sh: the build needs $missing(not in this host's repositories)"; exit 1; }
         for p in "$java" squid glibc-static libasan libubsan runc; do
             rpm -q "$p" > /dev/null 2>&1 || echo "arm64_sweep.sh: note: no $p here (the suites that need it skip or fail)"
@@ -92,8 +92,15 @@ if [ "$DEPS" = 1 ]; then
     # one meets the requirement; z3 5 has none for aarch64 before glibc 2.38,
     # so on RHEL 9 it is built from source (gcc-c++ and cmake, above; about
     # half an hour)
-    python3 -m pip install $BSP --ignore-installed --prefer-binary -q \
+    # --require-hashes: every package at the version and hash
+    # requirements-sweep.txt names (compiled from requirements-sweep.in for
+    # Python 3.9 and later). It pins no pytest for 3.9 (each has a known
+    # vulnerability): there pytest is the distribution's python3-pytest
+    # (dnf, above; Ubuntu's apt list has it too)
+    python3 -m pip install $BSP --ignore-installed --prefer-binary --require-hashes -q \
         -r "$HERE/tools/requirements-sweep.txt" || { echo "arm64_sweep.sh: pip failed"; exit 1; }
+    python3 -c 'import pytest' 2> /dev/null ||
+        echo "arm64_sweep.sh: note: no pytest for this Python (test-cli fails)"
     # the cross-check oracle's solver is optional: without it that check skips.
     # Built from source, with gcc-toolset-13's compiler where RHEL has it
     # (above); its libstdc++ additions are linked in, so z3 runs on the

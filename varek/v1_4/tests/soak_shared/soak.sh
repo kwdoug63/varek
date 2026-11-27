@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# soak.sh — the shared soak of v1.28.1, v1.29.0 and v1.31.0: three runs of
-# the Warden side by side for 24 hours, then soak_check.py judges them.
+# soak.sh — the shared soak of v1.28.1, v1.29.0, v1.31.0 and, from v1.42.0,
+# its approvals: four runs of the Warden side by side for 24 hours, then
+# soak_check.py judges them.
 #
 #   A  (v1.28.1, v1.31.0) an agent on behalf of a user whose token the
 #      Warden verified, the egress proxy in inspecting mode: two confined MCP
@@ -18,6 +19,11 @@
 #      read-only but for build/ and .git/): every call the policy refuses is
 #      recorded and let through. At the end `varek policy suggest` drafts a
 #      policy from it, and a short dry run under the draft refuses nothing.
+#   D  (v1.42.0) approvals: each turn the agent reads a file a step_up rule
+#      holds (mode=hold) until soak_approver.py approves its runtime grant,
+#      and one a standing grant allows (signed by the run's approver key,
+#      --grants); every tenth turn a read a defer rule holds until its
+#      timeout (its marker never written): refused.
 #
 # Run as root on the droplet, from a checkout with the Warden and the test
 # program built (make -C varek/v1_4 all tests/v1281_sub), with
@@ -54,6 +60,7 @@ for c in openssl git; do command -v "$c" > /dev/null || { echo "soak.sh: needs $
 CGM="$(awk '$3 == "cgroup2" { print $2; exit }' /proc/self/mounts)"
 [ -n "$CGM" ] || { echo "soak.sh: needs cgroup v2 (the sub-agents and the MCP servers run in control groups)"; exit 2; }
 id nobody > /dev/null 2>&1 || { echo "soak.sh: needs the user nobody"; exit 2; }
+command -v groupadd > /dev/null || { echo "soak.sh: needs groupadd (run D's approvers' group)"; exit 2; }
 SECS=$(python3 -c "print(int(float('$HOURS') * 3600))")
 # run A's revocation: the user's token expires LEAD seconds before the end
 LEAD=$(python3 -c "print(int(min(max(5 * float('$INTERVAL'), 30), $SECS / 2)))")
@@ -87,7 +94,8 @@ finish() {
 # they were cut short, as by a host out of memory), with the same --hours,
 # --interval and --sign-key
 if [ "$CHECK_ONLY" = 1 ]; then
-    [ -n "$OUT" ] && [ -s "$OUT/a/verdicts.log" ] && [ -s "$OUT/b/verdicts.log" ] && [ -s "$OUT/c/verdicts.log" ] ||
+    [ -n "$OUT" ] && [ -s "$OUT/a/verdicts.log" ] && [ -s "$OUT/b/verdicts.log" ] && [ -s "$OUT/c/verdicts.log" ] &&
+        [ -s "$OUT/d/verdicts.log" ] ||
         { echo "soak.sh: --check-only needs --out DIR of a soak whose runs finished"; exit 2; }
     echo "soak.sh: the steps after the runs again, on $OUT (--check-only)"
     rm -f "$OUT/c/draft.txt" "$OUT/c/draft.log" "$OUT/c/draft.jsonl" "$OUT/c/draft.err"
@@ -99,12 +107,12 @@ fi
 if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
     echo "soak.sh: $OUT is not empty: give the soak a directory of its own (--out)"; exit 2
 fi
-mkdir -p "$OUT/a" "$OUT/b/work" "$OUT/b/outside" "$OUT/c/work" "$OUT/as"
-chmod 755 "$OUT" "$OUT/a" "$OUT/b" "$OUT/c" "$OUT/as"
+mkdir -p "$OUT/a" "$OUT/b/work" "$OUT/b/outside" "$OUT/c/work" "$OUT/d/grants" "$OUT/as"
+chmod 755 "$OUT" "$OUT/a" "$OUT/b" "$OUT/c" "$OUT/d" "$OUT/d/grants" "$OUT/as"
 chmod 1777 "$OUT/b/outside"                  # its owner's rights would let the agent write: only the policy refuses
 chown nobody "$OUT/b/work" "$OUT/c/work"
 mkdir -p "$AG/bin" "$AG/srv" "$AG/proj" "$S"; chmod 755 "$AG" "$AG/bin" "$AG/srv" "$AG/proj"; chmod 700 "$S"
-cp "$HERE/agent_a.py" "$HERE/build_agent.py" "$AG/"; chmod 644 "$AG/agent_a.py" "$AG/build_agent.py"
+cp "$HERE/agent_a.py" "$HERE/build_agent.py" "$HERE/agent_d.py" "$AG/"; chmod 644 "$AG/agent_a.py" "$AG/build_agent.py" "$AG/agent_d.py"
 cp "$HERE/fs_server.py" "$HERE/gh_server.py" "$AG/srv/"; chmod 755 "$AG/srv/fs_server.py" "$AG/srv/gh_server.py"
 for n in coder tester; do cp "$V14/tests/v1281_sub" "$AG/bin/$n"; chmod 755 "$AG/bin/$n"; done
 echo "project file a" > "$AG/proj/a"; echo "project file b" > "$AG/proj/b"
@@ -239,8 +247,44 @@ open(dst, "w").write("# the shared soak, run C (soak.sh): the baseline, the proj
 PY
 chmod 644 "$OUT/c/narrow.txt"
 
-# --- the three runs -----------------------------------------------------------
-echo "soak.sh: $HOURS h, a turn every $INTERVAL s (every tenth a probe in A and B), A revoked by its user's token $LEAD s before the end, into $OUT"
+# --- run D (v1.42.0): approvals ------------------------------------------------
+# its approver's key (pinned in the policy, of the group varek-soak-apv),
+# the standing grant it signs, and the files the agent reads
+mkdir -p "$AG/d"; chmod 755 "$AG/d"
+for f in held standing defer; do echo "run D's $f file" > "$AG/d/$f"; chmod 644 "$AG/d/$f"; done
+groupadd -f varek-soak-apv || { echo "soak.sh: could not make the group varek-soak-apv"; exit 1; }
+rm -f "$S/dkey" "$S/dkey.pub" "$S/d.marker"
+"$V14/tools/varek_keygen" "$S/dkey" > /dev/null || { echo "soak.sh: varek_keygen failed (run D's approver key)"; exit 1; }
+HT=$(python3 -c "print(max(30, int(2 * float('$INTERVAL'))))")             # a held read: approved within it
+DT=$(python3 -c "print(max(2, min(20, int(float('$INTERVAL') / 3))))")      # the deferral's timeout
+POLD="$OUT/d/policy.txt"
+{
+    echo "# the shared soak, run D (soak.sh): v1.42.0's approvals"
+    echo "require warden 1.42"
+    echo "approver key=$(cat "$S/dkey.pub") group=varek-soak-apv name=soak-standing"
+    for d in $SL; do echo "allow path $d readonly"; done
+    echo "allow path exact /etc/ld.so.cache readonly"
+    echo "allow path exact $AG/agent_d.py readonly"
+    echo "step_up path exact $AG/d/held mode=hold timeout=$HT"
+    echo "step_up path exact $AG/d/standing approvers=varek-soak-apv timeout=$HT"
+    echo "defer path exact $AG/d/defer until=$S/d.marker timeout=$DT scope=thread"
+} > "$POLD"
+chmod 644 "$POLD"
+SDL=$(grep -n "^step_up path exact $AG/d/standing " "$POLD" | cut -d: -f1)
+NT=$(python3 -c "print(int($SECS / float('$INTERVAL')) + 10)")
+SU=$(date -u -d "+$((SECS + 3600)) seconds" +%Y-%m-%dT%H:%M:%SZ)
+printf 'grant\nstep_up line %s\nallow path exact %s readonly\ncount %s\nuntil %s\n' "$SDL" "$AG/d/standing" "$NT" "$SU" \
+    > "$OUT/d/grants/standing.grant"
+"$V14/tools/varek_keygen" --sign grant "$S/dkey" "$OUT/d/grants/standing.grant" > /dev/null ||
+    { echo "soak.sh: could not sign run D's standing grant"; exit 1; }
+chmod 644 "$OUT/d/grants/standing.grant" "$OUT/d/grants/standing.grant.sig"
+DOPTS=(--grants "$OUT/d/grants")
+[ -n "$KEY" ] && DOPTS+=(--sign-key "$KEY")
+"$V14/warden" "$POLD" "${DOPTS[@]}" --check-startup > "$OUT/d/check.out" 2>&1 ||
+    { cat "$OUT/d/check.out"; echo "soak.sh: run D's Warden would not start"; exit 1; }
+
+# --- the four runs -------------------------------------------------------------
+echo "soak.sh: $HOURS h, a turn every $INTERVAL s (every tenth a probe in A and B, a deferral timing out in D), A revoked by its user's token $LEAD s before the end, into $OUT"
 T0=$(date +%s)
 env -i PATH=/usr/bin:/bin "$V14/warden" "$POLA" "${WOPTS[@]}" -- \
     /usr/bin/python3 "$AG/agent_a.py" --interval "$INTERVAL" --seconds "$SECS" --port "$PS" --dir "$AG" --store "$S/mt" \
@@ -253,28 +297,38 @@ WB=$!
       --log "$OUT/c/verdicts.log" -- python3 "$AG/build_agent.py" "${BOPTS[@]}" --outside "$OUT/c/work" ) \
     > "$OUT/c/agent.jsonl" 2> "$OUT/c/varek.err" &
 WC=$!
+( cd "$AG" && exec env -i PATH=/usr/bin:/bin "$V14/warden" "$POLD" "${DOPTS[@]}" -- \
+    /usr/bin/python3 "$AG/agent_d.py" --interval "$INTERVAL" --seconds "$SECS" --dir "$AG" ) \
+    > "$OUT/d/agent.jsonl" 2> "$OUT/d/verdicts.log" &
+WD=$!
+python3 "$HERE/soak_approver.py" --log "$OUT/d/verdicts.log" --pid "$WD" --out "$OUT/d/approvals.jsonl" \
+    > "$OUT/d/approver.out" 2>&1 &
+WAP=$!
+PIDS="$PIDS $WAP"
 # the OCSF export follows A's stream until its run_end
 python3 "$V14/tools/varek_ocsf.py" --follow "$OUT/a/verdicts.log" --policy "$POLA" --checker "$V14/tools/vdp_cert_check" \
     -o "$OUT/a/events.jsonl" > "$OUT/a/ocsf.out" 2>&1 &
 WO=$!
 # each process's memory, every ten turns (and once at the start)
 SAMPLE=$(python3 -c "print(max(int(10 * float('$INTERVAL')), 30))")
-( printf 't\twarden_a\tproxy_a\tsecrets_a\tfs\tgh\twarden_b\twarden_c\n'
+( printf 't\twarden_a\tproxy_a\tsecrets_a\tfs\tgh\twarden_b\twarden_c\twarden_d\n'
   sleep 5
   rss() { [ -n "$1" ] && ps -o rss= -p "$1" 2>/dev/null | tr -d ' '; }
-  while kill -0 "$WA" 2>/dev/null || kill -0 "$WB" 2>/dev/null || kill -0 "$WC" 2>/dev/null; do
+  while kill -0 "$WA" 2>/dev/null || kill -0 "$WB" 2>/dev/null || kill -0 "$WC" 2>/dev/null || kill -0 "$WD" 2>/dev/null; do
       px=$(pgrep -fx 'warden-proxy [0-9]+:[0-9]+' | head -1); sx=$(pgrep -fx 'warden-secrets [0-9]+:[0-9]+' | head -1)
       fs=$(pgrep -f "^/usr/bin/python3 $AG/srv/fs_server.py\$" | head -1); gh=$(pgrep -f "^/usr/bin/python3 $AG/srv/gh_server.py " | head -1)
       wb=$(pgrep -f "^$V14/warden $OUT/b/lib/" | head -1); wc=$(pgrep -f "^$V14/warden $OUT/c/narrow.txt" | head -1)
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$(rss "$WA")" "$(rss "$px")" "$(rss "$sx")" \
-          "$(rss "$fs")" "$(rss "$gh")" "$(rss "$wb")" "$(rss "$wc")"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$(rss "$WA")" "$(rss "$px")" "$(rss "$sx")" \
+          "$(rss "$fs")" "$(rss "$gh")" "$(rss "$wb")" "$(rss "$wc")" "$(rss "$WD")"
       sleep "$SAMPLE"
   done ) > "$OUT/rss.tsv" &
 PIDS="$PIDS $!"
 wait "$WA"; RA=$?
 wait "$WB"; RB=$?
 wait "$WC"; RC=$?
-echo "soak.sh: the runs finished (A exit $RA, B exit $RB, C exit $RC)"
+wait "$WD"; RD=$?
+wait "$WAP" 2>/dev/null
+echo "soak.sh: the runs finished (A exit $RA, B exit $RB, C exit $RC, D exit $RD)"
 for _ in $(seq 60); do kill -0 "$WO" 2>/dev/null || break; sleep 1; done
 kill "$WO" 2>/dev/null
 

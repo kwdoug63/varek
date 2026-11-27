@@ -92,7 +92,6 @@
 #include <sys/ioctl.h>
 #include <sys/file.h>
 #include <sys/mman.h>
-#include <sys/random.h>
 #include <sys/resource.h>
 #include <sys/prctl.h>
 #include <poll.h>
@@ -113,7 +112,8 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <limits.h>
-#include <sodium.h>              /* v1.16: SHA-256 chain, Ed25519 signatures */
+#include "varek_fips.h"          /* v1.41: all hashing/signing via the host OpenSSL provider
+                                  * (SHA-384 chain, ECDSA P-384 signatures); was libsodium */
 
 /* VAREK v1.6 plan-graph integration headers.
  * The v1_6/ directory ships these as a self-contained module; this
@@ -140,6 +140,7 @@
 #include "shared_domains.h"     /* v1.25 wildcards over shared domains, refused at load */
 #include "warden_proxy.h"       /* v1.26 the egress proxy process */
 #include "warden_secrets.h"     /* v1.28 the credentials' helper, warden-secrets */
+#include "warden_notify.h"      /* v1.42 step 7: the webhook poster, warden-notify */
 #include "proxy_parse.h"        /* v1.26 what the proxy reads (pp_kind_name) */
 
 /* Kernel/libc compatibility shims --------------------------------- */
@@ -290,6 +291,12 @@ struct action {
     bool          certified;            /* v1.15: the checker accepted the certificate */
     char          cert[420];            /* v1.15: the certificate, as record fields */
     char          check_why[160];       /* v1.15: why the checker refused it */
+    int           grant;                /* v1.42: 1 + the live grant that allowed it, 0: none */
+    int           grant_rule;           /* v1.42: the deciding rule in that grant */
+    char          gcert[600];           /* v1.42: the certificate's second half, as record fields */
+    bool          defer_ok;             /* v1.42 step 5: allowed under a defer rule, its marker passing */
+    char          df_sha[65];           /* ... the marker's SHA-256 */
+    bool          unk;                  /* v1.42 step 5: held under `on unknown defer escalate` */
     int           connect_family;
     int           connect_port;
     /* v1.21: decided connections and relayed sends */
@@ -564,11 +571,43 @@ static int policy_load(const char *path, struct policy *p) {
             strcmp(ci.subagent, r->subagent) ||
             /* v1.31: the subject a rule decides for, the confined subject it launches, an mcp server's pin */
             ci.subj != r->subj || ci.confined_subj != r->confined_subj || ci.mcp_server != r->mcp_server ||
-            strcmp(ci.sha256, r->sha256)) {
+            strcmp(ci.sha256, r->sha256) ||
+            /* v1.42: a step_up rule and its options */
+            ci.step_up != (r->verb == VDP_STEP_UP) || ci.su_mode != r->su_mode || ci.su_scope != r->su_scope ||
+            ci.su_timeout != r->su_timeout || strcmp(ci.su_approvers, r->su_approvers) ||
+            strcmp(ci.su_notify, r->su_notify) ||
+            /* v1.42 step 5: a defer rule, its marker and escalate */
+            ci.defer != (r->verb == VDP_DEFER) || ci.su_escalate != r->su_escalate || strcmp(ci.df_until, r->df_until)) {
             fprintf(stderr, "[warden] policy %s:%d: the decision procedure and the certificate "
                     "checker read this rule differently; refusing to start\n", path, r->line);
             return -1;
         }
+    }
+    /* v1.42 step 5: and the `on unknown` line */
+    if (p->v.unk_line != p->c.unk_line || p->v.unk_timeout != p->c.unk_timeout ||
+        p->v.unk_scope != (uint8_t)p->c.unk_scope || strcmp(p->v.unk_approvers, p->c.unk_approvers)) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read the "
+                "`on unknown` line differently; refusing to start\n", path);
+        return -1;
+    }
+    /* v1.42 step 6: and the approvers' pinned keys */
+    bool apv_same = p->v.napprovers == p->c.napprovers;
+    for (size_t k = 0; apv_same && k < p->v.napprovers; k++)
+        apv_same = !strcmp(p->v.approvers[k].key, p->c.approvers[k].key) &&
+                   !strcmp(p->v.approvers[k].group, p->c.approvers[k].group) &&
+                   !strcmp(p->v.approvers[k].name, p->c.approvers[k].name) &&
+                   p->v.approvers[k].line == p->c.approvers[k].line;
+    if (!apv_same) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read the "
+                "approver lines differently; refusing to start\n", path);
+        return -1;
+    }
+    /* v1.42 step 5b: and the `on outside_plan` line */
+    if (p->v.op_line != p->c.op_line || p->v.op_timeout != p->c.op_timeout ||
+        p->v.op_scope != (uint8_t)p->c.op_scope || strcmp(p->v.op_approvers, p->c.op_approvers)) {
+        fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read the "
+                "`on outside_plan` line differently; refusing to start\n", path);
+        return -1;
     }
     /* v1.26: and the proxy directives */
     bool proxy_same = p->v.proxy == (p->c.proxy != 0) && p->v.proxy_nports == p->c.proxy_nports;
@@ -669,7 +708,7 @@ static int policy_load(const char *path, struct policy *p) {
             fprintf(stderr, "[warden] policy %s:%d: WARNING: %s %s rule can never "
                     "fire: every action it matches is decided by an earlier rule, "
                     "or it matches no string within the length bound\n",
-                    path, r->line, r->verb == VDP_ALLOW ? "allow" : "deny",
+                    path, r->line, vdp_verb_name(r->verb),
                     vdp_kind_name(r->kind));
         } else if (rr == VDP_REACH_UNKNOWN) {
             fprintf(stderr, "[warden] policy %s:%d: note: reachability not decided "
@@ -703,6 +742,20 @@ static int policy_load(const char *path, struct policy *p) {
             !vdp_host_rule_ok(&p->v.rules[i], hw, sizeof hw))
             hostnever++;
     }
+#ifdef VAREK_NO_TLS_INSPECT
+    /* v1.41, Defense build: the egress proxy's TLS-inspecting mode is not
+     * compiled in. A policy that asks for it is refused here, on every path
+     * that loads a policy (lint, --check-startup, --oci-filter, a run), so it
+     * can never fall back to running uninspected. The parsers require
+     * `proxy inspect` for request rules, mcp rules, credentials and
+     * passthrough hosts, so this refuses those too. */
+    if (p->v.proxy_inspect) {
+        fprintf(stderr, "[warden] policy %s: refused: it says `proxy inspect`, and this VAREK Defense build "
+                "does not include the egress proxy's TLS-inspecting mode (request rules, mcp rules, "
+                "credentials and passthrough hosts need it); `proxy on` gates by host name and port\n", path);
+        return -1;
+    }
+#endif
     fprintf(stderr, "[warden] loaded policy %s v%s with %zu rules (%zu can never fire%s), "
             "sha256 %s\n", p->name, p->version, p->v.n, dead,
             hostnever ? "; some host rules can never match a connect, see the notes" : "",
@@ -1276,6 +1329,24 @@ static int sub_policy_subject(int s);  /* v1.31: warden_subagent.inc.c */
 static int act_policy_subject(const struct action *a) {
     return a->plan_psubj > 0 ? a->plan_psubj - 1 : sub_policy_subject(a->subject);
 }
+/* v1.42 step 2 (warden_grant.inc.c): runtime grants */
+static vdp_verdict_t grant_decide(const struct policy *p, const struct action *a, int subj, vdp_kind_t kind,
+                                  const char *s, uint32_t flags, bool has_flags, int *ri, vdp_why_t *why,
+                                  int *grant, int *grant_rule);
+static bool grant_certify(const struct policy *p, struct action *a, int subj, int kind, const char *s,
+                          bool has_flags, const vdpc_cert_t *su);
+static void step_up_note(const struct action *a, decision_t d_raw, decision_t d_final, char *buf, size_t n);
+static void step_up_after(uint64_t seq);
+static void grant_end_all(void);
+static bool hold_take(pid_t pid, const struct action *a, decision_t d_raw, decision_t d_final,
+                      const char *rule_id, uint64_t latency_ns);     /* v1.42 step 3 */
+static bool hold_swallow(uint64_t id, bool refusal);
+static void hold_round(int notify_fd);
+static void hold_cur(const struct seccomp_notif *req);
+static bool hold_replay_pop(struct seccomp_notif *req);
+static void held_check(void);
+static bool df_marker(const vdp_rule_t *r, char sha[65], char *why, size_t wn);   /* v1.42 step 5 */
+
 static decision_t policy_decide(const struct policy *p, struct action *a)
 {
     /* v1.13: every decision is made by the SMT decision procedure
@@ -1288,6 +1359,10 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
     a->policy_line = -1;
     a->rule_index = -1;
     a->why = NULL;
+    a->grant = 0;                        /* v1.42 */
+    a->grant_rule = -1;
+    a->defer_ok = false;                 /* v1.42 step 5 */
+    a->df_sha[0] = '\0';
     /* v1.28 step 4: after `varek revoke`, nothing more is allowed */
     if (g_revoked) { a->why = "revoked"; return DEC_DENY; }
     vdp_kind_t kind;
@@ -1325,13 +1400,20 @@ static decision_t policy_decide(const struct policy *p, struct action *a)
     }
     int ri;
     vdp_why_t why;
-    /* v1.31: by the calling subject's rules (the Warden's attribution) */
-    vdp_verdict_t v = vdp_decide_subj(&p->v, act_policy_subject(a), kind, s, vdp_oflags_from_native((uint32_t)a->open_flags),
-                                      kind == VDP_KIND_PATH && a->flags_known,
-                                      &ri, &why);
+    /* v1.31: by the calling subject's rules (the Warden's attribution);
+     * v1.42: within the run's live grants, when a step_up rule decides */
+    vdp_verdict_t v = grant_decide(p, a, act_policy_subject(a), kind, s, vdp_oflags_from_native((uint32_t)a->open_flags),
+                                   kind == VDP_KIND_PATH && a->flags_known,
+                                   &ri, &why, &a->grant, &a->grant_rule);
     a->why = vdp_why_name(why);
     a->rule_index = ri;
     if (ri >= 0) a->policy_line = p->v.rules[ri].line;
+    /* v1.42 step 5: a defer rule allows the call while its marker passes
+     * (certify then has the checker confirm the defer rule decides it) */
+    if (v == VDP_UNSATISFIED && ri >= 0 && p->v.rules[ri].verb == VDP_DEFER) {
+        char mw[160];
+        if (df_marker(&p->v.rules[ri], a->df_sha, mw, sizeof mw)) { a->defer_ok = true; return DEC_ALLOW; }
+    }
     switch (v) {
         case VDP_SATISFIED:   return DEC_ALLOW;
         case VDP_UNSATISFIED: return DEC_DENY;
@@ -1369,6 +1451,7 @@ static int exec_access_x(int ofd, const struct action *a);   /* v1.27: warden_ex
 static bool certify(const struct policy *p, struct action *a) {
     a->certified = false;
     a->cert[0] = '\0';
+    a->gcert[0] = '\0';
     a->check_why[0] = '\0';
     int kind;
     const char *s;
@@ -1420,7 +1503,22 @@ static bool certify(const struct policy *p, struct action *a) {
      * attribution (not the procedure's), recorded when it is not the agent */
     int subj = act_policy_subject(a);
     if (subj && (size_t)n < sizeof a->cert) snprintf(a->cert + n, sizeof a->cert - (size_t)n, ",\"cert_subject\":%d", subj);
-    if (!vdpc_check_subj(&p->c, subj, kind, s, strlen(s), vdp_oflags_from_native((uint32_t)a->open_flags), has_flags, &cc,
+    /* v1.42 step 5: an ALLOW under a defer rule, its marker passing: the
+     * checker confirms the defer rule decides the call; the marker is named */
+    if (a->defer_ok) {
+        const char *mp = a->rule_index >= 0 ? p->v.rules[a->rule_index].df_until : "";
+        size_t gn = (size_t)snprintf(a->gcert, sizeof a->gcert, ",\"cert_defer\":true,\"defer_marker\":{\"path\":\"");
+        for (const char *q = mp; *q && gn + 8 < sizeof a->gcert; q++) {
+            if (*q == '"' || *q == '\\') a->gcert[gn++] = '\\';
+            a->gcert[gn++] = *q;
+        }
+        snprintf(a->gcert + gn, sizeof a->gcert - gn, "\",\"sha256\":\"%s\"}", a->df_sha);
+    }
+    /* v1.42: an ALLOW under a grant: the checker verifies both halves */
+    if (a->defer_ok ? !vdpc_check_defer(&p->c, subj, kind, s, strlen(s), vdp_oflags_from_native((uint32_t)a->open_flags),
+                                        has_flags, &cc, a->check_why, sizeof a->check_why) :
+        a->grant > 0 ? !grant_certify(p, a, subj, kind, s, has_flags, &cc) :
+        !vdpc_check_subj(&p->c, subj, kind, s, strlen(s), vdp_oflags_from_native((uint32_t)a->open_flags), has_flags, &cc,
                          a->check_why, sizeof a->check_why)) {
         for (char *q = a->check_why; *q; q++)          /* recorded inside a JSON string */
             if (*q == '"' || *q == '\\' || (unsigned char)*q < 0x20) *q = '\'';
@@ -1569,8 +1667,8 @@ static int plan_snapshot(const char *path) {
     }
     close(fd);
     unsigned char h[32];
-    crypto_hash_sha256(h, (const unsigned char *)b, n);
-    sodium_bin2hex(g_plan_snap_sha, sizeof g_plan_snap_sha, h, sizeof h);
+    if (vfips_sha256(b, n, h) != 0) { free(b); errno = EIO; return -1; }
+    vfips_bin2hex(g_plan_snap_sha, sizeof g_plan_snap_sha, h, sizeof h);
     free(g_plan_snap);
     g_plan_snap = b, g_plan_snap_len = n;
     snprintf(g_plan_snap_path, sizeof g_plan_snap_path, "%s", path);
@@ -2081,9 +2179,13 @@ static plan_decision_t warden_plan_decider(const plan_spec_action_t *a,
 /* v1.35 step 4c: a plan read already (parsed, or NULL with err): under the
  * node agent it is read in the node's view and decided in the container's
  * (node_supervise); it is freed here */
+static plan_decision_t g_plan_last_pd;   /* v1.42 step 5b: the last plan gate's verdict (an extension's) */
+static size_t g_plan_last_n;             /* ... and its steps */
 static int warden_verify_plan_parsed(plan_parsed_t *parsed, const char *err, const char *plan_path,
                                      const struct policy *policy, bool records)
 {
+    g_plan_last_pd = PLAN_DEC_UNKNOWN;
+    g_plan_last_n = 0;
     if (!parsed) {
         fprintf(stderr, "[warden] plan load failed: %s\n", err);
         if (records) emit_plan_gate_basic(plan_path, 0, 0, PLAN_DEC_UNKNOWN, err, NULL);
@@ -2109,6 +2211,8 @@ static int warden_verify_plan_parsed(plan_parsed_t *parsed, const char *err, con
     /* v1.21.1: read the count before the plan is freed (spec points into it;
      * through v1.21.0 it was read after plan_parser_free). */
     size_t n_actions = spec->n_actions, n_edges = spec->n_edges;
+    g_plan_last_pd = pd;
+    g_plan_last_n = n_actions;
     pathology_sink_free(sink);
     plan_parser_free(parsed);
     char why[32] = "";
@@ -2228,6 +2332,29 @@ static int g_obo_on_expiry;                         /* v1.28.1 step 4: 0 revoke 
 /* v1.28.1 step 3: sub-agents (warden_subagent.inc.c) */
 static bool g_sub_on;                               /* the policy names a sub-agent */
 static char g_cg_self[PATH_MAX];                    /* the run's group as /proc/<pid>/cgroup shows it */
+static bool g_frz_want;                 /* v1.42 step 4: the policy holds calls with scope=run */
+static bool g_frz_ok;                   /* ... and the run can be frozen */
+static char g_frz_why[200];             /* ... or why it cannot */
+static bool g_waitkill;                 /* the kernel ends a held call's wait on a fatal signal only */
+/* v1.42 step 6: the plan's approval (warden_signed.inc.c), for run_start */
+static bool g_plan_apv;
+static char g_plan_apv_key[195], g_plan_apv_name[33], g_plan_apv_group[33], g_plan_apv_sig[VFIPS_SIG_HEX_MAX + 1];
+static char g_plan_apv_note[400];
+/* v1.42 step 7: the user's request (--intent FILE), as the agent framework
+ * received it: context for approvers, never for a decision (no rule
+ * matches on it). Its SHA-256 and length in run_start, with its text when
+ * it is UTF-8 of at most 4 KiB, else in a file beside the verdict stream. */
+#define INTENT_MAX        (1u << 20)
+#define INTENT_INLINE_MAX 4096u
+static unsigned char *g_intent;
+static size_t g_intent_len;
+static bool   g_intent_on, g_intent_utf8, g_intent_inline;
+static char   g_intent_sha[65];
+static char   g_intent_file[256];         /* the side file's name (in the stream's directory) */
+/* v1.42 step 7: warden-notify (warden_notify.inc.c), for run_start */
+static char   g_nt_bin_sha[65];           /* the SHA-256 of the warden-notify that runs */
+static uid_t  g_nt_uid;
+static gid_t  g_nt_gid;
 static void sub_obo(FILE *f, int s);
 static bool sub_cgroup_write(int fd, int flags);
 static char       g_cred_ph[WS_MAX_CREDS][WP_PH_MAX]; /* v1.28: each credential's placeholder (not a secret) */
@@ -2265,14 +2392,18 @@ static bool     g_relay_midline = false;
  *
  *   1. Hash chain (always on). Every record of this run (run_start, each
  *      decision record, checkpoint, anchor_error, run_end) ends with
- *        "chain":"<hex>"   chain_i = SHA-256(chain_{i-1} || body_i)
+ *        "chain":"<hex>"   chain_i = SHA-384(chain_{i-1} || body_i)
  *      where body_i is the record's exact bytes from its '{' up to (not
  *      including) the ',"chain":' that follows, and chain_{-1} =
- *      SHA-256("VAREK-LOG-CHAIN-1"). Editing, inserting, removing or
+ *      SHA-384("VAREK-LOG-CHAIN-2"). Editing, inserting, removing or
  *      reordering any record changes every chain value after it.
- *   2. Ed25519 signatures (--sign-key). run_start, every checkpoint and
- *      run_end also carry "sig": an Ed25519 signature over
- *      "VAREK-LOG-SIG-1" || chain_i (the raw 32 bytes). A checkpoint is written
+ *   2. ECDSA P-384 signatures (--sign-key). run_start, every checkpoint and
+ *      run_end also carry "sig": a DER ECDSA signature (SHA-384, curve P-384)
+ *      over "VAREK-LOG-SIG-2" || chain_i (the raw 48 bytes), computed by the
+ *      host OpenSSL provider. run_start says "log":"chain-2" and
+ *      "sigalg":"ecdsa-p384-sha384". (Through v1.40 the format was chain-1:
+ *      SHA-256 and Ed25519 over "VAREK-LOG-SIG-1"; the audit still verifies
+ *      those logs.) A checkpoint is written
  *      after every N decision records (--checkpoint-every, default 64) and once
  *      a second while records are pending. With the public key pinned, an
  *      auditor detects any change to the log up to the last signature; without
@@ -2288,12 +2419,16 @@ static bool     g_relay_midline = false;
  *
  * Human status lines ("[warden] ...") and the agent's relayed stderr
  * ("[agent] ...") are not records and are not chained. */
-#define LOG_CHAIN_IV   "VAREK-LOG-CHAIN-1"
-#define LOG_SIG_DOMAIN "VAREK-LOG-SIG-1"
-static unsigned char g_chain[32];
+/* v1.41: format chain-2 — SHA-384 chain, ECDSA P-384 (SHA-384) signatures over
+ * "VAREK-LOG-SIG-2" || chain. Streams written before v1.41 say "chain-1"
+ * (SHA-256, Ed25519, "VAREK-LOG-SIG-1"); tools/varek_audit.py verifies both. */
+#define LOG_CHAIN_IV   "VAREK-LOG-CHAIN-2"
+#define LOG_SIG_DOMAIN VFIPS_LOG_SIG_DOMAIN
+#define LOG_CHAIN_FMT  "chain-2"
+static unsigned char g_chain[VFIPS_CHAIN_LEN];
 static bool          g_signing = false;
-static unsigned char g_pk[crypto_sign_PUBLICKEYBYTES];
-static unsigned char *g_sk;                /* sodium_malloc: guarded, locked, not dumped */
+static char          g_pub_hex[VFIPS_PUB_HEX_MAX];   /* the signing key's public point */
+static vfips_key    *g_key;                /* held by OpenSSL (secure heap); never in the clear here */
 static int           g_anchor_fd = -1;
 static bool          g_anchor_fifo = false;  /* v1.16.2: held read-write; drained at exit */
 static char          g_anchor_lock[PATH_MAX + 8];  /* v1.16.2: the forwarder's liveness lock */
@@ -2377,20 +2512,27 @@ static void rec_end(const char *ckpt_event) {
         abort();
     }
     size_t bl = g_rl - 2;
-    crypto_hash_sha256_state st;
-    crypto_hash_sha256_init(&st);
-    crypto_hash_sha256_update(&st, g_chain, sizeof g_chain);
-    crypto_hash_sha256_update(&st, (const unsigned char *)g_rb, bl);
-    crypto_hash_sha256_final(&st, g_chain);
-    char chain_hex[65], sig_hex[2 * crypto_sign_BYTES + 1];
-    sodium_bin2hex(chain_hex, sizeof chain_hex, g_chain, sizeof g_chain);
+    /* A chain or signature the provider cannot compute stops supervision
+     * (fail closed), as a stream that cannot be written does. */
+    vfips_md *st = vfips_md_new(384);
+    if (!st || vfips_md_update(st, g_chain, sizeof g_chain) != 0 ||
+        vfips_md_update(st, (const unsigned char *)g_rb, bl) != 0 ||
+        vfips_md_final(st, g_chain) != 0) {
+        fprintf(stderr, "[warden] audit chain: SHA-384 via the host crypto provider failed; stopping\n");
+        abort();
+    }
+    vfips_md_free(st);
+    char chain_hex[2 * VFIPS_CHAIN_LEN + 1], sig_hex[VFIPS_SIG_HEX_MAX];
+    vfips_bin2hex(chain_hex, sizeof chain_hex, g_chain, sizeof g_chain);
     bool sign = ckpt_event && g_signing;
     if (sign) {
-        unsigned char msg[sizeof LOG_SIG_DOMAIN - 1 + 32], sig[crypto_sign_BYTES];
+        unsigned char msg[sizeof LOG_SIG_DOMAIN - 1 + VFIPS_CHAIN_LEN];
         memcpy(msg, LOG_SIG_DOMAIN, sizeof LOG_SIG_DOMAIN - 1);
-        memcpy(msg + sizeof LOG_SIG_DOMAIN - 1, g_chain, 32);
-        crypto_sign_detached(sig, NULL, msg, sizeof msg, g_sk);
-        sodium_bin2hex(sig_hex, sizeof sig_hex, sig, sizeof sig);
+        memcpy(msg + sizeof LOG_SIG_DOMAIN - 1, g_chain, VFIPS_CHAIN_LEN);
+        if (vfips_sign(g_key, msg, sizeof msg, sig_hex, sizeof sig_hex) < 0) {
+            fprintf(stderr, "[warden] verdict stream: ECDSA P-384 signing failed; stopping\n");
+            abort();
+        }
     }
     log_line_start();
     fwrite(g_rb, 1, bl, g_log);
@@ -2419,7 +2561,7 @@ static void emit_anchor_error(const char *event, int err) {
  * file cannot be made, it goes on in this one (it is whole either way), and
  * is tried again after as much again. */
 static void seg_rotate(void) {
-    char name[256], prev[65];
+    char name[256], prev[2 * VFIPS_CHAIN_LEN + 1];
     int n = snprintf(name, sizeof name, "%s.jsonl.%u", g_seg_base, g_seg + 1);
     /* this segment whole on disk before the next is there (a follower moves
      * on when it sees the next) */
@@ -2442,7 +2584,7 @@ static void seg_rotate(void) {
     close(fd);
     g_seg++;
     g_seg_bytes = 0;
-    sodium_bin2hex(prev, sizeof prev, g_chain, sizeof g_chain);
+    vfips_bin2hex(prev, sizeof prev, g_chain, sizeof g_chain);
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     g_rotating = true;
@@ -2499,15 +2641,12 @@ static int log_init(void) {
     /* v1.16: records are built here, then chained and written in one piece. */
     g_rf = open_memstream(&g_rb, &g_rl);
     if (!g_rf) return -1;
-    crypto_hash_sha256(g_chain, (const unsigned char *)LOG_CHAIN_IV, sizeof LOG_CHAIN_IV - 1);
+    if (vfips_sha384(LOG_CHAIN_IV, sizeof LOG_CHAIN_IV - 1, g_chain) != 0) return -1;
     clock_gettime(CLOCK_MONOTONIC, &g_last_ckpt);
+    /* v1.41: the run id from the crypto provider's DRBG (the FIPS provider's
+     * in the Defense build), as every other random byte the Warden uses */
     unsigned char rnd[16];
-    size_t got = 0;
-    while (got < sizeof rnd) {
-        ssize_t n = getrandom(rnd + got, sizeof rnd - got, 0);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
-        got += (size_t)n;
-    }
+    if (vfips_rand(rnd, sizeof rnd) != 0) return -1;
     for (size_t i = 0; i < sizeof rnd; i++)
         snprintf(g_run_id + 2 * i, 3, "%02x", rnd[i]);
     return 0;
@@ -2557,6 +2696,11 @@ static int relay_agent_stderr(int fd, bool drain_all) {
 /* v1.28.1: run_start's on_behalf_of and operator */
 static void emit_on_behalf_of(FILE *f, const struct policy *p) {
     const struct ws_identity *id = &g_identity;
+    if (g_frz_want) {                                /* v1.42 step 4: can the run be frozen (scope=run)? */
+        fprintf(f, "\"scope_run\":{\"freeze\":%s,\"%s\":\"", g_frz_ok ? "true" : "false", g_frz_ok ? "cgroup" : "why");
+        json_escape(f, g_frz_ok ? g_cg_self : g_frz_why);
+        fputs("\"},", f);
+    }
     fputs("\"on_behalf_of\":{", f);
     if (id->has_user) {
         /* v1.31: the issuer is the policy's, or found through a trusted MCP resource */
@@ -2628,6 +2772,110 @@ static void emit_on_behalf_of(FILE *f, const struct policy *p) {
 }
 
 static void as_agent_record(FILE *f);   /* v1.29: warden_asagent.inc.c */
+/* v1.42 step 7: UTF-8, with no NUL, overlong form, surrogate or code
+ * point past U+10FFFF */
+static bool utf8_ok(const unsigned char *b, size_t n) {
+    for (size_t i = 0; i < n;) {
+        unsigned c = b[i];
+        size_t k;
+        unsigned cp;
+        if (c == 0) return false;
+        if (c < 0x80) { i++; continue; }
+        if (c >= 0xc2 && c <= 0xdf) { k = 1; cp = c & 0x1f; }
+        else if (c >= 0xe0 && c <= 0xef) { k = 2; cp = c & 0x0f; }
+        else if (c >= 0xf0 && c <= 0xf4) { k = 3; cp = c & 0x07; }
+        else return false;
+        if (i + k >= n) return false;
+        for (size_t j = 1; j <= k; j++) {
+            if ((b[i + j] & 0xc0) != 0x80) return false;
+            cp = (cp << 6) | (b[i + j] & 0x3f);
+        }
+        if ((k == 2 && (cp < 0x800 || (cp >= 0xd800 && cp <= 0xdfff))) || (k == 3 && (cp < 0x10000 || cp > 0x10ffff)))
+            return false;
+        i += k + 1;
+    }
+    return true;
+}
+
+/* v1.42 step 7: --intent FILE, read at the start: a regular file (not
+ * through a symlink at its last name) of at most 1 MiB. 0, or -1 with the
+ * reason on stderr. */
+static int intent_load(const char *path) {
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY | O_NONBLOCK);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size > (off_t)INTENT_MAX) {
+        fprintf(stderr, "[warden] --intent %s: %s; refusing to start\n", path,
+                fd < 0 ? (errno == ELOOP ? "a symbolic link" : strerror(errno))
+                       : !S_ISREG(st.st_mode) ? "not a regular file" : "over 1 MiB");
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    g_intent = malloc((size_t)st.st_size + 1);
+    size_t n = 0;
+    while (g_intent && n <= INTENT_MAX) {
+        ssize_t r = read(fd, g_intent + n, (size_t)st.st_size + 1 - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        n += (size_t)r;
+        if (n == (size_t)st.st_size + 1) break;          /* it grew: refused below */
+    }
+    close(fd);
+    if (!g_intent || n != (size_t)st.st_size) {
+        fprintf(stderr, "[warden] --intent %s: %s; refusing to start\n", path,
+                g_intent ? "it changed while it was read" : "out of memory");
+        return -1;
+    }
+    g_intent[n] = '\0';
+    g_intent_len = n;
+    unsigned char d[32];
+    if (vfips_sha256(g_intent, n, d) != 0) {
+        fprintf(stderr, "[warden] --intent: SHA-256 via the host crypto provider failed\n");
+        return -1;
+    }
+    vfips_bin2hex(g_intent_sha, sizeof g_intent_sha, d, sizeof d);
+    g_intent_utf8 = utf8_ok(g_intent, n);
+    g_intent_inline = g_intent_utf8 && n <= INTENT_INLINE_MAX;
+    g_intent_on = true;
+    return 0;
+}
+
+/* v1.42 step 7: a request not kept in run_start is written beside the
+ * verdict stream (the Warden's stderr, a regular file), as STREAM.intent:
+ * made anew (never over a file), root's, 0600. 0, or -1 with the reason on
+ * stderr. */
+static int intent_side_write(void) {
+    if (!g_intent_on || g_intent_inline) return 0;
+    char lp[PATH_MAX];
+    struct stat st;
+    ssize_t n = proc_readlinkf(lp, sizeof lp - 16, "self/fd/2");
+    if (n <= 0 || lp[0] != '/' || fstat(STDERR_FILENO, &st) < 0 || !S_ISREG(st.st_mode)) {
+        fprintf(stderr, "[warden] --intent: the request is %s, so it is kept beside the verdict stream, which is "
+                "not a file here; refusing to start\n", g_intent_utf8 ? "over 4 KiB" : "not UTF-8 text");
+        return -1;
+    }
+    memcpy(lp + n, ".intent", sizeof ".intent");      /* n < sizeof lp - 16 */
+    const char *bn = strrchr(lp, '/') + 1;
+    if (strlen(bn) >= sizeof g_intent_file) { fprintf(stderr, "[warden] --intent: the stream's name is too long\n"); return -1; }
+    int fd = open(lp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "[warden] --intent: cannot make %s: %s; refusing to start\n", lp, strerror(errno));
+        return -1;
+    }
+    for (size_t off = 0; off < g_intent_len;) {
+        ssize_t w = write(fd, g_intent + off, g_intent_len - off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) {
+            fprintf(stderr, "[warden] --intent: writing %s failed; refusing to start\n", lp);
+            close(fd);
+            return -1;
+        }
+        off += (size_t)w;
+    }
+    if (fsync(fd) < 0 || close(fd) < 0) { fprintf(stderr, "[warden] --intent: writing %s failed\n", lp); return -1; }
+    memcpy(g_intent_file, bn, strlen(bn) + 1);
+    return 0;
+}
+
 static void emit_run_start(const char *policy_path, const struct policy *p) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -2645,13 +2893,29 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
 #endif
             );
     /* v1.16: how this stream is protected (see the log integrity notes). */
-    fputs("\"log\":\"chain-1\",", f);
+    fputs("\"log\":\"" LOG_CHAIN_FMT "\",", f);
+    /* v1.41: the provider that computes the stream's chain and signatures
+     * ("fips": the host's FIPS 140-3 validated module), recorded in run_start,
+     * which is signed, so a log's holder cannot change it undetected */
+    fprintf(f, "\"crypto_provider\":\"%s\",", vfips_provider_label());
     /* v1.35 step 4: the run is held to this plan (if it passes the gate) */
     if (g_hold_req) fprintf(f, "\"hold\":{\"plan\":\"%s\",\"plan_sha256\":\"%s\"},", g_hold_plan_json, g_hold_plan_sha);
+    /* v1.42 step 6: the plan's approval, signed by a pinned approver's key over the plan's bytes */
+    if (g_plan_apv)
+        fprintf(f, "\"plan_approved_by\":{\"key\":\"%s\",\"name\":\"%s\",\"group\":\"%s\",\"sig\":\"%s\","
+                "\"plan_sha256\":\"%s\"},", g_plan_apv_key, g_plan_apv_name, g_plan_apv_group, g_plan_apv_sig, g_plan_snap_sha);
+    else if (g_plan_apv_note[0]) { fputs("\"plan_approval_note\":\"", f); json_escape(f, g_plan_apv_note); fputs("\",", f); }
+    /* v1.42 step 7: the user's request, and warden-notify */
+    if (g_intent_on) {
+        fprintf(f, "\"intent\":{\"sha256\":\"%s\",\"bytes\":%zu,", g_intent_sha, g_intent_len);
+        if (g_intent_inline) { fputs("\"text\":\"", f); json_escape(f, (const char *)g_intent); fputs("\"},", f); }
+        else { fputs("\"file\":\"", f); json_escape(f, g_intent_file); fputs("\"},", f); }
+    }
+    if (g_nt_bin_sha[0])
+        fprintf(f, "\"notify\":{\"helper_sha256\":\"%s\",\"uid\":%u,\"gid\":%u},", g_nt_bin_sha,
+                (unsigned)g_nt_uid, (unsigned)g_nt_gid);
     if (g_signing) {
-        char pk_hex[2 * crypto_sign_PUBLICKEYBYTES + 1];
-        sodium_bin2hex(pk_hex, sizeof pk_hex, g_pk, sizeof g_pk);
-        fprintf(f, "\"log_pubkey\":\"%s\",", pk_hex);
+        fprintf(f, "\"log_pubkey\":\"%s\",\"sigalg\":\"%s\",", g_pub_hex, VFIPS_SIGALG_P384);
     }
     if (checkpoints_on())
         fprintf(f, "\"checkpoint_every\":%" PRIu64 ",", g_ckpt_every);
@@ -2802,7 +3066,7 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
             if (r->kind == VDP_KIND_HOST && r->s.name) g_any_name = true;
             if (r->kind == VDP_KIND_HOST && r->s.wild && r->verb == VDP_ALLOW) g_any_wild = true;
             if (r->kind != VDP_KIND_HOST || !r->s.name || r->s.wild) continue;
-            if (r->verb != (pass == 0 ? VDP_ALLOW : VDP_DENY)) continue;
+            if ((r->verb == VDP_ALLOW) != (pass == 0)) continue;   /* v1.42: step_up names with deny's */
             char name[WR_NAME_MAX + 1];
             const char *colon = memchr(r->s.c, ':', r->s.len);
             size_t nl = colon ? (size_t)(colon - r->s.c) : r->s.len;
@@ -2852,17 +3116,19 @@ static int names_setup(const struct policy *p, const wr_config_t *cfg) {
 static int sha256_file_hex(const char *path, char out[65]) {
     FILE *f = fopen(path, "re");
     if (!f) return -1;
-    crypto_hash_sha256_state st;
-    crypto_hash_sha256_init(&st);
+    vfips_md *st = vfips_md_new(256);
+    if (!st) { fclose(f); return -1; }
     unsigned char buf[65536];
     size_t n;
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0) crypto_hash_sha256_update(&st, buf, n);
+    int upd = 0;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) upd |= vfips_md_update(st, buf, n);
     int bad = ferror(f);
     fclose(f);
-    if (bad) return -1;
     unsigned char h[32];
-    crypto_hash_sha256_final(&st, h);
-    sodium_bin2hex(out, 65, h, sizeof h);
+    int fin = vfips_md_final(st, h);
+    vfips_md_free(st);
+    if (bad || upd || fin) return -1;
+    vfips_bin2hex(out, 65, h, sizeof h);
     return 0;
 }
 
@@ -3007,6 +3273,7 @@ static unsigned g_exec_mismatch;       /* v1.27: processes killed by the identit
 static void exec_finish(void);         /* v1.27: warden_exec.inc.c */
 static void ctl_close(void);
 static void emit_run_end(int exit_status) {
+    grant_end_all();                     /* v1.42: open proposals end `abandoned` before run_end */
     ctl_close();                        /* v1.28 step 4: no revocation after the end */
     px_finish();                        /* v1.26: every relay's proxy_close */
     exec_finish();                      /* v1.27: launches never seen */
@@ -3069,6 +3336,9 @@ static void emit_pathology(uint64_t seq,
 {
     bool held = rule_id && !strcmp(rule_id, "outside_plan");   /* v1.35 step 4 */
     if (!g_log) return;
+    /* v1.42 step 3: a call a mode=hold rule refuses is held, not answered;
+     * its record is written when it ends */
+    if (hold_take(pid, a, d_raw, d_final, rule_id, latency_ns)) return;
     /* v1.31 (the shared soak): a checkpoint seals at most checkpoint_every
      * decision records. It is written between notifications
      * (maybe_checkpoint), but one notification or one pass over the proxy's
@@ -3077,6 +3347,9 @@ static void emit_pathology(uint64_t seq,
      * first, here. */
     if (checkpoints_on() && g_since_ckpt >= g_ckpt_every) emit_checkpoint();
     if (a->dry) d_final = DEC_DENY;      /* v1.29: a call a dry run let through was refused by the policy */
+    /* v1.42: a refusal by a step_up rule proposes a grant, which the record names */
+    char su_json[480];
+    step_up_note(a, d_raw, d_final, su_json, sizeof su_json);
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     char flags_json[40] = "";
@@ -3121,8 +3394,8 @@ static void emit_pathology(uint64_t seq,
         "\"rule\":\"%s\","
         "\"policy_line\":%d,"
         "%s%s%s"
+        "%s%s%s%s%s%s%s"
         "%s%s%s%s%s%s"
-        "%s%s%s%s%s"
         "\"kernel_verdict\":\"%s\","
         "\"errno\":%d,"
         "\"latency_us\":%" PRIu64 ","
@@ -3134,11 +3407,11 @@ static void emit_pathology(uint64_t seq,
         /* v1.15: the open flags, so an audit can re-check the certificate */
         flags_json[0] ? "\"open_flags\":\"" : "", flags_json, flags_json[0] ? "\"," : "",
         /* v1.15: the certificate and the checker's answer */
-        "", a->cert, a->cert[0] ? "," : "",
+        "", a->cert, a->gcert, a->cert[0] ? "," : "",
         a->cert[0] ? (a->certified ? "\"check\":\"ok\"," : "\"check\":\"refused\",\"check_why\":\"") : "",
         a->cert[0] && !a->certified ? a->check_why : "",
         a->cert[0] && !a->certified ? "\"," : "",
-        net_json, a->extra,
+        net_json, a->extra, su_json,
         /* v1.35 step 4: an outside_plan refusal names the plan the run is held to */
         held ? "\"plan\":\"" : "", held ? g_hold_plan_json : "", held ? "\"," : "",
         /* v1.12.1: an ALLOW whose open then failed (EEXIST, ENXIO, ...)
@@ -3158,6 +3431,7 @@ static void emit_pathology(uint64_t seq,
     rec_end(NULL);
     g_records++;
     g_since_ckpt++;
+    step_up_after(seq);                  /* v1.42: a new proposal's record */
 }
 
 /* ---------------- Kernel Injection ---------------- */
@@ -3174,6 +3448,7 @@ static void send_simple(int notify_fd, uint64_t id, decision_t d) {
         .flags = 0,
     };
     if (d == DEC_ALLOW) resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+    if (hold_swallow(id, d != DEC_ALLOW)) return;       /* v1.42 step 3: held */
     ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);
 }
 
@@ -3183,6 +3458,7 @@ static void send_errno(int notify_fd, uint64_t id, int err) {
     struct seccomp_notif_resp resp = {
         .id = id, .val = 0, .error = -err, .flags = 0,
     };
+    if (hold_swallow(id, err != 0)) return;             /* v1.42 step 3: held */
     ioctl(notify_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);
 }
 
@@ -4139,6 +4415,9 @@ static void syn_hosts_view(const struct policy *p, FILE *f);
 #include "warden_revoke.inc.c"       /* v1.28 step 4: revoking a run */
 #include "warden_trust.inc.c"        /* v1.26.1: the run's CA and the trust views */
 #include "warden_subagent.inc.c"     /* v1.28.1: sub-agents' control groups and attribution */
+#include "warden_grant.inc.c"        /* v1.42 step 2: runtime grants */
+#include "warden_signed.inc.c"       /* v1.42 step 6: signed approvals */
+#include "warden_notify.inc.c"       /* v1.42 step 7: notify= */
 #include "warden_exec.inc.c"         /* v1.27: the launch set and its Landlock ruleset */
 #include "warden_noexec.inc.c"       /* v1.27.1: writable directories mounted noexec */
 #include "warden_change.inc.c"       /* v1.29: changes by name */
@@ -4158,6 +4437,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
     bool bootstrap_done = false;
     while (!g_stop && !g_log_broken) {
         struct seccomp_notif req;
+        hold_round(notify_fd);                      /* v1.42 step 3 */
         /* v1.36 step 12: the container's first call, received when it tied
          * the container to its listener (node_tie): its caller waits, and
          * nothing else comes from it until it is answered */
@@ -4166,6 +4446,8 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
             g_nr.held = false;
             goto decide;
         }
+        /* v1.42 step 3: a held call approved: decided again, within its grant */
+        if (hold_replay_pop(&req)) goto decide;
         /* v1.9.3: wait on the listener AND the target's pidfd. Blocking in
          * NOTIF_RECV alone can hang forever if the target exits between the
          * g_stop check and the ioctl (the SIGCHLD is already spent).
@@ -4175,7 +4457,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
          * finished for the agent (warden_net.inc.c). */
         /* v1.24: also on the resolver helper's results. */
         /* v1.25: and on the stub resolver's sockets (warden_stub.inc.c). */
-        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN + 1 + PX_MAX_DIAL + 3] = {
+        struct pollfd pfds[4 + MAX_PENDING + 2 + STUB_MAX_CONN + 1 + PX_MAX_DIAL + 5] = {
             { .fd = notify_fd,    .events = POLLIN },
             { .fd = target_pidfd, .events = POLLIN },
             { .fd = agent_err_fd, .events = POLLIN },
@@ -4212,11 +4494,17 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         pfds[rvi] = (struct pollfd){ .fd = g_ctl_listen, .events = POLLIN };
         pfds[rvi + 1] = (struct pollfd){ .fd = g_secrets.ctl, .events = POLLIN };
         pfds[rvi + 2] = (struct pollfd){ .fd = g_cn, .events = POLLIN };     /* v1.28.1 review: process events */
+        pfds[rvi + 3] = (struct pollfd){ .fd = g_apv_listen, .events = POLLIN };   /* v1.42: approvers */
+        pfds[rvi + 4] = (struct pollfd){ .fd = g_nt_ctl, .events = POLLIN };       /* v1.42 step 7: posts' outcomes */
         /* v1.28.1 step 4: and the user's token's expiry */
         int oto = obo_timeout_ms();
         if (oto >= 0 && (to < 0 || oto < to)) to = oto;
-        int pr = poll(pfds, (nfds_t)(rvi + 3), to);
+        int gto = grant_timeout_ms();                                        /* v1.42: proposals ending */
+        if (gto >= 0 && (to < 0 || gto < to)) to = gto;
+        int pr = poll(pfds, (nfds_t)(rvi + 5), to);
         if (pr >= 0) obo_check(notify_fd);
+        if (pr >= 0) grant_expire();
+        if (pr >= 0) held_check();                  /* v1.42 step 3: a held call's caller gone */
         if (pr > 0 && (pfds[rvi + 2].revents & POLLIN)) sub_cn_drain();
         if (pr < 0) {
             if (errno == EINTR) continue;
@@ -4230,6 +4518,8 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         stub_service(p, &pfds[4 + npoll], nstub);
         px_service(p, &pfds[pxi + 1], npx);
         if (g_ctl_listen >= 0 && (pfds[rvi].revents & POLLIN)) ctl_service(notify_fd);   /* v1.28 step 4 */
+        if (g_apv_listen >= 0 && (pfds[rvi + 3].revents & POLLIN)) apv_service();          /* v1.42 */
+        if (g_nt_ctl >= 0 && (pfds[rvi + 4].revents & (POLLIN | POLLHUP | POLLERR))) notify_service();   /* v1.42 step 7 */
         if (g_secrets.ctl >= 0 && (pfds[rvi + 1].revents & (POLLIN | POLLHUP | POLLERR)) && secrets_service(p) < 0) {
             log_line_start();
             fprintf(g_log, "[warden] warden-secrets has gone: leased secrets will not be renewed or revoked\n");
@@ -4267,6 +4557,7 @@ static bool supervise(int notify_fd, int target_pidfd, int agent_err_fd,
         }
 
     decide:;
+        hold_cur(&req);                             /* v1.42 step 3: the call being decided */
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -5008,30 +5299,40 @@ static int load_sign_key(const char *path, const struct policy *p) {
     }
     if (refuse_if_agent_can_open(p, fd, path, "signing key") < 0) { close(fd); return -1; }
     protect_fd(fd, "signing key");          /* v1.17.0: refused by identity at runtime too */
-    char buf[80];
+    /* v1.41: a PKCS#8 PEM EC private key on curve P-384 (tools/varek_keygen).
+     * A pre-v1.41 key (64 hex characters, an Ed25519 seed) is refused with a
+     * pointer to make a new one: the Warden no longer signs with Ed25519. */
+    char buf[4096];
+    size_t total = 0;
     ssize_t n;
-    do { n = read(fd, buf, sizeof buf); } while (n < 0 && errno == EINTR);
+    for (;;) {
+        n = read(fd, buf + total, sizeof buf - 1 - total);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        total += (size_t)n;
+        if (total == sizeof buf - 1) break;
+    }
     close(fd);
-    unsigned char seed[crypto_sign_SEEDBYTES];
-    size_t bl = 0;
-    bool ok = (n == 64 || (n == 65 && buf[64] == '\n')) &&
-              sodium_hex2bin(seed, sizeof seed, buf, 64, NULL, &bl, NULL) == 0 &&
-              bl == sizeof seed;
-    sodium_memzero(buf, sizeof buf);
-    if (!ok) {
-        sodium_memzero(seed, sizeof seed);
-        fprintf(stderr, "[warden] signing key %s: not a VAREK signing key (64 hex characters; "
-                "make one with tools/varek_keygen)\n", path);
+    if (n < 0) {
+        vfips_memzero(buf, sizeof buf);
+        fprintf(stderr, "[warden] signing key %s: %s\n", path, strerror(errno));
         return -1;
     }
-    g_sk = sodium_malloc(crypto_sign_SECRETKEYBYTES);
-    if (!g_sk) {
-        sodium_memzero(seed, sizeof seed);
-        fprintf(stderr, "[warden] cannot allocate protected memory for the signing key\n");
+    buf[total] = '\0';
+    char why[160] = {0};
+    g_key = vfips_key_load_pem(buf, total, why, sizeof why);
+    vfips_memzero(buf, sizeof buf);
+    if (!g_key) {
+        fprintf(stderr, "[warden] signing key %s: not a VAREK signing key: %s (v1.41 signs with ECDSA "
+                "P-384; make a key with tools/varek_keygen; a v1.40 Ed25519 key is no longer used)\n", path, why);
         return -1;
     }
-    crypto_sign_seed_keypair(g_pk, g_sk, seed);
-    sodium_memzero(seed, sizeof seed);
+    if (vfips_pubkey_hex(g_key, g_pub_hex, sizeof g_pub_hex) < 0) {
+        vfips_key_free(g_key);
+        g_key = NULL;
+        fprintf(stderr, "[warden] signing key %s: cannot derive its public key\n", path);
+        return -1;
+    }
     g_signing = true;
     return 0;
 }
@@ -5866,7 +6167,8 @@ static void usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s <policy.txt> [--plan <plan.txt> [--hold-to-plan] [--flow-policy <cfg>\n"
         "              [--session <id>] [--breaker-state <file>] [--gate-status <file>]]]\n"
-        "              [--sign-key <key>]\n"
+        "              [--sign-key <key>] [--grants <dir>] [--require-approved-plan] [--intent <file>]\n"
+        "              [--notify-as <user>] [--notify-bin <warden-notify>]\n"
         "              [--anchor <path>] [--checkpoint-every <n>] [--run-as <user>]\n"
         "              [--dns-server <a.b.c.d[:port]>] [--dns-ttl-min <s>] [--dns-ttl-max <s>]\n"
         "              [--dns-grace-max <s>] [--psl <file>] [--shared-domains <file>]\n              [--proxy-as <user>] [--proxy-bin <warden-proxy>] [--trust-bundle <pem>]\n"
@@ -5962,6 +6264,13 @@ static void usage(const char *argv0) {
         "      the run it is recorded (on_behalf_of_expired) and the run revoked, as by varek revoke;\n"
         "      --on-behalf-of-expiry record lets the run go on.\n"
         "\n"
+        "  --intent FILE (v1.42): the user's request, recorded in run_start (its SHA-256 and length,\n"
+        "      its text when UTF-8 of at most 4 KiB, else STREAM.intent beside the stream) and shown\n"
+        "      to approvers (varek pending); no rule matches on it. At most 1 MiB.\n"
+        "  notify=URL on a step_up rule (v1.42): each proposal is posted to the webhook by\n"
+        "      warden-notify (--notify-bin; beside this binary by default), run as its own user\n"
+        "      (--notify-as; varek-notify, else 65530:65530); its outcome is a notify record.\n"
+        "\n"
         , stderr);
     fputs(
         "  v1.24 host names (with `require warden 1.24`): the Warden resolves\n"
@@ -6056,12 +6365,16 @@ int main(int argc, char **argv) {
 
     const char *policy_path = argv[1];
     const char *plan_path   = NULL;
+    const char *grants_dir  = NULL;     /* v1.42 step 6: --grants DIR (standing grants) */
+    bool require_apv_plan   = false;    /* v1.42 step 6: --require-approved-plan */
     const char *key_path    = NULL;     /* v1.16 */
     const char *anchor_path = NULL;     /* v1.16 */
     const char *run_as_arg  = NULL;     /* v1.17.0 */
     const char *proxy_as_arg = NULL;    /* v1.26: the egress proxy's user */
     const char *proxy_bin_arg = NULL;   /* v1.26.1: the warden-proxy binary */
     const char *secrets_bin_arg = NULL, *secrets_as_arg = NULL, *secrets_conf_arg = NULL;   /* v1.28 */
+    const char *notify_bin_arg = NULL, *notify_as_arg = NULL;   /* v1.42 step 7 */
+    const char *intent_arg = NULL;                              /* v1.42 step 7: --intent FILE */
     const char *obo_arg = NULL, *svid_arg = NULL, *obo_exp_arg = NULL;                  /* v1.28.1 */
     const char *node_kubelet_arg = NULL;                                                 /* v1.36 step 6 */
     const char *flow_path   = NULL;     /* v1.18.0 */
@@ -6104,6 +6417,10 @@ int main(int argc, char **argv) {
             anchor_path = argv[++i];
         } else if (strcmp(argv[i], "--hold-to-plan") == 0) {             /* v1.35 step 4 */
             g_hold_req = true;
+        } else if (strcmp(argv[i], "--grants") == 0 && !grants_dir && i + 1 < argc) {   /* v1.42 step 6 */
+            grants_dir = argv[++i];
+        } else if (strcmp(argv[i], "--require-approved-plan") == 0) {   /* v1.42 step 6 */
+            require_apv_plan = true;
         } else if (strcmp(argv[i], "--node-agent") == 0 && !node_sock && i + 1 < argc) {   /* v1.34 step 2 */
             node_sock = argv[++i];
         } else if (strcmp(argv[i], "--node-streams") == 0 && !node_streams && i + 1 < argc) {
@@ -6152,6 +6469,12 @@ int main(int argc, char **argv) {
             proxy_as_arg = argv[++i];
         } else if (strcmp(argv[i], "--proxy-bin") == 0 && !proxy_bin_arg) { /* v1.26.1 */
             proxy_bin_arg = argv[++i];
+        } else if (strcmp(argv[i], "--notify-bin") == 0 && !notify_bin_arg && i + 1 < argc) {   /* v1.42 step 7 */
+            notify_bin_arg = argv[++i];
+        } else if (strcmp(argv[i], "--notify-as") == 0 && !notify_as_arg && i + 1 < argc) {     /* v1.42 step 7 */
+            notify_as_arg = argv[++i];
+        } else if (strcmp(argv[i], "--intent") == 0 && !intent_arg && i + 1 < argc) {           /* v1.42 step 7 */
+            intent_arg = argv[++i];
         } else if (strcmp(argv[i], "--secrets-bin") == 0 && !secrets_bin_arg) { /* v1.28 */
             secrets_bin_arg = argv[++i];
         } else if (strcmp(argv[i], "--secrets-as") == 0 && !secrets_as_arg) {   /* v1.28 */
@@ -6203,6 +6526,23 @@ int main(int argc, char **argv) {
             else dns_cfg.grace_max = n;
         } else {
             usage(argv[0]); return 2;
+        }
+    }
+
+    /* v1.41: the crypto backend, before anything is hashed or signed (the
+     * policy digest in policy_load, the plan snapshot, the node's key). It is
+     * libcrypto's first initialisation and reads no OpenSSL configuration
+     * file, so no module or provider one names is loaded (v1.29). Every hash
+     * and signature after this goes through the host's provider; on a host in
+     * FIPS mode that is the FIPS provider. In the Defense build
+     * (VAREK_REQUIRE_FIPS) the Warden refuses to do anything — lint, check or
+     * supervise — unless the FIPS 140-3 validated provider services its
+     * hashing and signing (fail closed). */
+    {
+        char why[256] = {0};
+        if (vfips_init(VFIPS_INIT_NO_CONFIG | VFIPS_INIT_SECURE_HEAP, why, sizeof why) != 0) {
+            fprintf(stderr, "[warden] refusing to start: %s\n", why);
+            return 1;
         }
     }
 
@@ -6399,6 +6739,7 @@ int main(int argc, char **argv) {
         ra.drop = g_nr.uid != 0;
         if (ra.drop && ra.gid == 0) node_fail("an unprivileged user in group 0 (root)");
     }
+    g_agent_uid = ra.drop ? ra.uid : 0;                                  /* v1.42: never an approver */
     if (!ra.drop)
         fprintf(stderr, "[warden] WARNING: --run-as root: the agent runs as root with every "
                 "capability (the pre-v1.17 behaviour); only the seccomp filter holds it back\n");
@@ -6423,6 +6764,23 @@ int main(int argc, char **argv) {
     /* ~2 MB (512 rules x 4 KB constants): static, not on the stack. */
     static struct policy p;
     if (policy_load(policy_path, &p) < 0) return 1;
+    /* v1.42 step 2: runtime grants (mode=grant); what is not built yet is refused */
+    if (grant_policy_check(&p, policy_path) < 0) {
+        if (g_nr.on) node_fail("the policy needs a step_up option not built yet");
+        return 2;
+    }
+    /* v1.42 step 7: notify= and the user's request are not taken under the node agent */
+    if (g_nr.on && (nt_policy_wants(&p) || intent_arg))
+        node_fail(intent_arg ? "--intent is not taken under the node agent"
+                             : "notify= is not taken under the node agent (v1.42)");
+    if (intent_arg && intent_load(intent_arg) < 0) return 1;
+    /* v1.42 step 6: standing grants and the plan's approval, checked before anything runs */
+    if ((grants_dir || require_apv_plan) && g_nr.on) {
+        fprintf(stderr, "[warden] --grants and --require-approved-plan are not taken under the node agent\n");
+        return 2;
+    }
+    if (!g_nr.on && plan_approval_check(&p, plan_path, require_apv_plan) < 0) return 1;
+    if (grants_dir && standing_load(&p, grants_dir) < 0) return 1;
     /* v1.29: a dry run (section 3), on the command line only (D3); not with
      * a plan, credentials or sub-agents (dry_refusal). v1.36 step 7 (D6):
      * under the node agent, the pod's VarekPolicy's, refused the same */
@@ -6443,17 +6801,7 @@ int main(int argc, char **argv) {
         g_writable_exec = true;          /* no noexec mounts: launches are not held */
     }
 
-    /* v1.16: log integrity. */
-    /* v1.29 (step 9): libcrypto only hashes the launch set; it reads no
-     * configuration file, so no module or provider one names is loaded */
-    if (OPENSSL_init_crypto(OPENSSL_INIT_NO_LOAD_CONFIG, NULL) != 1) {
-        fprintf(stderr, "[warden] libcrypto failed to initialize\n");
-        return 1;
-    }
-    if (sodium_init() < 0) {
-        fprintf(stderr, "[warden] libsodium failed to initialize\n");
-        return 1;
-    }
+    /* v1.16: log integrity (crypto initialised after the argument parse). */
     load_raw_char_majors();                 /* v1.17.0 */
     load_ancestors(&p);                     /* v1.17.0 */
     if (refuse_exposed_stream(&p) < 0) return 1;
@@ -6519,7 +6867,7 @@ int main(int argc, char **argv) {
     if (p.v.proxy && geteuid() != 0 && !g_check_only) {
         fprintf(stderr, "[warden] `proxy on` needs the Warden to run as root (the proxy runs as its "
                 "own user); refusing to start\n");
-        if (g_sk) sodium_free(g_sk);
+        if (g_key) vfips_key_free(g_key);
         return 2;
     }
     /* v1.26.1: the proxy is warden-proxy, beside this binary unless
@@ -6540,7 +6888,7 @@ int main(int argc, char **argv) {
         if (proxy_fd < 0) {
             fprintf(stderr, "[warden] the egress proxy: %s; build it (make warden-proxy) or name it with "
                     "--proxy-bin; refusing to start\n", why);
-            if (g_sk) sodium_free(g_sk);
+            if (g_key) vfips_key_free(g_key);
             return 1;
         }
         fprintf(stderr, "[warden] egress proxy binary %s, SHA-256 %s\n", pb, g_proxy_sha);
@@ -6549,7 +6897,7 @@ int main(int argc, char **argv) {
         if (wp_start(&g_proxy, proxy_fd, pxa.uid, pxa.gid) < 0) {
             fprintf(stderr, "[warden] cannot start the egress proxy (%s); refusing to start\n",
                     g_proxy.why[0] ? g_proxy.why : strerror(errno));
-            if (g_sk) sodium_free(g_sk);
+            if (g_key) vfips_key_free(g_key);
             return 1;
         }
         fprintf(stderr, "[warden] egress proxy (%s) on 127.0.0.1:%u as %u:%u\n",
@@ -6814,15 +7162,29 @@ int main(int argc, char **argv) {
                     if (g_nr.on) {
                         /* v1.36 step 4: the NRI plugin's, in the container's
                          * environment already (node_creds_check) */
-                        crypto_hash_sha256(dg, (const unsigned char *)g_cred_ph[k], strlen(g_cred_ph[k]));
-                        sodium_bin2hex(g_cred_ph_sha[k], sizeof g_cred_ph_sha[k], dg, sizeof dg);
+                        if (vfips_sha256(g_cred_ph[k], strlen(g_cred_ph[k]), dg) != 0) {
+                            fprintf(stderr, "[warden] credentials: SHA-256 failed; refusing to start\n");
+                            ws_stop(&g_secrets);
+                            return 1;
+                        }
+                        vfips_bin2hex(g_cred_ph_sha[k], sizeof g_cred_ph_sha[k], dg, sizeof dg);
                         continue;
                     }
-                    randombytes_buf(rnd, sizeof rnd);
-                    sodium_bin2base64(b64, sizeof b64, rnd, sizeof rnd, sodium_base64_VARIANT_URLSAFE_NO_PADDING);
+                    if (vfips_rand(rnd, sizeof rnd) != 0 ||
+                        vfips_b64url(b64, sizeof b64, rnd, sizeof rnd) != 0) {
+                        vfips_memzero(rnd, sizeof rnd);
+                        fprintf(stderr, "[warden] credentials: no random placeholder; refusing to start\n");
+                        ws_stop(&g_secrets);
+                        return 1;
+                    }
                     snprintf(g_cred_ph[k], sizeof g_cred_ph[k], "varek_ph_%s_%s", p.v.creds[k].name, b64);
-                    crypto_hash_sha256(dg, (const unsigned char *)g_cred_ph[k], strlen(g_cred_ph[k]));
-                    sodium_bin2hex(g_cred_ph_sha[k], sizeof g_cred_ph_sha[k], dg, sizeof dg);
+                    if (vfips_sha256(g_cred_ph[k], strlen(g_cred_ph[k]), dg) != 0) {
+                        vfips_memzero(rnd, sizeof rnd);
+                        fprintf(stderr, "[warden] credentials: SHA-256 failed; refusing to start\n");
+                        ws_stop(&g_secrets);
+                        return 1;
+                    }
+                    vfips_bin2hex(g_cred_ph_sha[k], sizeof g_cred_ph_sha[k], dg, sizeof dg);
                     int el = snprintf(env, sizeof env, "VAREK_CRED_%s", p.v.creds[k].name);
                     for (int q = 11; q < el; q++) env[q] = (char)toupper((unsigned char)env[q]);
                     if (setenv(env, g_cred_ph[k], 1) < 0) {
@@ -6830,7 +7192,7 @@ int main(int argc, char **argv) {
                         ws_stop(&g_secrets);
                         return 1;
                     }
-                    sodium_memzero(rnd, sizeof rnd);
+                    vfips_memzero(rnd, sizeof rnd);
                 }
                 int vs[2];
                 if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, vs) < 0 || ws_hand_to(&g_secrets, vs[0]) < 0 ||
@@ -6847,13 +7209,65 @@ int main(int argc, char **argv) {
             }
         }
     }
+    /* v1.42 step 7: warden-notify, which posts each proposal of a notify=
+     * rule to its webhook: from a sealed copy hashed for run_start, as its
+     * own user (not the agent's, the proxy's or warden-secrets'), before the
+     * agent starts. A check finds and hashes it without starting it. */
+    if (nt_policy_wants(&p) && !g_nr.on) {
+        char nb[PATH_MAX], why[PATH_MAX + 256];
+        if (notify_bin_arg) snprintf(nb, sizeof nb, "%s", notify_bin_arg);
+        else {
+            ssize_t n = proc_readlinkf(nb, sizeof nb - 16, "self/exe");
+            if (n <= 0) { fprintf(stderr, "[warden] cannot find this binary's directory\n"); return 1; }
+            nb[n] = '\0';
+            char *sl = strrchr(nb, '/');
+            snprintf(sl ? sl + 1 : nb, sizeof nb - (size_t)(sl ? sl + 1 - nb : 0), "warden-notify");
+        }
+        int nfd = wp_load(nb, g_nt_bin_sha, why, sizeof why);
+        if (nfd < 0) {
+            fprintf(stderr, "[warden] warden-notify (the policy has notify=): %s; build it (make warden-notify) or "
+                    "name it with --notify-bin; refusing to start\n", why);
+            return 1;
+        }
+        fprintf(stderr, "[warden] notifications' helper %s, SHA-256 %s\n", nb, g_nt_bin_sha);
+        if (!g_check_only) {
+            if (geteuid() != 0) {
+                close(nfd);
+                fprintf(stderr, "[warden] notify= needs the Warden to run as root (warden-notify runs as its own "
+                        "user); refusing to start\n");
+                return 2;
+            }
+            struct run_as nta = { .drop = false };
+            const char *nas = notify_as_arg ? notify_as_arg : getpwnam("varek-notify") ? "varek-notify" : "65530:65530";
+            if (parse_run_as(nas, &nta) < 0 || !nta.drop) {
+                close(nfd);
+                fprintf(stderr, "[warden] --notify-as %s: give an unprivileged user (name, uid or uid:gid) with a "
+                        "non-root group\n", nas);
+                return 2;
+            }
+            if ((ra.drop && nta.uid == ra.uid) || (p.v.proxy && nta.uid == pxa.uid) ||
+                (g_secrets.ctl >= 0 && nta.uid == g_secrets.uid)) {
+                close(nfd);
+                fprintf(stderr, "[warden] --notify-as %s: warden-notify may not run as the agent's user, the "
+                        "proxy's or warden-secrets'; give it its own\n", nas);
+                return 2;
+            }
+            if (nt_start(nfd, nta.uid, nta.gid) < 0) {
+                int e = errno;
+                close(nfd);
+                fprintf(stderr, "[warden] cannot start warden-notify (%s); refusing to start\n", strerror(e));
+                return 1;
+            }
+        }
+        close(nfd);
+    }
     /* v1.27: with `require warden 1.27`, the files the agent may launch and
      * the Landlock ruleset that holds it to them (warden_exec.inc.c). v1.34
      * step 3: under the node agent, in the container's view (node_supervise) */
     if (p.v.launches && !g_nr.on) {
         if (exec_ruleset_build(&p, target_argv ? boot_path : NULL) < 0 ||
             exec_confined_checks(&p) < 0) {              /* v1.31 */
-            if (g_sk) sodium_free(g_sk);
+            if (g_key) vfips_key_free(g_key);
             return 1;
         }
         fprintf(stderr, "[warden] launch set: %zu files, %s\n", g_exec_n,
@@ -6874,11 +7288,11 @@ int main(int argc, char **argv) {
                     "mapped executable\n");
         } else {
             if (noexec_build(&p, target_argv ? boot_path : NULL) < 0) {
-                if (g_sk) sodium_free(g_sk);
+                if (g_key) vfips_key_free(g_key);
                 return 1;
             }
             if (!g_check_only && noexec_mount() < 0) {      /* step 2: before the agent is forked */
-                if (g_sk) sodium_free(g_sk);
+                if (g_key) vfips_key_free(g_key);
                 return 1;
             }
             size_t gone = 0;
@@ -6903,6 +7317,7 @@ int main(int argc, char **argv) {
     if (g_nr.on) node_as_agent();                                         /* v1.34 step 2 (review) */
     /* v1.28.1 step 3: sub-agents need cgroup v2 (a check makes no group) */
     if (g_check_only && sub_setup(&p, true, !ra.drop) < 0) return 1;
+    if (g_check_only) frz_setup(&p, true, !ra.drop);                     /* v1.42 step 4 */
     if (g_check_only) {
         /* v1.24: resolve each allowed name and report the ones that fail (a
          * name that does not resolve does not stop the Warden). */
@@ -6924,7 +7339,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[warden] the plan's steps are decided (the node check); a check does not "
                         "step the flow policy or the breaker\n");
             if (warden_verify_plan(plan_path, &p, false) != 0) {
-                if (g_sk) sodium_free(g_sk);
+                if (g_key) vfips_key_free(g_key);
                 return 1;
             }
         }
@@ -6935,7 +7350,7 @@ int main(int argc, char **argv) {
                 gstatus_arg ? ", --gate-status" : "",
                 pidns && !have_cap_sys_admin() ? " (but this user lacks CAP_SYS_ADMIN, which "
                 "a run needs)" : "");
-        if (g_sk) sodium_free(g_sk);
+        if (g_key) vfips_key_free(g_key);
         return 0;
     }
     if (!target_argv && !g_nr.on) { usage(argv[0]); return 2; }
@@ -6951,7 +7366,8 @@ int main(int argc, char **argv) {
     }
     /* v1.28.1 step 3: the run's control group, named after the run */
     if (sub_setup(&p, false, !ra.drop) < 0) return 1;
-    if (g_sub_on) atexit(sub_finish);
+    frz_setup(&p, false, !ra.drop);                                       /* v1.42 step 4: scope=run */
+    if (g_sub_on || g_frz_own) atexit(sub_finish);
     /* v1.12.1: if stdout and stderr are the same file (2>&1), the agent's
      * stdout lands in the verdict stream unprefixed. Records stay
      * authenticated by run id and seq, and the exporter refuses a stream
@@ -6969,11 +7385,14 @@ int main(int argc, char **argv) {
     /* v1.26.1: inspecting mode: the run's CA, made by the proxy, and the
      * trust views, before run_start records them */
     if (g_inspect_on && trust_setup(&p) < 0) {
-        if (g_sk) sodium_free(g_sk);
+        if (g_key) vfips_key_free(g_key);
         return 1;
     }
+    if (intent_side_write() < 0) return 1;                                 /* v1.42 step 7 */
     if (!g_nr.on) emit_run_start(policy_path, &p);     /* v1.34 step 3: node_supervise's, after the launch set */
+    if (!g_nr.on) standing_start();                                        /* v1.42 step 6 */
     ctl_open();                                                            /* v1.28 step 4 */
+    if (!g_nr.on) apv_open();                                              /* v1.42: approvals */
     /* v1.24: every allowed host name is resolved before the agent runs.
      * Refreshes then run in a resolver helper process (warden_resolve.c),
      * started now: while the Warden is single-threaded and before the agent's
@@ -6985,7 +7404,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[warden] cannot start the resolver helper (%s); refusing to start\n",
                     strerror(errno));
             emit_run_end(1);
-            if (g_sk) sodium_free(g_sk);
+            if (g_key) vfips_key_free(g_key);
             return 1;
         }
         /* v1.34 step 4: under the node agent, after run_start (node_supervise);
@@ -7004,19 +7423,26 @@ int main(int argc, char **argv) {
         int gate = warden_gate_plan_flow(plan_path, &p);
         if (gate != GATE_PASS) {
             emit_run_end(gate);
-            if (g_sk) sodium_free(g_sk);
+            if (g_key) vfips_key_free(g_key);
             return gate;
         }
     } else if (plan_path && warden_verify_plan(plan_path, &p, true) != 0) {
         emit_run_end(1);                    /* v1.16: a closed (and signed) stream */
-        if (g_sk) sodium_free(g_sk);
+        if (g_key) vfips_key_free(g_key);
         return 1;
     }
     if (g_hold_req && !g_nr.on) {                                          /* v1.35 step 4 */
         g_hold_collect = false;
         g_hold_on = true;
         fprintf(stderr, "[warden] the run is held to its plan: %zu entries; a call the policy allows "
-                "outside them is refused (outside_plan)\n", g_nhold);
+                "outside them is %s\n", g_nhold,
+                p.v.op_line ? "deferred until a plan extension covers it (on outside_plan defer)" : "refused (outside_plan)");
+        if (p.v.op_line && g_flow_cfg)
+            fprintf(stderr, "[warden] note: a plan extension (varek plan extend) is decided by the basic plan "
+                    "gate; the flow policy (--flow-policy) is not consulted for it\n");
+    } else if (p.v.op_line && !g_nr.on) {
+        fprintf(stderr, "[warden] note: `on outside_plan defer` (policy line %d) holds nothing: the run is not "
+                "held to a plan (--plan PLAN --hold-to-plan)\n", p.v.op_line);
     }
 
     struct sigaction sa = { .sa_handler = on_term };
@@ -7143,7 +7569,8 @@ int main(int argc, char **argv) {
         int notify_fd =
             install_baseline_user_notif_filter_ex(getenv("VAREK_WARDEN_OBSERVE") != NULL,
                                                   (p.v.open_as_agent ? WD_FILTER_CHANGES : 0) |
-                                                  (g_dry ? WD_FILTER_DRY : 0));   /* v1.29 */
+                                                  (g_dry ? WD_FILTER_DRY : 0) |   /* v1.29 */
+                                                  (grant_holds(&p) ? WD_FILTER_WAITKILL : 0));   /* v1.42 */
         if (notify_fd < 0) { perror("seccomp"); _exit(1); }
         /* v1.12: hand the fd NUMBER to the supervisor and wait for it to pull
          * the fd via pidfd_getfd(). write()/read() are admitted; no sendmsg. */
@@ -7293,7 +7720,7 @@ int main(int argc, char **argv) {
     if (g_names_on) wr_async_stop(&g_names);    /* v1.24 */
     emit_run_end(rc);
     anchor_drain();
-    if (g_sk) sodium_free(g_sk);             /* zeroes it */
+    if (g_key) vfips_key_free(g_key);        /* OpenSSL clears the key */
     close(target_pidfd);
     close(notify_fd);
     if (g_px_failed && rc == 0) rc = 1;      /* v1.26.1 review: the run did not end cleanly */

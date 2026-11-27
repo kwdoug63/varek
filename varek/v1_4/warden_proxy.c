@@ -4,8 +4,8 @@
 // own binary, warden-proxy). See warden_proxy.h.
 
 #include "warden_proxy.h"
+#include "varek_fips.h"          /* v1.41: the sealed helper's SHA-256, via the host provider */
 
-#include <sodium.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -166,8 +166,8 @@ int wp_load(const char *path, char sha256_hex[65], char *why, size_t wn) {
     if (m < 0 && errno == EINVAL)          /* a kernel before 6.3 */
         m = (int)syscall(SYS_memfd_create, mname, MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (m < 0) { snprintf(why, wn, "memfd_create: %s", strerror(errno)); close(fd); return -1; }
-    crypto_hash_sha256_state h;
-    crypto_hash_sha256_init(&h);
+    vfips_md *h = vfips_md_new(256);
+    if (!h) { snprintf(why, wn, "SHA-256 via the host crypto provider failed"); close(fd); close(m); return -1; }
     unsigned char buf[65536];
     ssize_t n;
     size_t total = 0;
@@ -177,7 +177,10 @@ int wp_load(const char *path, char sha256_hex[65], char *why, size_t wn) {
             snprintf(why, wn, "reading %s: %s", path, strerror(errno));
             goto fail;
         }
-        crypto_hash_sha256_update(&h, buf, (unsigned long long)n);
+        if (vfips_md_update(h, buf, (size_t)n) != 0) {
+            snprintf(why, wn, "SHA-256 of %s failed", path);
+            goto fail;
+        }
         for (ssize_t off = 0; off < n;) {
             ssize_t w = write(m, buf + off, (size_t)(n - off));
             if (w < 0 && errno == EINTR) continue;
@@ -196,11 +199,16 @@ int wp_load(const char *path, char sha256_hex[65], char *why, size_t wn) {
         goto fail;
     }
     unsigned char d[32];
-    crypto_hash_sha256_final(&h, d);
-    sodium_bin2hex(sha256_hex, 65, d, sizeof d);
+    if (vfips_md_final(h, d) != 0) {
+        snprintf(why, wn, "SHA-256 of %s failed", path);
+        goto fail;
+    }
+    vfips_md_free(h);
+    vfips_bin2hex(sha256_hex, 65, d, sizeof d);
     close(fd);
     return m;
 fail:
+    vfips_md_free(h);
     close(fd);
     close(m);
     return -1;
