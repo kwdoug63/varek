@@ -2899,6 +2899,20 @@ def cmd_export_falcon(args):
     return _export_sent(args, fa, "the run's events sent to Falcon Next-Gen SIEM")
 
 
+def cmd_export_secops(args):
+    """v1.43: `varek export --format secops`: the run's OCSF events (audited,
+    as --format ocsf writes them) sent to a Google Security Operations
+    instance as UDM events, through the Chronicle API's events:import
+    (tools/varek_secops.py); with --follow, as the run goes"""
+    go = [sys.executable, tool("varek_secops.py"), "-"]
+    for flag, val in (("--endpoint", args.endpoint), ("--project", args.secops_project),
+                      ("--region", args.secops_region), ("--customer-id", args.secops_customer_id),
+                      ("--auth", args.secops_auth), ("--ca", args.ca)):
+        if val:
+            go += [flag, val]
+    return _export_sent(args, go, "the run's events sent to Google Security Operations")
+
+
 def _export_sent(args, sender, done):
     """the run's OCSF events, audited (tools/varek_ocsf.py), piped to a sender"""
     if args.verify:
@@ -3022,10 +3036,12 @@ def cmd_export(args):
         return cmd_export_sentinel(args)
     if getattr(args, "format", "cyclonedx") == "falcon":                # v1.41
         return cmd_export_falcon(args)
+    if getattr(args, "format", "cyclonedx") == "secops":                # v1.43
+        return cmd_export_secops(args)
     if args.follow:
-        raise CliError("--follow is for --format ocsf, otlp, splunk, sentinel and falcon")
+        raise CliError("--follow is for --format ocsf, otlp, splunk, sentinel, falcon and secops")
     if args.from_position is not None:
-        raise CliError("--from-position is for --format ocsf, otlp, splunk, sentinel and falcon",
+        raise CliError("--from-position is for --format ocsf, otlp, splunk, sentinel, falcon and secops",
                        fix="the CycloneDX evidence is one document, written whole")
     if args.verify:
         cfg = load_config(required=False)
@@ -3855,18 +3871,20 @@ def build_parser():
 
     sp = add("export", cmd_export, "write CycloneDX 1.6 authorization evidence, or OCSF 1.9.0 events, for a run")
     sp.add_argument("log", nargs="?", help="a verdict log (default: the last run)")
-    sp.add_argument("--format", choices=("cyclonedx", "ocsf", "otlp", "splunk", "sentinel", "falcon"), default="cyclonedx",
+    sp.add_argument("--format", choices=("cyclonedx", "ocsf", "otlp", "splunk", "sentinel", "falcon", "secops"), default="cyclonedx",
                     help="cyclonedx (default); ocsf: OCSF 1.9.0 events, one per line (v1.31); otlp: those "
                          "events sent to an OpenTelemetry collector as log records (v1.39); splunk: sent to "
                          "a Splunk HTTP Event Collector, sourcetype varek:ocsf (v1.39); sentinel: to Microsoft "
                          "Sentinel's workspace, table VarekOCSF_CL, through the Logs Ingestion API (v1.40); falcon: to "
-                         "a CrowdStrike Falcon Next-Gen SIEM HTTP Event Collector connector (v1.41)")
+                         "a CrowdStrike Falcon Next-Gen SIEM HTTP Event Collector connector (v1.41); secops: to a Google "
+                         "Security Operations instance as UDM events, through the Chronicle API (v1.43)")
     sp.add_argument("--endpoint", help="otlp: the collector's OTLP/HTTP logs URL (default: "
                     "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, OTEL_EXPORTER_OTLP_ENDPOINT, or http://localhost:4318/v1/logs); "
                     "splunk: the HTTP Event Collector's URL, https://HOST:8088 (default: SPLUNK_HEC_URL); "
                     "sentinel: the data collection rule's logs ingestion endpoint (default: "
                     "AZURE_LOGS_INGESTION_ENDPOINT); falcon: the HTTP Event Collector connector's API URL, as "
-                    "the Falcon console gives it (default: FALCON_HEC_URL)")
+                    "the Falcon console gives it (default: FALCON_HEC_URL); secops: the Chronicle API's base URL "
+                    "(default: https://REGION-chronicle.googleapis.com)")
     sp.add_argument("--dcr", metavar="ID", help="sentinel: the data collection rule's immutable id, dcr-... "
                     "(default: AZURE_DCR_IMMUTABLE_ID)")
     sp.add_argument("--stream", metavar="NAME", help="sentinel: the rule's stream (default Custom-VarekOCSF)")
@@ -3886,7 +3904,16 @@ def build_parser():
                     help="falcon: the environment variable holding the connector's API key (default "
                          "FALCON_HEC_API_KEY; a key is never taken from the command line)")
     sp.add_argument("--splunk-index", metavar="INDEX", help="splunk: the index (default: the token's)")
-    sp.add_argument("--ca", metavar="FILE", help="splunk, sentinel, falcon: certificate authorities to trust for the "
+    sp.add_argument("--secops-project", metavar="ID", help="secops: the Google Cloud project the instance is "
+                    "bound to (default: SECOPS_PROJECT, else GOOGLE_CLOUD_PROJECT)")
+    sp.add_argument("--secops-region", metavar="REGION", help="secops: the instance's region (default: "
+                    "SECOPS_REGION, else us)")
+    sp.add_argument("--secops-customer-id", metavar="ID", help="secops: the instance's customer id (default: "
+                    "SECOPS_CUSTOMER_ID)")
+    sp.add_argument("--secops-auth", choices=("auto", "metadata", "key-file", "token"),
+                    help="secops: auto (the default: the key file GOOGLE_APPLICATION_CREDENTIALS names, else the "
+                         "VM's service account), metadata (the VM's), key-file, or token (GOOGLE_OAUTH_ACCESS_TOKEN)")
+    sp.add_argument("--ca", metavar="FILE", help="splunk, sentinel, falcon, secops: certificate authorities to trust for the "
                     "endpoint's certificate (default: the system's)")
     sp.add_argument("--hec-ack", action="store_true",
                     help="splunk: wait for Splunk to acknowledge each batch as indexed (the token's indexer "
@@ -3894,10 +3921,10 @@ def build_parser():
     sp.add_argument("--otlp-header", action="append", metavar="NAME=ENVVAR",
                     help="otlp: send header NAME with the value of the environment variable ENVVAR "
                          "(an API key: never on the command line); repeatable")
-    sp.add_argument("--follow", metavar="STREAM", help="ocsf, otlp, splunk, sentinel, falcon: tail a live run's stream, writing (or "
+    sp.add_argument("--follow", metavar="STREAM", help="ocsf, otlp, splunk, sentinel, falcon, secops: tail a live run's stream, writing (or "
                     "sending) each event as its record is chained (to stdout, or -o)")
     sp.add_argument("--from-position", type=int, metavar="N",
-                    help="ocsf, otlp, splunk, sentinel, falcon: the rest of an export that failed partway: the events "
+                    help="ocsf, otlp, splunk, sentinel, falcon, secops: the rest of an export that failed partway: the events "
                          "from the first whose record is at position N or later (the position the failed "
                          "send named); the stream is audited whole all the same (v1.40)")
     sp.add_argument("--policy", help="ocsf: the policy file the run used (default: found from the log)")
