@@ -1266,6 +1266,11 @@ static const char *mcp_url_x(const char *u, bool https_only, char *out, size_t o
     return NULL;
 }
 
+int vdp_gateway_of(const vdp_policy_t *p, const char *name) {
+    for (size_t g = 0; g < p->ngw; g++) if (!strcmp(p->gw_host[g], name)) return (int)g;
+    return -1;
+}
+
 const char *vdp_mcp_url(const char *u, bool https_only, char *out, size_t outn) {
     return mcp_url_x(u, https_only, out, outn, NULL, NULL);
 }
@@ -1785,6 +1790,38 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
             cr->line = lineno;
             snprintf(cr->audience, sizeof cr->audience, "%s", aud);
             cr->opaque = nt == 6;
+            continue;
+        }
+        /* v1.43: mcp gateway URL (docs/security/v1.43-palantir-ontology-mcp.md, D3) */
+        if (!strcmp(tok[0], "mcp") && nt >= 2 && !strcmp(tok[1], "gateway")) {
+            if (!(req_maj > 1 || (req_maj == 1 && req_min >= 43))) {
+                rc = perr(err, errlen, path, lineno, "`mcp gateway` needs `require warden 1.43` before it");
+                break;
+            }
+            if (nt != 3) { rc = perr(err, errlen, path, lineno, "need: mcp gateway https://<host>[:<port>]/<path>"); break; }
+            char cu[VDP_STR_MAX + 1], gh[254];
+            unsigned gp = 0;
+            const char *why = mcp_url_x(tok[2], true, cu, sizeof cu, gh, &gp);
+            if (why) { rc = perr(err, errlen, path, lineno, "%s", why); break; }
+            char hw[160];
+            if (vdp_host_name_form(gh, strlen(gh), hw, sizeof hw) != 1) {
+                rc = perr(err, errlen, path, lineno, "a gateway's host is a host name, not an address"); break;
+            }
+            for (size_t k = 0; rc == 0 && k < p->ngw; k++) {
+                if (!strcmp(p->gw_url[k], cu))
+                    rc = perr(err, errlen, path, lineno, "gateway %s given twice (line %d)", cu, p->gw_line[k]);
+                else if (!strcmp(p->gw_host[k], gh) && p->gw_port[k] != gp)
+                    rc = perr(err, errlen, path, lineno, "a host's gateways go to one port: %s is on port %u "
+                              "at line %d", gh, p->gw_port[k], p->gw_line[k]);
+            }
+            if (rc) break;
+            if (p->ngw >= VDP_MAX_GATEWAYS) {
+                rc = perr(err, errlen, path, lineno, "more than %d `mcp gateway` lines", VDP_MAX_GATEWAYS); break;
+            }
+            memcpy(p->gw_url[p->ngw], cu, strlen(cu) + 1);
+            memcpy(p->gw_host[p->ngw], gh, strlen(gh) + 1);
+            p->gw_port[p->ngw] = gp;
+            p->gw_line[p->ngw++] = lineno;
             continue;
         }
         /* v1.31: mcp server NAME exec PATH [sha256=HEX] */
@@ -2380,6 +2417,29 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
     /* v1.26.1: what inspecting mode needs */
     if (rc == 0 && p->proxy_npass && !p->proxy_inspect)
         rc = perr(err, errlen, path, lineno, "`proxy passthrough` without `proxy inspect`");
+    /* v1.43: what a gateway needs: the proxy, port 80 proxied (the agent's
+     * side), and a host that is not a passthrough host. (A gateway no mcp rule
+     * names refuses every call, as any call no rule names is refused.) */
+    for (size_t g = 0; rc == 0 && g < p->ngw; g++) {
+        bool p80 = !p->proxy_nports, pgw = !p->proxy_nports && p->gw_port[g] == 443;
+        for (size_t k = 0; k < p->proxy_nports; k++) {
+            if (p->proxy_ports[k] == 80) p80 = true;
+            if (p->proxy_ports[k] == p->gw_port[g]) pgw = true;
+        }
+        if (!p->proxy)
+            rc = perr(err, errlen, path, p->gw_line[g], "`mcp gateway` without `proxy on` or `proxy inspect`");
+        else if (!p80)
+            rc = perr(err, errlen, path, p->gw_line[g], "`mcp gateway` needs port 80 proxied (the agent reaches "
+                      "the gateway as plain HTTP there): add 80 to `proxy ports`");
+        else if (!pgw)
+            rc = perr(err, errlen, path, p->gw_line[g], "`mcp gateway` needs its server's port %u proxied (a "
+                      "direct connection there must reach the proxy, which refuses it): add it to `proxy ports`",
+                      p->gw_port[g]);
+        for (size_t k = 0; rc == 0 && k < p->proxy_npass; k++)
+            if (!strcmp(p->proxy_pass[k], p->gw_host[g]))
+                rc = perr(err, errlen, path, p->gw_line[g], "%s is a passthrough host; a gateway host's calls "
+                          "are read", p->gw_host[g]);
+    }
     /* v1.27: launches after the first are decided only after this directive */
     p->launches = req_maj > 1 || (req_maj == 1 && req_min >= 27);
     /* v1.29: files opened with the agent's credentials after this directive */
@@ -2387,9 +2447,18 @@ static int vdp_policy_load_inner(const char *path, FILE *f, vdp_policy_t *p, cha
     for (size_t i = 0; rc == 0 && i < p->n; i++) {
         const vdp_rule_t *r = &p->rules[i];
         if (r->kind != VDP_KIND_REQUEST && r->kind != VDP_KIND_MCP) continue;
+        /* v1.43: an mcp rule on a gateway's URL is read by the gateway, with
+         * or without inspecting mode (the agent never reaches its port) */
+        bool via_gw = false;
+        for (size_t g = 0; r->kind == VDP_KIND_MCP && g < p->ngw; g++) {
+            size_t ul = strlen(p->gw_url[g]);
+            if (!strncmp(r->s.c, p->gw_url[g], ul) && r->s.c[ul] == '#') via_gw = true;
+        }
+        if (via_gw) continue;
         if (!p->proxy_inspect) {
             rc = perr(err, errlen, path, r->line, "%s rule without `proxy inspect` (requests are "
-                      "seen only in inspecting mode)", r->kind == VDP_KIND_MCP ? "an mcp" : "a request");
+                      "seen only in inspecting mode%s)", r->kind == VDP_KIND_MCP ? "an mcp" : "a request",
+                      r->kind == VDP_KIND_MCP ? ", or through an `mcp gateway` for its URL" : "");
             break;
         }
         bool proxied = false;
@@ -2722,7 +2791,8 @@ int vdp_grant_parse(const vdp_policy_t *p, const char *text, size_t len, vdp_gra
      * load-time checks of request and mcp rules need), then the grant's
      * lines, each other line left blank so the line numbers keep their
      * distance (hdr). */
-    size_t cap = len + 64 + 32 + (size_t)VDP_PROXY_MAX_PORTS * 8 + (size_t)VDP_PROXY_MAX_PASS * 280 + 2;
+    size_t cap = len + 64 + 32 + (size_t)VDP_PROXY_MAX_PORTS * 8 + (size_t)VDP_PROXY_MAX_PASS * 280 +
+                 (size_t)VDP_MAX_GATEWAYS * (VDP_STR_MAX + 16) + 2;      /* v1.43: the gateways */
     char *mini = malloc(cap);
     vdp_policy_t *tmp = NULL;
     if (!mini) return perr(err, errlen, "grant", 0, "out of memory");
@@ -2732,6 +2802,7 @@ int vdp_grant_parse(const vdp_policy_t *p, const char *text, size_t len, vdp_gra
                        if (k_ > 0) ml += (size_t)k_ < cap - ml ? (size_t)k_ : cap - ml - 1; } while (0)
     MADD("require warden %d.%d\n", VDP_WARDEN_MAJOR, VDP_WARDEN_MINOR); hdr++;
     if (p->proxy) { MADD(p->proxy_inspect ? "proxy inspect\n" : "proxy on\n"); hdr++; }
+    for (size_t g = 0; g < p->ngw; g++) { MADD("mcp gateway %s\n", p->gw_url[g]); hdr++; }  /* v1.43 */
     if (p->proxy_nports) {
         MADD("proxy ports");
         for (size_t i = 0; i < p->proxy_nports; i++) MADD(" %u", p->proxy_ports[i]);

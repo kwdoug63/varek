@@ -231,6 +231,7 @@ typedef struct {
 
 #define VDP_PROXY_MAX_PORTS 16
 #define VDP_PROXY_MAX_PASS  64
+#define VDP_MAX_GATEWAYS    16   /* v1.43: `mcp gateway` lines */
 #define VDP_MAX_BODY_LIMIT  1073741824u   /* max_body= at most 1 GiB */
 
 /* v1.28: `credential NAME from STORE:REF`, after `require warden 1.28`.
@@ -325,6 +326,20 @@ typedef struct {
     bool       proxy_inspect;
     char       proxy_pass[VDP_PROXY_MAX_PASS][254];
     size_t     proxy_npass;
+    /* v1.43 (docs/security/v1.43-palantir-ontology-mcp.md, D3): `mcp gateway
+     * URL`. The agent reaches the MCP server at URL (https) as plain HTTP on
+     * port 80 of URL's host, over the socket the Warden hands it; the proxy
+     * reads and decides each call as inspecting mode does, against URL, and
+     * speaks TLS to URL's host and port itself (verified against the host's
+     * trust bundle). No certificate is minted and the agent trusts no CA.
+     * gw_url: canonical (vdp_mcp_url); gw_host, gw_port: what it names. A
+     * gateway host is reached on its port only through its gateway. Not part
+     * of any decision. */
+    char       gw_url[VDP_MAX_GATEWAYS][VDP_STR_MAX + 1];
+    char       gw_host[VDP_MAX_GATEWAYS][254];
+    unsigned   gw_port[VDP_MAX_GATEWAYS];
+    int        gw_line[VDP_MAX_GATEWAYS];
+    size_t     ngw;
     /* v1.27 (docs/security/v1.27-program-launches.md): `require warden 1.27`
      * (or later) was given, so launches after the first are decided by the
      * exec rules. Without it every later launch is refused, as in v1.26,
@@ -587,6 +602,9 @@ int vdp_mcp_object(const char *url, const char *method, const char *name, char *
  * nor an unreserved byte. https_only refuses http://. NULL and the form in
  * out, or the reason. */
 const char *vdp_mcp_url(const char *u, bool https_only, char *out, size_t outn);
+/* v1.43: the index of the first `mcp gateway` whose host is name (exact,
+ * lowercase as the parser holds it), or -1 */
+int vdp_gateway_of(const vdp_policy_t *p, const char *name);
 
 /* Decide a single action. s must be a NUL-terminated string. flags is used only
  * for VDP_KIND_PATH when has_flags is true; with has_flags false the flags are
@@ -819,7 +837,7 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * `require warden 1.31`; a v1.29 Warden refuses each, so the policy fails
  * closed there. (v1.30 adds no lines.) */
 #define VDP_WARDEN_MAJOR 1
-#define VDP_WARDEN_MINOR 42     /* the grammar: the highest `require warden` a policy may name
+#define VDP_WARDEN_MINOR 43     /* the grammar: the highest `require warden` a policy may name
                                  * (v1.42: step_up rules, max_held, max_pending) */
 /* v1.32 (D12): the Warden's own version, ahead of the grammar's when a
  * release adds no policy lines (v1.32.0: containers; v1.34.0: Kubernetes, the
@@ -835,7 +853,8 @@ bool vdp_request_host_refused(const vdp_policy_t *p, size_t i, char *why, size_t
  * host in FIPS mode), the verdict stream in format chain-2 (SHA-384, ECDSA
  * P-384), libsodium no longer used, and the Defense build (make DEFENSE=1);
  * the grammar stays 1.35; v1.42.0: STEP_UP and DEFER, approvals as grants,
- * the grammar 1.42 with it) */
+ * the grammar 1.42 with it; v1.43 (in progress): `mcp gateway`, the grammar
+ * 1.43, the release number moved when v1.43.0 is tagged) */
 #define VDP_WARDEN_REL_MINOR 42
 #define VDP_WARDEN_PATCH 0      /* v1.27.1: the Warden's version beyond the grammar's
                                  * (v1.36.1: packaging for Red Hat's certification;

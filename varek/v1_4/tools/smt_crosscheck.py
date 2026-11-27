@@ -667,6 +667,7 @@ def parse_lines(raw_lines, path):
     proxy, proxy_ports = False, None   # v1.26: `proxy on`, `proxy ports`
     upstream = None                    # v1.26 section 5: `proxy upstream http://HOST:PORT`
     inspect, passthrough = False, []   # v1.26.1: `proxy inspect`, `proxy passthrough host NAME`
+    gateways = []                      # v1.43: `mcp gateway URL`: (canonical URL, host, port, line)
     creds = []                         # v1.28: (name, store, ref), in order
     cred_aud = []                      # v1.31: (audience, opaque) of each credential
     subjects = []                      # v1.31: (name, rule index, mcp, line); subject k is subjects[k - 1]
@@ -804,7 +805,7 @@ def parse_lines(raw_lines, path):
                 if len(toks) != 3 or toks[1] != "warden" or not m:
                     raise PolicyError(f"{path}:{lineno}: bad directive")
                 v = (int(m.group(1)), int(m.group(2)))
-                if v > (1, 42):                    # v1.42: the grammar is 1.42
+                if v > (1, 43):                    # v1.43: the grammar is 1.43 (mcp gateway)
                     raise PolicyError(f"{path}:{lineno}: requires newer Warden")
                 if legacy_name and v >= (1, 24):
                     raise PolicyError(f"{path}:{lineno}: require warden 1.24 after a host name")
@@ -868,6 +869,15 @@ def parse_lines(raw_lines, path):
                     toks = toks[:4]
                 creds.append(credential_parse(toks, [c[0] for c in creds], f"{path}:{lineno}"))
                 cred_aud.append((aud, opq))
+                continue
+            if toks[0] == "mcp" and len(toks) >= 2 and toks[1] == "gateway":
+                # v1.43: mcp gateway URL (https, a host name)
+                if req < (1, 43) or len(toks) != 3:
+                    raise PolicyError(f"{path}:{lineno}: bad mcp gateway")
+                cu, gh, gp = mcp_canon(toks[2], True, f"{path}:{lineno}")
+                if any(g[0] == cu or (g[1] == gh and g[2] != gp) for g in gateways) or len(gateways) >= 16:
+                    raise PolicyError(f"{path}:{lineno}: bad mcp gateway")
+                gateways.append((cu, gh, gp, lineno))
                 continue
             if toks[0] == "mcp":
                 # v1.31: mcp server NAME exec PATH [sha256=HEX]
@@ -1182,9 +1192,15 @@ def parse_lines(raw_lines, path):
     if passthrough and not inspect:
         raise PolicyError(f"{path}: passthrough without proxy inspect")
     ports = proxy_ports or [80, 443]
+    # v1.43: a gateway needs the proxy, port 80 proxied, and a host that is not passthrough
+    for g in gateways:
+        if not proxy or 80 not in ports or g[2] not in ports or g[1] in passthrough:
+            raise PolicyError(f"{path}:{g[3]}: bad mcp gateway")
     for r in rules:
         if r["kind"] not in ("request", "mcp"):        # v1.31: mcp rules too
             continue
+        if r["kind"] == "mcp" and any(r["c"].startswith(g[0] + "#") for g in gateways):
+            continue                                   # v1.43: read by the gateway
         if not inspect or r["rport"] not in ports:
             raise PolicyError(f"{path}:{r['line']}: request rule without proxy inspect, or on an unproxied port")
         for h in passthrough:
@@ -1198,6 +1214,7 @@ def parse_lines(raw_lines, path):
     parse_policy.identity = (issuers, spiffe, require_obo)   # v1.28.1
     parse_policy.require_plan = require_plan                 # v1.35 step 4
     parse_policy.cred_aud = cred_aud                         # v1.31
+    parse_policy.gateways = gateways                         # v1.43
     parse_policy.subjects = subjects
     parse_policy.mcpres = mcpres
     # v1.31: a rule decides for its subject only. Within the oracle a rule's
@@ -2163,6 +2180,66 @@ def fuzz_policy(rng, path, v142=False):
         fh.write("\n".join(lines) + "\n")
 
 
+def fuzz_gateway_policy(rng, path):
+    """v1.43: a random policy with `mcp gateway` lines (in a run of its own,
+    from its own random stream): gateways under `proxy on` and `proxy
+    inspect`, their host and mcp rules, credentials on them, and (when the
+    policy may be invalid) each refused form, for the three parsers to agree
+    on."""
+    valid = rng.random() < 0.7
+    good = ["https://omcp.example.com/mcp/app1", "https://omcp.example.com/mcp/app2",
+            "https://api.example.org:8443/mcp", "https://a.b.example.net/x/y", "https://omcp.example.com:443/z"]
+    bad = ["http://omcp.example.com/mcp", "https://10.0.0.1/mcp", "https://omcp.example.com/mcp?x=1",
+           "https://omcp.example.com:0/mcp", "https://*.example.com/mcp", "https://omcp.example.com/a/../b",
+           "https://omcp.example.com//mcp", "https://omcp.example.com:8443/clash", "https://[::1]/mcp",
+           "https://omcp.example.com/m#f", "https://u@omcp.example.com/mcp", "omcp.example.com/mcp", ""]
+    L = ["require warden 1.43" if valid or rng.random() < 0.8 else rng.choice(["require warden 1.42",
+                                                                              "require warden 1.31"])]
+    mode = rng.choice(["proxy on", "proxy on", "proxy inspect"])
+    if valid or rng.random() < 0.85:
+        L.append(mode)
+    gws = rng.sample(good, rng.randint(1, 3))
+    if not valid and rng.random() < 0.6:
+        gws.append(rng.choice(bad + good[:1]))           # a malformed one, or one given twice
+    ports = {80}
+    for g in gws:
+        m = re.fullmatch(r"https://[^/:]+:([0-9]+)/.*", g)
+        ports.add(int(m.group(1)) if m else 443)
+    if rng.random() < 0.5 or 8443 in ports:
+        pl = sorted(p for p in ports if 0 < p <= 65535)
+        if not valid and rng.random() < 0.4 and len(pl) > 1:
+            pl.remove(rng.choice(pl))                     # port 80, or a gateway's, not proxied
+        L.append("proxy ports " + " ".join(str(p) for p in pl))
+    if mode == "proxy inspect" and not valid and rng.random() < 0.3:
+        L.append("proxy passthrough host omcp.example.com")
+    cred = rng.random() < 0.4
+    if cred:
+        L.append("credential tok from file:/etc/varek/omcp/tok")
+    for g in gws:
+        L.append(f"mcp gateway {g}")
+    hosts = set()
+    for g in gws:
+        m = re.fullmatch(r"https://([^/:?#@]+)(?::([0-9]+))?/.*", g)
+        if m:
+            hosts.add(f"{m.group(1)}:{m.group(2) or 443}")
+    for h in sorted(hosts):
+        L.append(f"allow host {h}")
+    for _ in range(rng.randint(1, 6)):
+        u = rng.choice(gws)
+        meth = rng.choice(["initialize", "tools/list", "tools/call", "notifications/initialized", "tools/*"])
+        name = rng.choice(["", " search-osdk-todo-task", " create-*", " delete-osdk-todo-task", " get-?"]) \
+            if meth.startswith("tools/c") else ""
+        verb = rng.choice(["allow", "allow", "deny", "step_up"])
+        tail = " credential=tok" if cred and verb == "allow" and rng.random() < 0.6 else ""
+        if verb == "step_up":
+            tail = rng.choice([" mode=hold timeout=30", " mode=grant", ""])
+        L.append(f"{verb} mcp {u} {meth}{name}{tail}")
+    if not valid and rng.random() < 0.3:
+        L.append("allow mcp https://other.example.com/mcp tools/list")   # no gateway, no inspect: refused under proxy on
+    with open(path, "w", encoding="latin-1", newline="") as fh:
+        fh.write("\n".join(L) + "\n")
+
+
 # ------------------------------------------------------------------ check --
 
 # ------------------------------------------------------------ certificates --
@@ -2607,6 +2684,9 @@ def main():
     ap.add_argument("--fuzz-v142", type=int, default=None,
                     help="v1.42: random policies with step_up rules, after the others, from a random "
                          "stream of their own (default: a fifth of --fuzz)")
+    ap.add_argument("--fuzz-v143", type=int, default=None,
+                    help="v1.43: random policies with mcp gateway lines, after the others, from a random "
+                         "stream of their own (default: a fifth of --fuzz)")
     ap.add_argument("--queries", type=int, default=60)
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("policies", nargs="*")
@@ -2646,6 +2726,20 @@ def main():
                 fails.append(f"(failing fuzz policy saved to {keep})")
                 break
             stats["v142_policies"] = stats.get("v142_policies", 0) + 1
+        # v1.43: policies with mcp gateway lines, from their own stream
+        rng3 = random.Random(a.seed * 7919 + 143)
+        n143 = a.fuzz // 5 if a.fuzz_v143 is None else a.fuzz_v143
+        for k in range(n143 if not fails else 0):
+            p = os.path.join(td, f"fuzz143_{k}.txt")
+            fuzz_gateway_policy(rng3, p)
+            fails += check_policy(a.vdp, p, rng3, a.queries, stats, a.verbose, a.cert)
+            if fails and not a.verbose:
+                keep = os.path.join(tempfile.gettempdir(), f"vdp_fail_143_{k}.txt")
+                with open(p, encoding="latin-1") as src, open(keep, "w", encoding="latin-1") as dst:
+                    dst.write(src.read())
+                fails.append(f"(failing fuzz policy saved to {keep})")
+                break
+            stats["v143_policies"] = stats.get("v143_policies", 0) + 1
     total = stats["reach"] + stats["reach_forced_checked"] + stats["ground"] + stats["symbolic"]
     print(f"smt_crosscheck: {stats['policies']} policies ({stats['string_policies']} with "
           f"suffix/contains/glob rules, {stats['request_policies']} with request rules, {stats['launch_policies']} with launches, {stats['open_as_agent_policies']} opening as the agent; "

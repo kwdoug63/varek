@@ -620,6 +620,11 @@ static int policy_load(const char *path, struct policy *p) {
                  p->v.proxy_npass == p->c.proxy_npass;
     for (size_t k = 0; proxy_same && k < p->v.proxy_npass; k++)
         proxy_same = !strcmp(p->v.proxy_pass[k], p->c.proxy_pass[k]);
+    /* v1.43: and the gateways */
+    proxy_same = proxy_same && p->v.ngw == p->c.ngw;
+    for (size_t k = 0; proxy_same && k < p->v.ngw; k++)
+        proxy_same = !strcmp(p->v.gw_url[k], p->c.gw_url[k]) && !strcmp(p->v.gw_host[k], p->c.gw_host[k]) &&
+                     p->v.gw_port[k] == p->c.gw_port[k];
     if (!proxy_same) {
         fprintf(stderr, "[warden] policy %s: the decision procedure and the certificate checker read "
                 "the proxy directives differently; refusing to start\n", path);
@@ -753,6 +758,13 @@ static int policy_load(const char *path, struct policy *p) {
         fprintf(stderr, "[warden] policy %s: refused: it says `proxy inspect`, and this VAREK Defense build "
                 "does not include the egress proxy's TLS-inspecting mode (request rules, mcp rules, "
                 "credentials and passthrough hosts need it); `proxy on` gates by host name and port\n", path);
+        return -1;
+    }
+    /* v1.43: gateway mode needs a TLS client in the proxy, which the Defense
+     * build does not include until v1.43's step 7 (its inventory amended) */
+    if (p->v.ngw) {
+        fprintf(stderr, "[warden] policy %s: refused: it names an `mcp gateway`, and this VAREK Defense build "
+                "does not include the gateway's TLS client yet\n", path);
         return -1;
     }
 #endif
@@ -2949,6 +2961,17 @@ static void emit_run_start(const char *policy_path, const struct policy *p) {
         fprintf(f, "\"proxy_binary_sha256\":\"%s\",", g_proxy_sha);
         /* v1.26.1: inspecting mode's trust: the host's bundle, the run's CA
          * (the SHA-256 of its DER), the trust store, the passthrough hosts */
+        /* v1.43: the gateways, and (without inspecting mode) the bundle that verifies them */
+        if (p->v.ngw) {
+            fputs("\"gateways\":[", f);
+            for (size_t k = 0; k < p->v.ngw; k++) fprintf(f, "%s\"%s\"", k ? "," : "", p->v.gw_url[k]);
+            fputs("],", f);
+            if (!g_inspect_on) {
+                fprintf(f, "\"gateway_trust\":{\"host_bundle\":\"");
+                json_escape(f, g_trust_host_bundle);
+                fprintf(f, "\",\"host_bundle_sha256\":\"%s\",\"host_roots\":%d},", g_trust_host_sha, g_trust_nroots);
+            }
+        }
         if (g_inspect_on) {
             fprintf(f, "\"trust\":{\"host_bundle\":\"");
             json_escape(f, g_trust_host_bundle);
@@ -7385,6 +7408,12 @@ int main(int argc, char **argv) {
     /* v1.26.1: inspecting mode: the run's CA, made by the proxy, and the
      * trust views, before run_start records them */
     if (g_inspect_on && trust_setup(&p) < 0) {
+        if (g_key) vfips_key_free(g_key);
+        return 1;
+    }
+    /* v1.43: gateways without inspecting mode: the proxy loads the host's
+     * trust bundle to verify their servers (with it, the CA's setup did) */
+    if (p.v.ngw && !g_inspect_on && geteuid() == 0 && !g_check_only && gateway_setup() < 0) {
         if (g_key) vfips_key_free(g_key);
         return 1;
     }

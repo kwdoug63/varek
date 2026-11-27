@@ -407,6 +407,11 @@ args_ok:;
                 printf(" passthrough");
                 for (size_t k = 0; k < pol.proxy_npass; k++) printf(" %s", pol.proxy_pass[k]);
             }
+            /* v1.43: then the gateways' URLs (canonical), last */
+            if (pol.ngw) {
+                printf(" gateway");
+                for (size_t k = 0; k < pol.ngw; k++) printf(" %s", pol.gw_url[k]);
+            }
             printf("\n");
         }
         vdpc_free(&pol);

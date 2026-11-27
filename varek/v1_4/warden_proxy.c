@@ -352,3 +352,39 @@ gone:
     snprintf(why, wn, "the proxy has gone");
     return -1;
 }
+
+/* v1.43: a gateway's setup without inspecting mode (warden_proxy.h, struct
+ * wp_gateway): the host's trust bundle to the proxy, which loads its roots
+ * and makes the TLS context it verifies gateway servers with. */
+int wp_gateway_setup(const wp_t *w, const char *bundle, int *nroots, char *why, size_t wn) {
+    struct wp_gateway g;
+    memset(&g, 0, sizeof g);
+    g.type = WP_MSG_GATEWAY;
+    if (strlen(bundle) >= sizeof g.bundle) { snprintf(why, wn, "trust bundle path too long"); return -1; }
+    strcpy(g.bundle, bundle);
+    if (send(w->ctl, &g, sizeof g, MSG_NOSIGNAL) != (ssize_t)sizeof g) goto gone;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        struct timespec t;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        long left = 15000 - ((t.tv_sec - t0.tv_sec) * 1000 + (t.tv_nsec - t0.tv_nsec) / 1000000);
+        struct pollfd pf = { .fd = w->ctl, .events = POLLIN };
+        int pr = left > 0 ? poll(&pf, 1, (int)left) : 0;
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr <= 0) { snprintf(why, wn, "the proxy did not load the trust bundle within 15 s"); return -1; }
+        struct wp_gateway_done d;
+        ssize_t n = recv(w->ctl, &d, sizeof d, 0);
+        if (n <= 0) goto gone;
+        if (n != (ssize_t)sizeof d || d.type != WP_MSG_GATEWAY_DONE || !memchr(d.why, 0, sizeof d.why)) {
+            snprintf(why, wn, "the proxy sent an unexpected message");
+            return -1;
+        }
+        if (!d.ok) { snprintf(why, wn, "the proxy could not load the trust bundle: %s", d.why); return -1; }
+        *nroots = (int)d.nroots;
+        return 0;
+    }
+gone:
+    snprintf(why, wn, "the proxy has gone");
+    return -1;
+}

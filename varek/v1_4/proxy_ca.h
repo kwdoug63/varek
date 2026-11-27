@@ -38,6 +38,9 @@ typedef struct {
 int pca_init(pca_t *c);
 /* Read the host's trust bundle (PEM). 0, or -1 with why. */
 int pca_load_roots(pca_t *c, const char *bundle, char *why, size_t wn);
+/* v1.43: only the context toward servers (c->sctx), for an `mcp gateway`
+ * without inspecting mode; after pca_load_roots. 0, or -1 with why. */
+int pca_sctx_init(pca_t *c, char *why, size_t wn);
 /* Make the CA, valid from PCA_BACKDATE_S ago for valid_s, permitting the n
  * names (host names; a name covers the names under it) and excluding the
  * nx names in excl (review: the passthrough hosts, which a permitted

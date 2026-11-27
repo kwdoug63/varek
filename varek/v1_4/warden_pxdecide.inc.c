@@ -60,6 +60,7 @@ struct px_req {
     unsigned      port;
     bool          up;                    /* section 5: dialed to the upstream proxy */
     bool          inspect;               /* v1.26.1: the proxy terminates its TLS */
+    bool          gateway;               /* v1.43: plain HTTP to an `mcp gateway` host; TLS to it by the proxy */
     unsigned      dport;                 /* the port dialed (port, or the upstream's) */
     int           entry;                 /* in g_names (the upstream's: -1 for an address) */
     int           sock;                  /* the dial in progress, or -1 (waiting on the lookup) */
@@ -178,7 +179,8 @@ static void px_open_add(uint64_t id, bool inspect, const struct px_req *q) {
     }
     struct px_open o = { .id = id, .at = wr_now_ms(), .inspect = inspect, .next_seq = 1 };
     if (q) {
-        snprintf(o.scheme, sizeof o.scheme, "%s", q->kind == PP_KIND_HTTP ? "http" : "https");
+        /* v1.43: a gateway's calls are decided against its https URL */
+        snprintf(o.scheme, sizeof o.scheme, "%s", q->kind == PP_KIND_HTTP && !q->gateway ? "http" : "https");
         snprintf(o.name, sizeof o.name, "%s", q->name);
         o.port = q->port;
     }
@@ -305,9 +307,10 @@ static int px_closed(const struct wp_close *m) {
 
 static void px_record(struct px_req *q, decision_t d_raw, decision_t d_final, const char *rule, int err) {
     size_t el = strlen(q->a->extra);
-    snprintf(q->a->extra + el, sizeof q->a->extra - el, "\"proxy_conn\":%llu,\"proxy_kind\":\"%s\",%s",
+    snprintf(q->a->extra + el, sizeof q->a->extra - el, "\"proxy_conn\":%llu,\"proxy_kind\":\"%s\",%s%s",
              (unsigned long long)q->id, pp_kind_name((pp_kind_t)q->kind),
-             q->inspect ? "\"inspected\":true," : "");
+             q->inspect ? "\"inspected\":true," : "",
+             q->gateway ? "\"gateway\":true," : "");                /* v1.43: allowed or refused */
     if (q->up) {                                         /* section 5: the upstream used */
         el = strlen(q->a->extra);
         snprintf(q->a->extra + el, sizeof q->a->extra - el, "\"upstream\":\"%s:%u\",",
@@ -333,8 +336,9 @@ static void px_refuse(struct px_req *q, decision_t d_raw, const char *rule, int 
 }
 
 /* Pass the connected socket s to the proxy for request q. */
-static int px_pass(uint64_t id, int s, bool inspect) {
-    struct wp_verdict m = { .type = WP_MSG_VERDICT, .allow = 1, .id = id, .inspect = inspect };
+static int px_pass(uint64_t id, int s, uint32_t inspect, unsigned port) {    /* v1.43: WP_INSPECT_*, a gateway's port */
+    struct wp_verdict m = { .type = WP_MSG_VERDICT, .allow = 1, .id = id, .inspect = inspect,
+                            .port = inspect == WP_INSPECT_GATEWAY ? port : 0 };
     union { char b[CMSG_SPACE(sizeof(int))]; struct cmsghdr al; } cb;
     memset(&cb, 0, sizeof cb);
     struct iovec v = { &m, sizeof m };
@@ -349,7 +353,7 @@ static int px_pass(uint64_t id, int s, bool inspect) {
 
 /* Section 5: pass the socket dialed to the upstream proxy, with the name and
  * port the proxy is to ask it for (CONNECT). */
-static int px_pass_up(uint64_t id, int s, const char *name, unsigned port, bool inspect) {
+static int px_pass_up(uint64_t id, int s, const char *name, unsigned port, uint32_t inspect) {
     struct wp_verdict_up m;
     memset(&m, 0, sizeof m);
     m.type = WP_MSG_VERDICT_UP;
@@ -472,8 +476,9 @@ static void px_dialed(const struct policy *p, struct px_req *q, int so_error) {
         px_dial(p, q);
         return;
     }
-    if ((q->up ? px_pass_up(q->id, q->sock, q->name, q->port, q->inspect)
-               : px_pass(q->id, q->sock, q->inspect)) < 0) {
+    uint32_t mode = q->gateway ? WP_INSPECT_GATEWAY : q->inspect ? WP_INSPECT_TLS : WP_INSPECT_NONE;  /* v1.43 */
+    if ((q->up ? px_pass_up(q->id, q->sock, q->name, q->port, mode)
+               : px_pass(q->id, q->sock, mode, q->port)) < 0) {
         (void)wp_verdict(&g_proxy, q->id, false);
         px_record(q, DEC_ALLOW, DEC_ALLOW, "proxy_dial_failed", EIO);
     } else {
@@ -525,6 +530,24 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
     clock_gettime(CLOCK_MONOTONIC, &q->t0);
     a->kind = ACT_NET_PROXY;
     a->policy_line = -1;
+    /* v1.43 (docs/security/v1.43-palantir-ontology-mcp.md, D3): an `mcp
+     * gateway` host. Plain HTTP to its port 80 is the gateway: decided as a
+     * connection to the gateway's own host and port, dialed there, and each
+     * call read and decided against its https URL, the proxy speaking TLS to
+     * the server. Any other way to the host (TLS, a CONNECT, plain HTTP on
+     * another port) is refused, so its calls are never relayed unread. */
+    int gw = vdp_gateway_of(&p->v, q->name);
+    if (gw >= 0) {
+        if (m->kind == PP_KIND_HTTP && m->port == 80) {
+            q->gateway = true;
+            q->port = q->dport = p->v.gw_port[gw];
+        } else {
+            snprintf(a->target, sizeof a->target, "%s:%u", q->name, q->port);
+            snprintf(a->resolved, sizeof a->resolved, "%s:%u", q->name, q->port);
+            px_refuse(q, DEC_DENY, "gateway_host", EACCES);
+            return;
+        }
+    }
     snprintf(a->target, sizeof a->target, "%s:%u", q->name, q->port);
     snprintf(a->resolved, sizeof a->resolved, "%s:%u", q->name, q->port);
     decision_t d_raw = policy_decide(p, a);
@@ -551,6 +574,7 @@ static void px_request(const struct policy *p, const struct wp_req *m) {
      * here (px_httpreq) before a byte of it is sent. Passthrough hosts are
      * SNI mode by design. */
     if (p->v.proxy_inspect && !px_passthrough(p, q->name)) q->inspect = true;
+    if (q->gateway) q->inspect = true;                  /* v1.43: read, as inspecting mode reads plain HTTP */
     int i = wr_table_find(&g_names, q->name);
     if (i >= 0 && g_names.e[i].unlisted) i = -1;         /* only a deny rule names it */
     if (p->v.proxy_up_port) {

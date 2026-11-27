@@ -664,7 +664,7 @@ def policy_proxy(checker, policy):
         raise ValueError("the checker failed on the policy's proxy directives")
     if f[0] == "off":
         return None
-    ends = [f.index(w) for w in ("upstream", "passthrough") if w in f]
+    ends = [f.index(w) for w in ("upstream", "passthrough", "gateway") if w in f]
     ports = f[1:min(ends)] if ends else f[1:]
     return [int(x) for x in ports]
 
@@ -2215,7 +2215,24 @@ def policy_inspect(checker, policy):
     f = rq.stdout.split()
     if rq.returncode != 0 or not f or f[0] != "inspect":
         return None
-    return f[f.index("passthrough") + 1:] if "passthrough" in f else []
+    end = f.index("gateway") if "gateway" in f else len(f)       # v1.43: the gateways come last
+    return f[f.index("passthrough") + 1:end] if "passthrough" in f else []
+
+
+def policy_gateways(checker, policy):
+    """v1.43: the host:port of each `mcp gateway` (a set), as the checker reads
+    the policy: a connection recorded as a gateway's is for one of them."""
+    rq = subprocess.run([checker, policy, "proxy"], capture_output=True, text=True)
+    f = rq.stdout.split()
+    if rq.returncode != 0 or not f:
+        raise ValueError("the checker failed on the policy's proxy directives")
+    out = set()
+    for u in (f[f.index("gateway") + 1:] if "gateway" in f else []):
+        m = re.fullmatch(r"https://([^/:]+):([0-9]+)/.*", u)
+        if not m:
+            raise ValueError("the checker gave a gateway URL not in canonical form")
+        out.add(f"{m.group(1)}:{m.group(2)}")
+    return out
 
 
 def policy_upstream(checker, policy):
@@ -2236,7 +2253,8 @@ HANDOFF_OTHER_RULES = ("already_connected", "socket_option_failed", "too_many_pe
 PROXY_REFUSE_RULES = ("policy_match", "default_deny_unknown", "fragment_escape_flags",
                       "fragment_escape_length", "certificate_refused", "wildcard_budget",
                       "resolution_failed", "address_refused", "run_ended", "revoked",   # v1.28: revoked
-                      "outside_plan")       # v1.35 step 8: a held run's connection the plan names not (check_hold)
+                      "outside_plan",       # v1.35 step 8: a held run's connection the plan names not (check_hold)
+                      "gateway_host")       # v1.43: an `mcp gateway` host reached other than through its gateway
 # v1.26 (step 6): the Warden's decision on what the proxy read, when it allowed
 PROXY_ALLOW_RULES = ("proxy_dialed", "proxy_dial_failed")
 PROXY_KINDS = ("tls", "http", "connect")
@@ -3235,8 +3253,9 @@ class RequestsCheck:
     it). v1.36 (D9): in stream order as it comes; what it keeps is the
     connections not yet closed (and the ids of those closed)."""
 
-    def __init__(self, rules, problems, refused):
+    def __init__(self, rules, problems, refused, gateways=frozenset()):
         self.rules, self.problems, self.refused = rules, problems, refused
+        self.gateways = gateways         # v1.43: the policy's gateways, as host:port
         self.conns = {}                  # proxy_conn -> (position, name:port, scheme): passed on to be inspected
         self.state = {}                  # proxy_conn -> {"next", "refused", "closed", "body": pending or None}
         self.closed_insp = IdSet()       # closed, and passed on to be inspected
@@ -3247,8 +3266,15 @@ class RequestsCheck:
         if rec.get("action") == "net.proxy" and rec.get("rule") == "proxy_dialed" and \
                 rec.get("inspected") is True and type(rec.get("proxy_conn")) is int and \
                 rec["proxy_conn"] not in self.closed_insp:
+            # v1.43: a gateway's connection is plain HTTP from the agent, its
+            # requests https to the server: only for a gateway the policy names
+            gw = rec.get("gateway") is True
+            if gw and (rec.get("proxy_kind") != "http" or rec.get("target") not in self.gateways):
+                self.problems.append(f"seq {rec.get('seq')}: connection {rec['proxy_conn']} recorded as a gateway's, "
+                                     f"for {rec.get('target')!r}, which the policy names no gateway for")
+                gw = False
             self.conns.setdefault(rec["proxy_conn"], (pos, rec.get("target"),
-                                                      "http" if rec.get("proxy_kind") == "http" else "https"))
+                                                      "http" if rec.get("proxy_kind") == "http" and not gw else "https"))
         if rec.get("action") in ("net.request", "net.mcp"):
             self.request(rec, pos)
             # v1.26.1 (step 7): a refused request is asked of the policy again
@@ -3630,9 +3656,11 @@ class ProxiedCheck:
     it keeps is the hand-offs not yet decided (and the ids of those that
     were), and each name's first charge to a wildcard."""
 
-    def __init__(self, resolutions, problems, dialed_out, upstream=None, exact=None, passthrough=None):
+    def __init__(self, resolutions, problems, dialed_out, upstream=None, exact=None, passthrough=None,
+                 gateways=frozenset()):
         self.res, self.problems, self.dialed_out = resolutions, problems, dialed_out
         self.upstream, self.exact, self.passthrough = upstream, exact, passthrough
+        self.gateways = gateways         # v1.43: the policy's gateways, as host:port
         self.handoffs = IdSet()          # every connection id handed to the proxy so far
         self.port = {}                   # proxy_conn -> the port it was handed over on, until it is decided
         self.seen = IdSet()              # decided
@@ -3692,9 +3720,24 @@ class ProxiedCheck:
             problems.append(f"seq {seq}: a proxied decision {dfin!r} with rule {rule!r}, which the "
                             f"Warden does not write")
             return
+        # v1.43: a gateway's connection is plain HTTP to port 80 of a host the
+        # policy names a gateway for, decided on the gateway's own port; a
+        # gateway_host refusal is of a connection to such a host by another way
+        gw = rec.get("gateway") is True
+        gw_hosts = {g.rsplit(":", 1)[0] for g in self.gateways}
+        if "gateway" in rec and not gw:
+            problems.append(f"seq {seq}: a malformed gateway mark")
+            return
+        if gw and (rec.get("proxy_kind") != "http" or hport not in (None, 80) or tgt not in self.gateways or
+                   rule == "gateway_host"):
+            problems.append(f"seq {seq}: connection {cid} recorded as a gateway's ({tgt}), which it cannot be")
+            return
+        if rule == "gateway_host" and (gw or tgt.rsplit(":", 1)[0] not in gw_hosts):
+            problems.append(f"seq {seq}: a gateway_host refusal for {tgt}, which is no gateway's host")
+            return
         # v1.26 review: decided on the port the agent connected to (a CONNECT
         # names its own)
-        if rec.get("proxy_kind") != "connect" and hport not in (None, _host_port(tgt)):
+        if not gw and rec.get("proxy_kind") != "connect" and hport not in (None, _host_port(tgt)):
             problems.append(f"seq {seq}: a proxied decision on {tgt}, not on the port connection "
                             f"{cid} was handed over on ({hport})")
             return
@@ -3706,10 +3749,15 @@ class ProxiedCheck:
             problems.append(f"seq {seq}: a malformed inspected mark")
             return
         passthrough = self.passthrough
-        if passthrough is None and insp:
+        if gw:                                              # v1.43: an allowed gateway is always read
+            if insp != (dfin == "ALLOW"):
+                problems.append(f"seq {seq}: a gateway's connection {'' if insp else 'not '}inspected, "
+                                f"which {'only an allowed one is' if insp else 'an allowed one must be'}")
+                return
+        elif passthrough is None and insp:
             problems.append(f"seq {seq}: a proxied decision inspected outside inspecting mode")
             return
-        if passthrough is not None:
+        elif passthrough is not None:
             should = name not in passthrough
             if insp != (should and rule not in ("policy_match", "default_deny_unknown", "certificate_refused",
                                                 "fragment_escape_flags", "fragment_escape_length",
@@ -5549,10 +5597,15 @@ def start_checks(a, meta, rs, run, sec, res, prules, rules, names_policy, proxy_
                          _version_at_least(rs.get("warden"), (1, 25)))
     k["loop"].grants = k["grants"]
     k["dialed"] = Spool()
-    k["proxied"] = ProxiedCheck(res, sec["proxied"], k["dialed"], upstream, exact_hosts, passthrough)
+    try:
+        gateways = policy_gateways(a.checker, a.policy)                     # v1.43
+    except (OSError, ValueError) as e:
+        sec["proxied"].append(f"checker failed on the policy's gateways: {e}")
+        gateways = frozenset()
+    k["proxied"] = ProxiedCheck(res, sec["proxied"], k["dialed"], upstream, exact_hosts, passthrough, gateways)
     k["closes"] = ClosesCheck(sec["closes"])
     k["refused_req"] = Spool()
-    k["requests"] = RequestsCheck(prules, sec["requests"], k["refused_req"])
+    k["requests"] = RequestsCheck(prules, sec["requests"], k["refused_req"], gateways)
     k["creds"] = CredentialsCheck(pcreds, pcred_rules, pcred_auds, rs, sec, cnotes)
     k["chain"] = ChainCheck(ident, rs, run, sec)
     k["subjects"] = SubjectsCheck(confined6, forl6, sec["subjects"])
