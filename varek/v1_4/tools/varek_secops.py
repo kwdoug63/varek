@@ -25,7 +25,10 @@ A UDM event carries (G4):
     run's let-through and an allowed call), the three-state verdict;
   * additional: varek_decision, varek_verdict, varek_mode, varek_rule,
     varek_policy_name, varek_policy_sha256, varek_run, varek_agent,
-    varek_position, varek_event, and the whole OCSF event as JSON in
+    varek_position, varek_event, an audit's varek_audit_passed,
+    varek_audit_mode and varek_audit_problems, a hold's or a deferral's
+    varek_ending (v1.43 step 2: what the YARA-L rules read), and the whole
+    OCSF event as JSON in
     ocsf_event, so nothing the OCSF export says is lost on the way.
 
 Usage:
@@ -233,6 +236,11 @@ def udm(ev, line=None):
         "varek_run": run or None, "varek_agent": agent.get("name"),
         "varek_position": str(pos) if pos else None, "varek_event": v.get("event"),
         "varek_audit_passed": ("true" if passed else "false") if audit else None,
+        # v1.43 step 2: what the YARA-L rules group on, as plain strings (G6)
+        "varek_audit_mode": _get(v, "audit", "mode") if audit else None,
+        "varek_audit_problems": (json.dumps(_get(v, "audit", "problems"), separators=(",", ":"))
+                                 if audit and _get(v, "audit", "problems") else None),
+        "varek_ending": v.get("ending") if isinstance(v.get("ending"), str) else None,
         "ocsf_event": line if line is not None else json.dumps(ev, sort_keys=True, separators=(",", ":")),
     }
     out["additional"] = {k: x for k, x in extra.items() if x not in (None, "")}
