@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: MIT
+// VAREK for Google Security Operations (v1.43; integrations/secops/README.md).
+// An approval nobody gave in time (v1.42): a step_up proposal, or a
+// deferral waiting for its context, that ended at its timeout, so the call
+// was refused. One detection per run, host and policy line within the hour.
+// Sentinel's "VAREK: an approval nobody gave in time" (Medium).
+rule varek_approval_timeout {
+  meta:
+    author = "Sober Agentic Infrastructure, Inc."
+    description = "A VAREK step_up approval or deferral nobody gave in time"
+    severity = "Medium"
+    priority = "Medium"
+    reference = "https://github.com/kwdoug63/varek/tree/main/varek/v1_4/integrations/secops"
+
+  events:
+    $e.metadata.vendor_name = "Sober Agentic Infrastructure"
+    $e.metadata.product_name = "VAREK"
+    ($e.additional.fields["varek_event"] = "step_up_end" or $e.additional.fields["varek_event"] = "defer_end")
+    $e.additional.fields["varek_ending"] = "timeout"
+    $run = $e.additional.fields["varek_run"]
+    $host = $e.principal.hostname
+    $line = $e.additional.fields["varek_policy_line"]
+
+  match:
+    $run, $host, $line over 1h
+
+  outcome:
+    $risk_score = 40
+    $expired = count_distinct($e.metadata.product_log_id)
+    $waits = array_distinct($e.additional.fields["varek_event"])
+    $agent = array_distinct($e.principal.application)
+    $policy_name = array_distinct($e.additional.fields["varek_policy_name"])
+    $first_seen = min($e.metadata.event_timestamp.seconds)
+    $last_seen = max($e.metadata.event_timestamp.seconds)
+
+  condition:
+    $e
+}
